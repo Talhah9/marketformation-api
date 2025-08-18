@@ -1,16 +1,18 @@
 {
-  "extends": "next/core-web-vitals",
   "compilerOptions": {
-    "target": "ES2022",
-    "lib": ["DOM", "ES2022"],
+    "target": "ES2021",
+    "lib": ["ES2021", "DOM"],
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "strict": true,
+    "noEmit": true,
     "jsx": "preserve",
     "baseUrl": ".",
     "paths": {
       "@/*": ["./*"]
     },
-    "strict": true,
-    "noEmit": true
-  }
+    "types": ["node"]
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx"],
+  "exclude": ["node_modules"]
 }
