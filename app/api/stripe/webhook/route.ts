@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { stripe } from "@/lib/stripe";
+import stripe from '@/lib/stripe';
 
 export const runtime = "nodejs"; // nécessaire pour Buffer
 
