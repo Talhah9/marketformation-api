@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { stripe } from "@/lib/stripe";
+import stripe from '@/lib/stripe';
 
 export async function GET(req: NextRequest) {
   // MVP : crée un compte Express ; plus tard on persistera cet ID
