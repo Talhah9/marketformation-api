@@ -1,5 +1,3 @@
-// app/api/courses/route.ts
-
 const ALLOWED_ORIGIN = process.env.CORS_ORIGIN || "https://tqiccz-96.myshopify.com";
 
 function jsonCors(data: unknown, status = 200) {
@@ -27,21 +25,10 @@ export async function OPTIONS() {
   });
 }
 
-// GET: renvoie une liste au bon format (vide pour l’instant)
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const email = (searchParams.get("email") || "").toLowerCase();
-
   const items: Array<{ title: string; coverUrl?: string; collectionHandle?: string; handle?: string; email?: string; }> = [];
-
-  // 👉 Décommente pour voir 2 cartes de test immédiatement
-  // if (email) {
-  //   items.push(
-  //     { title: "Intro IA", coverUrl: "https://picsum.photos/seed/ia/600/320", collectionHandle: "intelligence-artificielle", handle: "intro-ia", email },
-  //     { title: "Vendre sa 1ère formation", coverUrl: "https://picsum.photos/seed/sales/600/320", collectionHandle: "business", handle: "vendre-premiere-formation", email }
-  //   );
-  // }
-
   return jsonCors({ items });
 }
 
