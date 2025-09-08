@@ -8,10 +8,9 @@
     "noEmit": true,
     "jsx": "preserve",
     "baseUrl": ".",
-    "paths": {
-      "@/*": ["./*"]
-    },
-    "types": ["node"]
+    "paths": { "@/*": ["./*"] },
+    "types": ["node"],
+    "skipLibCheck": true
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx"],
   "exclude": ["node_modules"]
