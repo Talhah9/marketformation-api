@@ -38,7 +38,6 @@ export async function POST(req: Request){
     const filename = body?.filename || (kind === 'image' ? `image-${Date.now()}.png` : `file-${Date.now()}.pdf`);
     const mimeType = body?.mimeType || (kind === 'image' ? 'image/png' : 'application/pdf');
 
-    // ⬅️ CLÉ : resource dépend du type
     const resource = (kind === 'image') ? 'IMAGE' : 'FILE';
 
     const data = await gql(`
@@ -59,6 +58,8 @@ export async function POST(req: Request){
     return new Response(JSON.stringify({
       ok: true,
       kind,
+      filename,
+      mimeType,
       postUrl: t.url,
       resourceUrl: t.resourceUrl,
       params: t.parameters || []
