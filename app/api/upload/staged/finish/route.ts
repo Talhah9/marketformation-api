@@ -21,9 +21,9 @@ async function gql(query:string, variables:any){
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/json',
-      'X-Shopify-Access-Token': env('SHOPIFY_ADMIN_API_ACCESS_TOKEN')
+      'X-Shopify-Access-Token': env('SHOPIFY_ADMIN_API_ACCESS_TOKEN'),
     },
-    body: JSON.stringify({ query, variables })
+    body: JSON.stringify({ query, variables }),
   });
   const json:any = await res.json();
   if (!res.ok || json.errors) throw new Error(json.errors ? JSON.stringify(json.errors) : `Shopify ${res.status}`);
@@ -33,8 +33,10 @@ async function gql(query:string, variables:any){
 export async function POST(req: Request){
   try{
     const { resourceUrl, kind, alt } = await req.json();
-    if (!resourceUrl) throw new Error('resourceUrl_required');
-    const isImage = (String(kind || '').toLowerCase() === 'image');
+    if (!resourceUrl) {
+      return new Response(JSON.stringify({ ok:false, error:'resourceUrl_required' }), { status:400, headers:{'Content-Type':'application/json', ...CORS}});
+    }
+    const isImage = (String(kind||'').toLowerCase() === 'image');
 
     const data = await gql(`
       mutation fileCreate($files: [FileCreateInput!]!) {
@@ -55,9 +57,15 @@ export async function POST(req: Request){
       }]
     });
 
+    const userErrors = data?.fileCreate?.userErrors || [];
     const f = data?.fileCreate?.files?.[0];
     const url = isImage ? f?.image?.url : f?.url;
-    if (!url) throw new Error('file_create_failed');
+
+    if (!url) {
+      return new Response(JSON.stringify({ ok:false, error:'file_create_failed', userErrors }), {
+        status: 400, headers:{'Content-Type':'application/json', ...CORS}
+      });
+    }
 
     return new Response(JSON.stringify({ ok:true, url }), { status:200, headers:{'Content-Type':'application/json', ...CORS} });
   }catch(e:any){
