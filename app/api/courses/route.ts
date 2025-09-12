@@ -1,103 +1,174 @@
 // Crée un produit Course et liste les courses d'un formateur via tag trainer:<email>
+// app/api/courses/route.ts
+import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
+
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-function env(n: string) {
-  const v = process.env[n];
-  if (!v) throw new Error(`Missing env: ${n}`);
-  return v;
-}
-const API = () => process.env.SHOPIFY_API_VERSION || '2025-07';
+// ====== ENV attendus ======
+// SHOPIFY_STORE_DOMAIN  -> ex: tqiccz-96.myshopify.com
+// SHOPIFY_ADMIN_API_ACCESS_TOKEN -> shpat_xxx (Admin API)
+// SHOPIFY_API_VERSION   -> "2025-07" (facultatif, défaut ci-dessous)
 
-async function shopify(path: string, method: string, body?: any) {
-  const res = await fetch(`https://${env('SHOPIFY_STORE_DOMAIN')}/admin/api/${API()}${path}`, {
-    method,
-    headers: {
-      'X-Shopify-Access-Token': env('SHOPIFY_ADMIN_API_ACCESS_TOKEN'),
-      'Content-Type': 'application/json',
-      'Accept': 'application/json'
-    },
-    body: body ? JSON.stringify(body) : undefined
-  });
-  const txt = await res.text();
-  let json: any = {};
-  try { json = txt ? JSON.parse(txt) : {}; } catch { json = { raw: txt }; }
-  return { ok: res.ok, status: res.status, json };
+const STORE = process.env.SHOPIFY_STORE_DOMAIN!;
+const TOKEN = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN!;
+const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-07';
+
+if (!STORE || !TOKEN) {
+  console.warn('[courses] Missing SHOPIFY_* envs');
+}
+
+type CreateCourseBody = {
+  title: string;
+  description: string;
+  collectionHandle?: string;
+  coverUrl?: string;   // URL publique retournée par /api/upload/image
+  pdfUrl?: string;     // URL publique retournée par /api/upload/pdf
+  price?: number;      // en centimes (ex: 1990 = 19,90€)
+  customerEmail?: string | null;
+  customerId?: number | null;
+};
+
+export async function OPTIONS(req: Request) {
+  // Préflight CORS
+  return handleOptions(req);
 }
 
 export async function POST(req: Request) {
   try {
-    const {
-      title, description, collectionHandle,
-      coverUrl, pdfUrl, price, customerEmail
-    } = await req.json();
-
-    if (!title || !coverUrl) {
-      return new Response(JSON.stringify({ error: 'title_and_cover_required' }), { status: 400 });
+    // Sécurité basique + CORS pour JSON
+    const contentType = req.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+      return jsonWithCors(req, { ok: false, error: 'content_type_required_json' }, { status: 415 });
     }
 
-    // 1) Crée le produit (image par URL => Shopify l’importe & l’affiche)
+    const body = (await req.json()) as CreateCourseBody;
+    const {
+      title,
+      description,
+      collectionHandle,
+      coverUrl,
+      pdfUrl,
+      price,
+      customerEmail,
+      customerId,
+    } = body || {};
+
+    if (!title || !description) {
+      return jsonWithCors(req, { ok: false, error: 'missing_fields' }, { status: 400 });
+    }
+
+    if (!STORE || !TOKEN) {
+      return jsonWithCors(req, { ok: false, error: 'server_misconfigured' }, { status: 500 });
+    }
+
+    // 1) Création du produit
+    // Si tu veux le publier directement: status: "active"
+    // Sinon "draft".
     const productPayload = {
       product: {
         title,
-        body_html: `${description || ''}${pdfUrl ? `<p><a href="${pdfUrl}" target="_blank">Télécharger le programme (PDF)</a></p>` : ''}`,
-        status: 'active', // 'draft' si tu préfères
-        product_type: 'Formation',
-        tags: ['mf_trainer', customerEmail || ''].filter(Boolean).join(', '),
-        images: coverUrl ? [{ src: coverUrl }] : []
-      }
+        body_html: description,
+        status: 'active',
+        tags: ['mf_trainer'], // <- demandé
+        images: coverUrl ? [{ src: coverUrl }] : [],
+        // On peut créer une variante pour avoir un prix (en €).
+        variants: [
+          {
+            price: price ? (price / 100).toFixed(2) : '19.90',
+            requires_shipping: false,
+            taxable: false,
+            option1: 'Default',
+          },
+        ],
+        options: [{ name: 'Title' }],
+        // Metafields pour stocker l'URL du PDF côté admin
+        metafields: pdfUrl
+          ? [
+              {
+                namespace: 'mf',
+                key: 'pdf_url',
+                type: 'single_line_text_field',
+                value: pdfUrl,
+              },
+            ]
+          : [],
+      },
     };
 
-    const created = await shopify('/products.json', 'POST', productPayload);
-    if (!created.ok) {
-      return new Response(JSON.stringify({ error: 'product_create_failed', detail: created }), { status: 400 });
-    }
-    const product = created.json?.product;
-    const productId = product?.id;
-    if (!productId) {
-      return new Response(JSON.stringify({ error: 'no_product_id', detail: created.json }), { status: 400 });
+    const base = `https://${STORE}/admin/api/${API_VERSION}`;
+    const resp = await fetch(`${base}/products.json`, {
+      method: 'POST',
+      headers: {
+        'X-Shopify-Access-Token': TOKEN,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify(productPayload),
+    });
+
+    const tx = await resp.text();
+    let created: any = {};
+    try { created = tx ? JSON.parse(tx) : {}; } catch {}
+
+    if (!resp.ok) {
+      return jsonWithCors(
+        req,
+        { ok: false, error: 'product_create_failed', detail: created?.errors || tx || resp.statusText },
+        { status: 502 },
+      );
     }
 
-    // 2) Metafield PDF URL
-    if (pdfUrl) {
-      const mf = await shopify(`/products/${productId}/metafields.json`, 'POST', {
-        metafield: {
-          namespace: 'mf',
-          key: 'pdf_url',
-          type: 'url',
-          value: pdfUrl
-        }
+    const product = created?.product;
+    const productId: number | undefined = product?.id;
+    const productHandle: string | undefined = product?.handle;
+
+    // 2) Ajouter à une collection par handle (optionnel)
+    if (productId && collectionHandle) {
+      // On cherche la custom collection par "handle"
+      const cc = await fetch(`${base}/custom_collections.json?handle=${encodeURIComponent(collectionHandle)}`, {
+        headers: {
+          'X-Shopify-Access-Token': TOKEN,
+          'Accept': 'application/json',
+        },
       });
-      // Pas bloquant si ça échoue, on continue
+      const cctxt = await cc.text();
+      let col: any = {};
+      try { col = cctxt ? JSON.parse(cctxt) : {}; } catch {}
+
+      const collId: number | undefined = col?.custom_collections?.[0]?.id;
+      if (collId) {
+        const collectResp = await fetch(`${base}/collects.json`, {
+          method: 'POST',
+          headers: {
+            'X-Shopify-Access-Token': TOKEN,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: JSON.stringify({ collect: { product_id: productId, collection_id: collId } }),
+        });
+        if (!collectResp.ok) {
+          const msg = await collectResp.text();
+          console.warn('[courses] collect failed:', msg);
+        }
+      } else {
+        console.warn(`[courses] collection not found for handle="${collectionHandle}"`);
+      }
     }
 
-    // 3) Ajouter à la collection (par handle)
-    if (collectionHandle) {
-      // Essaye custom collections
-      let colId: number | null = null;
-      const cc = await shopify('/custom_collections.json?limit=250', 'GET');
-      const foundCustom = cc.json?.custom_collections?.find((c: any) => c?.handle === collectionHandle);
-      if (foundCustom) colId = foundCustom.id;
+    // 3) Optionnel: logger qui a créé (customerId/email) — tu peux le garder en métadonnées si besoin
 
-      // Sinon smart collections
-      if (!colId) {
-        const sc = await shopify('/smart_collections.json?limit=250', 'GET');
-        const foundSmart = sc.json?.smart_collections?.find((c: any) => c?.handle === collectionHandle);
-        if (foundSmart) colId = foundSmart.id;
-      }
+    // URL publique du produit
+    const onlineUrl =
+      product?.handle ? `https://${STORE}/products/${product.handle}` : undefined;
 
-      if (colId) {
-        await shopify('/collects.json', 'POST', { collect: { product_id: productId, collection_id: colId } });
-      }
-    }
-
-    return new Response(JSON.stringify({
+    return jsonWithCors(req, {
       ok: true,
       productId,
-      adminUrl: `https://${env('SHOPIFY_STORE_DOMAIN')}/admin/products/${productId}`
-    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-
+      handle: productHandle,
+      url: onlineUrl,
+    });
   } catch (e: any) {
-    return new Response(JSON.stringify({ error: e?.message || 'create_course_failed' }), { status: 500 });
+    return jsonWithCors(req, { ok: false, error: e?.message || 'courses_failed' }, { status: 500 });
   }
 }
