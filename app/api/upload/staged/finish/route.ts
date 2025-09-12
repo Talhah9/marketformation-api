@@ -1,6 +1,7 @@
 // Finalise l'upload: crée le fichier dans Shopify Files et renvoie l'URL finale.
 // Appel: POST /api/upload/staged/finish  body: { resourceUrl, kind: "image"|"pdf", alt? }
 // app/api/upload/staged/finish/route.ts
+// app/api/upload/staged/finish/route.ts
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
@@ -54,7 +55,7 @@ export async function POST(req: Request) {
 
     const isImage = String(kind || '').toLowerCase() === 'image';
 
-    // IMPORTANT : contentType = IMAGE (image) | GENERIC_FILE (pdf/autres)
+    // ⬅️ ENUM CORRECT : IMAGE (images) | FILE (PDF/autres)
     const data = await gql(
       `
       mutation fileCreate($files: [FileCreateInput!]!) {
@@ -67,12 +68,12 @@ export async function POST(req: Request) {
           userErrors { field message }
         }
       }
-    `,
+      `,
       {
         files: [
           {
             originalSource: resourceUrl,
-            contentType: isImage ? 'IMAGE' : 'GENERIC_FILE',
+            contentType: isImage ? 'IMAGE' : 'FILE',
             alt: alt || null,
           },
         ],
@@ -84,6 +85,7 @@ export async function POST(req: Request) {
     const url = isImage ? f?.image?.url : f?.url;
 
     if (!url) {
+      // Renvoi l’erreur détaillée pour que le front l’affiche
       return new Response(
         JSON.stringify({ ok: false, error: 'file_create_failed', userErrors }),
         { status: 400, headers: { 'Content-Type': 'application/json', ...CORS } }
