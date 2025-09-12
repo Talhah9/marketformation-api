@@ -18,10 +18,9 @@ const CORS = {
   Vary: 'Origin',
 };
 
-export async function OPTIONS() {
-  return new Response(null, { status: 204, headers: CORS });
-}
+export async function OPTIONS() { return new Response(null, { status: 204, headers: CORS }); }
 
+// ---------- utils ----------
 async function gql(query: string, variables: any) {
   const url = `https://${env('SHOPIFY_STORE_DOMAIN')}/admin/api/${apiV()}/graphql.json`;
   const res = await fetch(url, {
@@ -33,17 +32,15 @@ async function gql(query: string, variables: any) {
     },
     body: JSON.stringify({ query, variables }),
   });
-
-  const json: any = await res.json();
-  if (!res.ok || json.errors) {
-    throw new Error(json.errors ? JSON.stringify(json.errors) : `Shopify ${res.status}`);
-  }
-  return json.data;
+  const txt = await res.text();
+  let json: any = {};
+  try { json = txt ? JSON.parse(txt) : {}; } catch { json = { raw: txt }; }
+  return { ok: res.ok, status: res.status, body: json };
 }
 
-async function restFilesCreate(payload: any) {
+async function shopifyFilesCreate(payload: any) {
   const url = `https://${env('SHOPIFY_STORE_DOMAIN')}/admin/api/${apiV()}/files.json`;
-  const r = await fetch(url, {
+  const res = await fetch(url, {
     method: 'POST',
     headers: {
       Accept: 'application/json',
@@ -52,33 +49,34 @@ async function restFilesCreate(payload: any) {
     },
     body: JSON.stringify(payload),
   });
-  const txt = await r.text();
-  let j: any = {};
-  try { j = txt ? JSON.parse(txt) : {}; } catch {}
-  if (!r.ok) {
-    throw new Error(j?.errors ? JSON.stringify(j.errors) : `Shopify REST ${r.status}`);
-  }
-  return j;
+  const txt = await res.text();
+  let body: any = {};
+  try { body = txt ? JSON.parse(txt) : {}; } catch { body = { raw: txt }; }
+  return { ok: res.ok, status: res.status, body };
 }
 
+function extractUrlFromFiles(body: any) {
+  return body?.file?.url || body?.files?.[0]?.url || null;
+}
+
+// ---------- handler ----------
 export async function POST(req: Request) {
   try {
     const { resourceUrl, kind, alt, filename, mimeType } = await req.json();
-
     if (!resourceUrl) {
-      return new Response(
-        JSON.stringify({ ok: false, error: 'resourceUrl_required' }),
-        { status: 400, headers: { 'Content-Type': 'application/json', ...CORS } }
-      );
+      return new Response(JSON.stringify({ ok:false, error:'resourceUrl_required' }), {
+        status: 400, headers: { 'Content-Type':'application/json', ...CORS }
+      });
     }
 
-    const isImage = String(kind || '').toLowerCase() === 'image';
-    const safeName = filename || (isImage ? `image-${Date.now()}.bin` : `file-${Date.now()}.bin`);
-    const safeMime = mimeType || (isImage ? 'image/png' : 'application/octet-stream');
+    const isImage  = String(kind || '').toLowerCase() === 'image';
+    const safeName = filename || (isImage ? `image-${Date.now()}.bin` : `file-${Date.now()}.pdf`);
+    const safeMime = mimeType || (isImage ? 'image/png' : 'application/pdf');
 
-    // 1) TENTATIVE GRAPHQL
-    try {
-      const data = await gql(
+    // 1) GraphQL fileCreate (IMAGE | FILE)
+    let gqlUserErrors: any[] = [];
+    {
+      const r = await gql(
         `
         mutation fileCreate($files: [FileCreateInput!]!) {
           fileCreate(files: $files) {
@@ -90,115 +88,74 @@ export async function POST(req: Request) {
             userErrors { field message }
           }
         }
-      `,
-        {
-          files: [
-            {
-              originalSource: resourceUrl,
-              contentType: isImage ? 'IMAGE' : 'FILE', // <-- ENUM CORRECT
-              alt: alt || null,
-            },
-          ],
-        }
+        `,
+        { files: [{ originalSource: resourceUrl, contentType: isImage ? 'IMAGE' : 'FILE', alt: alt || null }] }
       );
-
-      const userErrors = data?.fileCreate?.userErrors || [];
-      const f = data?.fileCreate?.files?.[0];
-      const url = isImage ? f?.image?.url : f?.url;
-
-      if (url) {
-        return new Response(JSON.stringify({ ok: true, url }), {
-          status: 200, headers: { 'Content-Type': 'application/json', ...CORS },
-        });
-      }
-
-      // 2) FALLBACK REST : utiliser directement la source signée (pas de base64)
-      try {
-        const out = await restFilesCreate({
-          file: {
-            source: resourceUrl,
-            filename: safeName,
-            mime_type: safeMime,
-            alt: alt || undefined,
-          },
-        });
-        const restUrl = out?.file?.url || out?.files?.[0]?.url;
-        if (restUrl) {
-          return new Response(JSON.stringify({ ok: true, url: restUrl, userErrors }), {
-            status: 200, headers: { 'Content-Type': 'application/json', ...CORS },
+      if (r.ok) {
+        const data = r.body?.data;
+        const f = data?.fileCreate?.files?.[0];
+        const url = isImage ? f?.image?.url : f?.url;
+        gqlUserErrors = data?.fileCreate?.userErrors || [];
+        if (url) {
+          return new Response(JSON.stringify({ ok:true, url, via:'gql' }), {
+            status: 200, headers: { 'Content-Type':'application/json', ...CORS }
           });
         }
-        // 3) DERNIER FALLBACK : télécharger puis envoyer en attachment base64
-        const s3 = await fetch(resourceUrl);
-        if (!s3.ok) throw new Error(`s3_fetch_failed_${s3.status}`);
-        const buff = Buffer.from(await s3.arrayBuffer());
-        const attachment = buff.toString('base64');
-        const out2 = await restFilesCreate({
-          file: {
-            attachment,
-            filename: safeName,
-            mime_type: safeMime,
-            alt: alt || undefined,
-          },
-        });
-        const restUrl2 = out2?.file?.url || out2?.files?.[0]?.url;
-        if (restUrl2) {
-          return new Response(JSON.stringify({ ok: true, url: restUrl2, userErrors }), {
-            status: 200, headers: { 'Content-Type': 'application/json', ...CORS },
-          });
-        }
-        return new Response(
-          JSON.stringify({ ok: false, error: 'file_create_failed', userErrors }),
-          { status: 400, headers: { 'Content-Type': 'application/json', ...CORS } }
-        );
-      } catch (restErr: any) {
-        return new Response(
-          JSON.stringify({
-            ok: false,
-            error: 'file_create_failed_rest',
-            details: restErr?.message || String(restErr),
-            userErrors,
-          }),
-          { status: 400, headers: { 'Content-Type': 'application/json', ...CORS } }
-        );
-      }
-    } catch (gqlErr: any) {
-      // Si la mutation GQL elle-même crashe, on tente directement REST (source)
-      try {
-        const out = await restFilesCreate({
-          file: {
-            source: resourceUrl,
-            filename: safeName,
-            mime_type: safeMime,
-            alt: alt || undefined,
-          },
-        });
-        const restUrl = out?.file?.url || out?.files?.[0]?.url;
-        if (restUrl) {
-          return new Response(JSON.stringify({ ok: true, url: restUrl, errorGraphQL: gqlErr?.message || 'gql_failed' }), {
-            status: 200, headers: { 'Content-Type': 'application/json', ...CORS },
-          });
-        }
-        return new Response(
-          JSON.stringify({ ok: false, error: 'file_create_failed', errorGraphQL: gqlErr?.message || 'gql_failed' }),
-          { status: 400, headers: { 'Content-Type': 'application/json', ...CORS } }
-        );
-      } catch (restErr: any) {
-        return new Response(
-          JSON.stringify({
-            ok: false,
-            error: 'finish_failed',
-            details: { graphQL: gqlErr?.message || 'gql_failed', rest: restErr?.message || 'rest_failed' },
-          }),
-          { status: 500, headers: { 'Content-Type': 'application/json', ...CORS } }
-        );
+      } else {
+        // on garde le corps d'erreur: r.body
+        gqlUserErrors = [{ field: ['graphql'], message: JSON.stringify(r.body) }];
       }
     }
-  } catch (e: any) {
-    return new Response(
-      JSON.stringify({ ok: false, error: e?.message || 'finish_failed' }),
-      { status: 500, headers: { 'Content-Type': 'application/json', ...CORS } }
-    );
+
+    // 2) REST files.json avec "source"
+    const restSource = await shopifyFilesCreate({
+      file: { source: resourceUrl, filename: safeName, mime_type: safeMime, alt: alt || undefined }
+    });
+    if (restSource.ok) {
+      const url = extractUrlFromFiles(restSource.body);
+      if (url) {
+        return new Response(JSON.stringify({ ok:true, url, via:'rest_source' }), {
+          status: 200, headers: { 'Content-Type':'application/json', ...CORS }
+        });
+      }
+    }
+
+    // 3) REST files.json avec "attachment" (base64)
+    let restAttachment: any = null;
+    try {
+      const s3 = await fetch(resourceUrl);
+      const buff = Buffer.from(await s3.arrayBuffer());
+      const attachment = buff.toString('base64');
+      restAttachment = await shopifyFilesCreate({
+        file: { attachment, filename: safeName, mime_type: safeMime, alt: alt || undefined }
+      });
+      if (restAttachment.ok) {
+        const url = extractUrlFromFiles(restAttachment.body);
+        if (url) {
+          return new Response(JSON.stringify({ ok:true, url, via:'rest_attachment' }), {
+            status: 200, headers: { 'Content-Type':'application/json', ...CORS }
+          });
+        }
+      }
+    } catch (e:any) {
+      restAttachment = { ok: false, status: 0, body: { error: e?.message || 'attachment_b64_failed' } };
+    }
+
+    // rien n'a marché → on renvoie TOUT le diagnostic
+    const debug = {
+      gqlUserErrors,
+      restSource,
+      restAttachment,
+    };
+    console.error('finish debug:', JSON.stringify(debug, null, 2)); // visible dans les logs Vercel
+
+    return new Response(JSON.stringify({ ok:false, error:'file_create_failed', debug }), {
+      status: 400, headers: { 'Content-Type':'application/json', ...CORS }
+    });
+
+  } catch (e:any) {
+    return new Response(JSON.stringify({ ok:false, error: e?.message || 'finish_failed' }), {
+      status: 500, headers: { 'Content-Type':'application/json', ...CORS }
+    });
   }
 }
-
