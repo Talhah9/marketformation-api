@@ -1,59 +1,28 @@
 // Upload image → Shopify Files CDN (REST)
 // Prérequis env: SHOPIFY_STORE_DOMAIN, SHOPIFY_ADMIN_API_ACCESS_TOKEN
+import { put } from '@vercel/blob';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const CORS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'POST,OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-  'Vary': 'Origin',
-};
-export async function OPTIONS(){ return new Response(null,{status:204,headers:CORS}); }
+export async function POST(req: Request) {
+  try {
+    const form = await req.formData();
+    const file = form.get('image') as File | null;
+    if (!file) return new Response(JSON.stringify({ error: 'no_image' }), { status: 400 });
 
-function env(n:string){ const v=process.env[n]; if(!v) throw new Error(`Missing env: ${n}`); return v; }
-async function shopify(path:string, init:RequestInit){
-  const apiV = process.env.SHOPIFY_API_VERSION || '2024-07';
-  const url  = `https://${env('SHOPIFY_STORE_DOMAIN')}/admin/api/${apiV}${path}`;
-  const res  = await fetch(url, {
-    ...init,
-    headers: {
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      'X-Shopify-Access-Token': env('SHOPIFY_ADMIN_API_ACCESS_TOKEN'),
-      ...(init.headers||{})
-    }
-  });
-  const txt = await res.text(); let json:any={}; try{ json = txt?JSON.parse(txt):{} }catch{}
-  if(!res.ok) throw new Error(json?.errors ? JSON.stringify(json.errors) : `Shopify ${res.status}`);
-  return json;
-}
+    const ext = (file.name?.split('.').pop() || 'png').toLowerCase();
+    const key = `courses/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
 
-export async function POST(req: Request){
-  try{
-    const fd = await req.formData();
-    const file = fd.get('image') || fd.get('file');
-    if(!(file instanceof File)){
-      return new Response(JSON.stringify({error:"field 'image' manquant"}),{status:400,headers:{'Content-Type':'application/json',...CORS}});
-    }
-
-    const attachment = Buffer.from(await file.arrayBuffer()).toString('base64');
-    const out = await shopify('/files.json', {
-      method:'POST',
-      body: JSON.stringify({
-        file: {
-          attachment,
-          filename: file.name || `image-${Date.now()}`,
-          mime_type: file.type || 'image/png' // <-- IMPORTANT
-        }
-      })
+    const blob = await put(key, Buffer.from(await file.arrayBuffer()), {
+      access: 'public',
+      contentType: file.type || 'image/png',
     });
 
-    const url = out?.file?.url || out?.files?.[0]?.url;
-    if(!url) throw new Error('upload_failed');
-
-    return new Response(JSON.stringify({ url }), { status:200, headers:{'Content-Type':'application/json',...CORS} });
-  }catch(e:any){
-    return new Response(JSON.stringify({ error: e?.message || 'upload_failed' }), { status:500, headers:{'Content-Type':'application/json',...CORS} });
+    return new Response(JSON.stringify({ url: blob.url }), {
+      status: 200, headers: { 'Content-Type': 'application/json' }
+    });
+  } catch (e: any) {
+    return new Response(JSON.stringify({ error: e?.message || 'upload_image_failed' }), { status: 500 });
   }
 }
+
