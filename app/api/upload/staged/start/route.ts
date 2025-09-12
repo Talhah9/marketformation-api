@@ -21,9 +21,9 @@ async function gql(query:string, variables:any){
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/json',
-      'X-Shopify-Access-Token': env('SHOPIFY_ADMIN_API_ACCESS_TOKEN')
+      'X-Shopify-Access-Token': env('SHOPIFY_ADMIN_API_ACCESS_TOKEN'),
     },
-    body: JSON.stringify({ query, variables })
+    body: JSON.stringify({ query, variables }),
   });
   const json:any = await res.json();
   if (!res.ok || json.errors) throw new Error(json.errors ? JSON.stringify(json.errors) : `Shopify ${res.status}`);
@@ -38,6 +38,9 @@ export async function POST(req: Request){
     const filename = body?.filename || (kind === 'image' ? `image-${Date.now()}.png` : `file-${Date.now()}.pdf`);
     const mimeType = body?.mimeType || (kind === 'image' ? 'image/png' : 'application/pdf');
 
+    // ⬅️ CLÉ : resource dépend du type
+    const resource = (kind === 'image') ? 'IMAGE' : 'FILE';
+
     const data = await gql(`
       mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
         stagedUploadsCreate(input: $input) {
@@ -45,17 +48,20 @@ export async function POST(req: Request){
           userErrors { field message }
         }
       }
-    `, { input: [{ resource: "FILE", filename, mimeType, httpMethod: "POST" }]});
+    `, { input: [{ resource, filename, mimeType, httpMethod: "POST" }]});
 
-    const target = data?.stagedUploadsCreate?.stagedTargets?.[0];
-    if (!target?.url || !target?.resourceUrl) throw new Error('staging_failed');
+    const t = data?.stagedUploadsCreate?.stagedTargets?.[0];
+    const ue = data?.stagedUploadsCreate?.userErrors || [];
+    if (!t?.url || !t?.resourceUrl) {
+      return new Response(JSON.stringify({ ok:false, error:'staging_failed', userErrors: ue }), { status: 400, headers:{'Content-Type':'application/json', ...CORS} });
+    }
 
     return new Response(JSON.stringify({
       ok: true,
       kind,
-      postUrl: target.url,
-      resourceUrl: target.resourceUrl,
-      params: target.parameters || []
+      postUrl: t.url,
+      resourceUrl: t.resourceUrl,
+      params: t.parameters || []
     }), { status: 200, headers: { 'Content-Type': 'application/json', ...CORS } });
   }catch(e:any){
     return new Response(JSON.stringify({ ok:false, error: e?.message || 'start_failed' }), {
