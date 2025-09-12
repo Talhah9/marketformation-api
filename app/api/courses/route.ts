@@ -1,12 +1,13 @@
 // Crée un produit Course et liste les courses d'un formateur via tag trainer:<email>
 // app/api/courses/route.ts
 // app/api/courses/route.ts
+// app/api/courses/route.ts
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const STORE = process.env.SHOPIFY_STORE_DOMAIN!;                     // ex: tqiccz-96.myshopify.com
+const STORE = process.env.SHOPIFY_STORE_DOMAIN!;                     // ex: tqiccz-96.myshopify.com (sans https)
 const TOKEN = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN!;           // shpat_...
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-07';
 
@@ -14,9 +15,9 @@ type CreateCourseBody = {
   title: string;
   description: string;
   collectionHandle?: string;
-  coverUrl?: string;     // URL publique (retournée par /api/upload/image)
-  pdfUrl?: string;       // URL publique (retournée par /api/upload/pdf)
-  price?: number;        // centimes (1990 = 19,90 €)
+  coverUrl?: string;
+  pdfUrl?: string;
+  price?: number;        // centimes
   customerEmail?: string | null;
   customerId?: number | null;
 };
@@ -37,13 +38,65 @@ async function shopifyFetch(path: string, init?: RequestInit) {
   return { ok: r.ok, status: r.status, json, text, statusText: r.statusText };
 }
 
+/* ---------- CORS preflight ---------- */
 export async function OPTIONS(req: Request) {
   return handleOptions(req);
 }
 
+/* ---------- GET /api/courses?email=...  ---------- */
+/* Liste les formations de l’utilisateur :
+   - filtre par vendor = email (défini à la création)
+   - renvoie un tableau items[] consumable par ton JS
+*/
+export async function GET(req: Request) {
+  try {
+    if (!STORE || !TOKEN) {
+      return jsonWithCors(req, { ok: false, error: 'server_misconfigured' }, { status: 500 });
+    }
+
+    const url = new URL(req.url);
+    const email = (url.searchParams.get('email') || '').trim();
+    const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 250);
+
+    // champs utiles pour la liste
+    let path = `/products.json?limit=${limit}&status=active&fields=id,title,handle,images,vendor,tags,created_at`;
+    if (email) path += `&vendor=${encodeURIComponent(email)}`;
+
+    const resp = await shopifyFetch(path);
+    if (!resp.ok) {
+      return jsonWithCors(req, {
+        ok: false,
+        error: 'list_failed',
+        detail: resp.json?.errors || resp.text || resp.statusText,
+        status: resp.status,
+      }, { status: 502 });
+    }
+
+    const products = resp.json?.products || [];
+    // ne garder que ceux taggés mf_trainer (sécurité côté lecture)
+    const filtered = products.filter((p: any) => (p.tags || '').split(',').map((t: string) => t.trim().toLowerCase()).includes('mf_trainer'));
+
+    const items = filtered.map((p: any) => ({
+      id: p.id,
+      title: p.title,
+      handle: p.handle,
+      coverUrl: p.images?.[0]?.src || null,
+      vendor: p.vendor,
+      tags: p.tags,
+      createdAt: p.created_at,
+      url: p.handle ? `https://${STORE}/products/${p.handle}` : null,
+    }));
+
+    return jsonWithCors(req, { ok: true, items });
+  } catch (e: any) {
+    return jsonWithCors(req, { ok: false, error: e?.message || 'list_failed' }, { status: 500 });
+  }
+}
+
+/* ---------- POST /api/courses  ---------- */
+/* Création d’une formation : payload minimal + ajouts post-création */
 export async function POST(req: Request) {
   try {
-    // --- Sanity / CORS ---
     const ct = req.headers.get('content-type') || '';
     if (!ct.includes('application/json')) {
       return jsonWithCors(req, { ok: false, error: 'content_type_required_json' }, { status: 415 });
@@ -53,12 +106,15 @@ export async function POST(req: Request) {
     }
 
     const body = (await req.json()) as CreateCourseBody;
-    const { title, description, collectionHandle, coverUrl, pdfUrl, price } = body || {};
+    const {
+      title, description, collectionHandle, coverUrl, pdfUrl, price,
+      customerEmail, customerId
+    } = body || {};
     if (!title || !description) {
       return jsonWithCors(req, { ok: false, error: 'missing_fields' }, { status: 400 });
     }
 
-    // --- 0) Ping token / boutique : /shop.json ---
+    // 0) Ping boutique
     const ping = await shopifyFetch('/shop.json');
     if (!ping.ok) {
       return jsonWithCors(req, {
@@ -69,7 +125,7 @@ export async function POST(req: Request) {
       }, { status: 502 });
     }
 
-    // --- 1) Création produit : payload minimal pour éviter 422 ---
+    // 1) Création produit (minimal & robuste)
     const variantPrice = price ? (price / 100).toFixed(2) : '19.90';
     const productPayload = {
       product: {
@@ -77,7 +133,9 @@ export async function POST(req: Request) {
         body_html: description,
         status: 'active',
         tags: ['mf_trainer'],
-        variants: [{ price: variantPrice }],  // variante par défaut
+        // <— IMPORTANT : vendor = email pour pouvoir filtrer en GET
+        vendor: (customerEmail || 'mf').toString(),
+        variants: [{ price: variantPrice }],
       },
     };
 
@@ -86,7 +144,6 @@ export async function POST(req: Request) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(productPayload),
     });
-
     if (!create.ok) {
       return jsonWithCors(req, {
         ok: false,
@@ -100,38 +157,69 @@ export async function POST(req: Request) {
     const productId: number | undefined = product?.id;
     const handle: string | undefined = product?.handle;
 
-    // --- 2) Image : ajout après création (évite 422 à la création si URL non accessible) ---
+    // 2) Image après création
     if (productId && coverUrl) {
       const img = await shopifyFetch(`/products/${productId}/images.json`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ image: { src: coverUrl } }),
       });
-      if (!img.ok) {
-        console.warn('[courses] add image failed', img.status, img.text);
+      if (!img.ok) console.warn('[courses] add image failed', img.status, img.text);
+    }
+
+    // 3) Metafields owner & pdf
+    if (productId) {
+      // owner email
+      if (customerEmail) {
+        const mfOwner = await shopifyFetch(`/products/${productId}/metafields.json`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            metafield: {
+              namespace: 'mf',
+              key: 'owner_email',
+              type: 'single_line_text_field',
+              value: customerEmail,
+            },
+          }),
+        });
+        if (!mfOwner.ok) console.warn('[courses] owner_email metafield failed', mfOwner.status, mfOwner.text);
+      }
+      // owner id
+      if (typeof customerId === 'number') {
+        const mfOwnerId = await shopifyFetch(`/products/${productId}/metafields.json`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            metafield: {
+              namespace: 'mf',
+              key: 'owner_id',
+              type: 'number_integer',
+              value: String(customerId),
+            },
+          }),
+        });
+        if (!mfOwnerId.ok) console.warn('[courses] owner_id metafield failed', mfOwnerId.status, mfOwnerId.text);
+      }
+      // pdf
+      if (pdfUrl) {
+        const mfPdf = await shopifyFetch(`/products/${productId}/metafields.json`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            metafield: {
+              namespace: 'mf',
+              key: 'pdf_url',
+              type: 'single_line_text_field',
+              value: pdfUrl,
+            },
+          }),
+        });
+        if (!mfPdf.ok) console.warn('[courses] pdf_url metafield failed', mfPdf.status, mfPdf.text);
       }
     }
 
-    // --- 3) Metafield PDF : ajout après création (évite les contraintes de définition) ---
-    if (productId && pdfUrl) {
-      const mf = await shopifyFetch(`/products/${productId}/metafields.json`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          metafield: {
-            namespace: 'mf',
-            key: 'pdf_url',
-            type: 'single_line_text_field',
-            value: pdfUrl,
-          },
-        }),
-      });
-      if (!mf.ok) {
-        console.warn('[courses] add metafield failed', mf.status, mf.text);
-      }
-    }
-
-    // --- 4) Collection par handle (optionnel) ---
+    // 4) Ajout à la collection par handle (optionnel)
     if (productId && collectionHandle) {
       const cc = await shopifyFetch(`/custom_collections.json?handle=${encodeURIComponent(collectionHandle)}`);
       const collId: number | undefined = cc.json?.custom_collections?.[0]?.id;
@@ -141,9 +229,7 @@ export async function POST(req: Request) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ collect: { product_id: productId, collection_id: collId } }),
         });
-        if (!collect.ok) {
-          console.warn('[courses] collect failed', collect.status, collect.text);
-        }
+        if (!collect.ok) console.warn('[courses] collect failed', collect.status, collect.text);
       } else {
         console.warn(`[courses] collection not found for handle="${collectionHandle}"`);
       }
