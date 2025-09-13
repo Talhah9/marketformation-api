@@ -54,7 +54,7 @@ export async function POST(req: Request) {
   try {
     const { shopifyCustomerId, email } = await req.json().catch(() => ({} as any));
 
-    // 1) Déterminer l'email
+    // 1) Déterminer l'email (body → Shopify)
     let customerEmail: string | null = email || null;
     if (!customerEmail && shopifyCustomerId) {
       customerEmail = await getShopifyCustomerEmail(shopifyCustomerId);
@@ -68,27 +68,27 @@ export async function POST(req: Request) {
     const customer = list.data[0];
     if (!customer) return jsonWithCors(req, { status: 'none', reason: 'no_customer' });
 
-    // 3) Lire abonnement actif
+    // 3) Lire un abonnement actif (expand limité pour éviter >4 niveaux)
     const subs = await stripe.subscriptions.list({
       customer: customer.id,
       status: 'all',
-      expand: ['data.items.data.price.product', 'data.latest_invoice.payment_intent'],
+      expand: ['data.items.data.price'], // ✅ pas de ".product" ici
       limit: 10,
     });
-    const active = subs.data.find(s => ['active', 'trialing', 'past_due', 'unpaid'].includes(s.status));
+    const active = subs.data.find(s => ['active','trialing','past_due','unpaid'].includes(s.status));
     if (!active) return jsonWithCors(req, { status: 'none', reason: 'no_active_sub' });
 
     const price = active.items.data[0]?.price as Stripe.Price | undefined;
     const priceId = price?.id ?? null;
 
-    // 4) Trouver planKey (ENV → déduction)
+    // 4) Déterminer planKey (ENV → déduction → fallback metadata → fetch prix)
     let planKey: PlanKey = priceIdToPlanKey(priceId);
     if (!planKey && price) planKey = inferPlanKey(price);
     if (!planKey && active.metadata?.plan_from_price) {
       planKey = priceIdToPlanKey(active.metadata.plan_from_price);
     }
     if (!planKey && priceId) {
-      const pr = await stripe.prices.retrieve(priceId, { expand: ['product'] });
+      const pr = await stripe.prices.retrieve(priceId, { expand: ['product'] }); // appel séparé autorisé
       planKey = inferPlanKey(pr);
     }
 
