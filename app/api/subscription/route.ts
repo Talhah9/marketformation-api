@@ -1,13 +1,40 @@
 // app/api/subscription/route.ts
 import Stripe from 'stripe';
-import { NextResponse } from 'next/server';
-import { priceIdToPlanKey } from '@/lib/plans';
+import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
+
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2024-06-20' });
 
 const STORE = process.env.SHOPIFY_STORE_DOMAIN!;
 const TOKEN = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN!;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-07';
+
+type PlanKey = 'starter' | 'pro' | 'business' | null;
+
+function priceIdToPlanKey(priceId: string | null | undefined): PlanKey {
+  if (!priceId) return null;
+  const map: Record<string, PlanKey> = {
+    [process.env.STRIPE_PRICE_STARTER ?? '']: 'starter',
+    [process.env.STRIPE_PRICE_PRO ?? '']: 'pro',
+    [process.env.STRIPE_PRICE_BUSINESS ?? '']: 'business',
+  };
+  return map[priceId] ?? null;
+}
+
+function inferPlanKey(p: Stripe.Price): PlanKey {
+  const name = `${p.nickname || ''} ${(typeof p.product !== 'string' && p.product?.name) || ''}`.toLowerCase();
+  if (name.includes('starter')) return 'starter';
+  if (name.includes('pro')) return 'pro';
+  if (name.includes('business') || name.includes('entreprise')) return 'business';
+  switch (p.unit_amount) {
+    case 1990: return 'starter';
+    case 3990: return 'pro';
+    case 6990: return 'business';
+    default: return null;
+  }
+}
 
 async function getShopifyCustomerEmail(id: number | string): Promise<string | null> {
   if (!STORE || !TOKEN) return null;
@@ -21,68 +48,51 @@ async function getShopifyCustomerEmail(id: number | string): Promise<string | nu
   return j?.customer?.email ?? null;
 }
 
-type PlanKey = 'starter' | 'pro' | 'business';
-
-function inferPlanKeyFromPriceObj(p: Stripe.Price): PlanKey | null {
-  const name = `${p.nickname || ''} ${(typeof p.product !== 'string' && p.product?.name) || ''}`.toLowerCase();
-  if (name.includes('starter')) return 'starter';
-  if (name.includes('pro')) return 'pro';
-  if (name.includes('business') || name.includes('entreprise')) return 'business';
-  switch (p.unit_amount) {
-    case 1990: return 'starter';
-    case 3990: return 'pro';
-    case 6990: return 'business';
-    default: return null;
-  }
-}
+export async function OPTIONS(req: Request) { return handleOptions(req); }
 
 export async function POST(req: Request) {
   try {
-    const { shopifyCustomerId, email } = await req.json().catch(() => ({}));
+    const { shopifyCustomerId, email } = await req.json().catch(() => ({} as any));
 
-    // 1) email à partir du body ou de Shopify
+    // 1) Déterminer l'email
     let customerEmail: string | null = email || null;
     if (!customerEmail && shopifyCustomerId) {
       customerEmail = await getShopifyCustomerEmail(shopifyCustomerId);
     }
-    if (!customerEmail) return NextResponse.json({ status: 'none', reason: 'no_email' });
+    if (!customerEmail) {
+      return jsonWithCors(req, { status: 'none', reason: 'no_email' });
+    }
 
-    // 2) retrouver le customer Stripe par email
+    // 2) Retrouver le customer Stripe par email
     const list = await stripe.customers.list({ email: customerEmail, limit: 1 });
     const customer = list.data[0];
-    if (!customer) return NextResponse.json({ status: 'none' });
+    if (!customer) return jsonWithCors(req, { status: 'none', reason: 'no_customer' });
 
-    // 3) trouver un abonnement actif
+    // 3) Lire abonnement actif
     const subs = await stripe.subscriptions.list({
       customer: customer.id,
       status: 'all',
-      expand: ['data.items.data.price.product'],
+      expand: ['data.items.data.price.product', 'data.latest_invoice.payment_intent'],
       limit: 10,
     });
-    const active = subs.data.find(s => ['active','trialing','past_due','unpaid'].includes(s.status));
-    if (!active) return NextResponse.json({ status: 'none' });
+    const active = subs.data.find(s => ['active', 'trialing', 'past_due', 'unpaid'].includes(s.status));
+    if (!active) return jsonWithCors(req, { status: 'none', reason: 'no_active_sub' });
 
     const price = active.items.data[0]?.price as Stripe.Price | undefined;
-    const priceId = price?.id || null;
+    const priceId = price?.id ?? null;
 
-    // 4) mapping vers planKey
-    let planKey: PlanKey | null = priceId ? (priceIdToPlanKey(priceId) as PlanKey | null) : null;
-    if (!planKey && price) {
-      // fallback sans ENV: nom/nickname/amount
-      planKey = inferPlanKeyFromPriceObj(price);
-      // dernier secours: lire la metadata posée au checkout
-      if (!planKey && active.metadata?.plan_from_price) {
-        const pid = active.metadata.plan_from_price;
-        planKey = priceIdToPlanKey(pid) as PlanKey | null;
-      }
-      // si toujours rien, on tente une requête price->product (déjà expand ci-dessus normalement)
-      if (!planKey && priceId) {
-        const pr = await stripe.prices.retrieve(priceId, { expand: ['product'] });
-        planKey = inferPlanKeyFromPriceObj(pr);
-      }
+    // 4) Trouver planKey (ENV → déduction)
+    let planKey: PlanKey = priceIdToPlanKey(priceId);
+    if (!planKey && price) planKey = inferPlanKey(price);
+    if (!planKey && active.metadata?.plan_from_price) {
+      planKey = priceIdToPlanKey(active.metadata.plan_from_price);
+    }
+    if (!planKey && priceId) {
+      const pr = await stripe.prices.retrieve(priceId, { expand: ['product'] });
+      planKey = inferPlanKey(pr);
     }
 
-    return NextResponse.json({
+    return jsonWithCors(req, {
       status: active.status,
       planKey,
       currentPeriodEnd: active.current_period_end * 1000,
@@ -90,8 +100,8 @@ export async function POST(req: Request) {
       priceId,
     });
   } catch (err: any) {
-    const msg = err?.message || err?.raw?.message || 'subscription_failed';
+    const msg = err?.raw?.message || err?.message || 'subscription_failed';
     const code = err?.statusCode || 500;
-    return NextResponse.json({ status: 'none', error: msg }, { status: code });
+    return jsonWithCors(req, { status: 'none', error: msg }, { status: code });
   }
 }
