@@ -1,6 +1,6 @@
-// Retourne l'état d'abonnement Stripe d'un formateur (status, planKey, etc.)
-// Accepte { email } ou { shopifyCustomerId } ; tolérant (pas de 400 pour params manquants)
 // app/api/subscription/route.ts
+// Retourne l'état d'abonnement Stripe (status, planKey, etc.)
+// ➜ Utilise STRIPE_PRICE_STARTER/PRO/BUSINESS pour mapper le priceId → planKey
 
 import Stripe from 'stripe';
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
@@ -10,6 +10,7 @@ export const dynamic = 'force-dynamic';
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2024-06-20' });
 
+// Shopify (fallback pour retrouver l'email depuis l'id client si besoin)
 const STORE = process.env.SHOPIFY_STORE_DOMAIN!;
 const TOKEN = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN!;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-07';
@@ -26,6 +27,7 @@ function mapPriceId(priceId: string | null | undefined): PlanKey {
   return map[priceId] ?? null;
 }
 
+// Petit filet de sécurité si jamais un ENV manque
 function inferPlanKey(p: Stripe.Price): PlanKey {
   const name = `${p.nickname || ''} ${(typeof p.product !== 'string' && p.product?.name) || ''}`.toLowerCase();
   if (name.includes('starter')) return 'starter';
@@ -51,7 +53,9 @@ async function getShopifyCustomerEmail(id: number | string): Promise<string | nu
   return j?.customer?.email ?? null;
 }
 
-export async function OPTIONS(req: Request) { return handleOptions(req); }
+export async function OPTIONS(req: Request) {
+  return handleOptions(req);
+}
 
 export async function POST(req: Request) {
   try {
@@ -71,28 +75,32 @@ export async function POST(req: Request) {
     const customer = list.data[0];
     if (!customer) return jsonWithCors(req, { status: 'none', reason: 'no_customer' });
 
-    // 3) Lire un abonnement actif (expand limité)
+    // 3) Lire un abonnement (expand limité pour respecter la profondeur)
     const subs = await stripe.subscriptions.list({
       customer: customer.id,
       status: 'all',
-      expand: ['data.items.data.price'], // pas de .product (limite profondeur)
+      expand: ['data.items.data.price'], // pas de ".product" ici
       limit: 10,
     });
-    const active = subs.data.find(s => ['active','trialing','past_due','unpaid'].includes(s.status));
+    const active = subs.data.find(s => ['active', 'trialing', 'past_due', 'unpaid'].includes(s.status));
     if (!active) return jsonWithCors(req, { status: 'none', reason: 'no_active_sub' });
 
     const price = active.items.data[0]?.price as Stripe.Price | undefined;
     const priceId = price?.id ?? null;
 
-    // 4) Déterminer planKey (ENV → inférence → metadata → fetch prix)
+    // 4) Déterminer planKey (ENV d'abord, puis filets de sécurité)
     let planKey: PlanKey = mapPriceId(priceId);
-    if (!planKey && price) planKey = inferPlanKey(price);
     if (!planKey && active.metadata?.plan_from_price) {
       planKey = mapPriceId(active.metadata.plan_from_price);
     }
-    if (!planKey && priceId) {
-      const pr = await stripe.prices.retrieve(priceId, { expand: ['product'] });
-      planKey = inferPlanKey(pr);
+    if (!planKey && price) {
+      // si jamais un ENV manque, essaie d'inférer via nom/montant
+      planKey = inferPlanKey(price);
+      // ou, en dernier recours, fetch du product pour récupérer son nom
+      if (!planKey && priceId) {
+        const pr = await stripe.prices.retrieve(priceId, { expand: ['product'] });
+        planKey = inferPlanKey(pr);
+      }
     }
 
     return jsonWithCors(req, {
@@ -104,7 +112,7 @@ export async function POST(req: Request) {
     });
   } catch (err: any) {
     const msg = err?.raw?.message || err?.message || 'subscription_failed';
-    // Tolérant : reste en 200 pour éviter les exceptions côté client
+    // Tolérant : on reste en 200 pour éviter les exceptions côté client
     return jsonWithCors(req, { status: 'none', error: msg });
   }
 }
