@@ -54,13 +54,13 @@ export async function POST(req: Request) {
   try {
     const { shopifyCustomerId, email } = await req.json().catch(() => ({} as any));
 
-    // 1) Déterminer l'email (body → Shopify)
+    // 1) Déterminer l'email
     let customerEmail: string | null = email || null;
     if (!customerEmail && shopifyCustomerId) {
       customerEmail = await getShopifyCustomerEmail(shopifyCustomerId);
     }
     if (!customerEmail) {
-      return jsonWithCors(req, { status: 'none', reason: 'no_email' });
+      return jsonWithCors(req, { status: 'none', reason: 'no_email' }); // 200, pas 400
     }
 
     // 2) Retrouver le customer Stripe par email
@@ -68,11 +68,11 @@ export async function POST(req: Request) {
     const customer = list.data[0];
     if (!customer) return jsonWithCors(req, { status: 'none', reason: 'no_customer' });
 
-    // 3) Lire un abonnement actif (expand limité pour éviter >4 niveaux)
+    // 3) Lire un abonnement actif (expand limité)
     const subs = await stripe.subscriptions.list({
       customer: customer.id,
       status: 'all',
-      expand: ['data.items.data.price'], // ✅ pas de ".product" ici
+      expand: ['data.items.data.price'], // pas de .product ici
       limit: 10,
     });
     const active = subs.data.find(s => ['active','trialing','past_due','unpaid'].includes(s.status));
@@ -81,14 +81,14 @@ export async function POST(req: Request) {
     const price = active.items.data[0]?.price as Stripe.Price | undefined;
     const priceId = price?.id ?? null;
 
-    // 4) Déterminer planKey (ENV → déduction → fallback metadata → fetch prix)
+    // 4) Trouver planKey (ENV → déduction → fallback metadata → fetch prix)
     let planKey: PlanKey = priceIdToPlanKey(priceId);
     if (!planKey && price) planKey = inferPlanKey(price);
     if (!planKey && active.metadata?.plan_from_price) {
       planKey = priceIdToPlanKey(active.metadata.plan_from_price);
     }
     if (!planKey && priceId) {
-      const pr = await stripe.prices.retrieve(priceId, { expand: ['product'] }); // appel séparé autorisé
+      const pr = await stripe.prices.retrieve(priceId, { expand: ['product'] }); // appel séparé
       planKey = inferPlanKey(pr);
     }
 
@@ -101,7 +101,7 @@ export async function POST(req: Request) {
     });
   } catch (err: any) {
     const msg = err?.raw?.message || err?.message || 'subscription_failed';
-    const code = err?.statusCode || 500;
-    return jsonWithCors(req, { status: 'none', error: msg }, { status: code });
+    // Même en erreur, on reste en 200 pour éviter les exceptions côté client
+    return jsonWithCors(req, { status: 'none', error: msg });
   }
 }
