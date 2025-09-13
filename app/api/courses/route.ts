@@ -1,8 +1,8 @@
 // Crée un produit Course et liste les courses d'un formateur via tag trainer:<email>
 // app/api/courses/route.ts
-// app/api/courses/route.ts
-// app/api/courses/route.ts
+
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
+import { assertCanPublish } from '@/lib/gating';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -21,6 +21,13 @@ type CreateCourseBody = {
   customerEmail?: string | null;
   customerId?: number | null;
 };
+
+function baseUrlFromReq(req: Request) {
+  return (
+    process.env.PUBLIC_BASE_URL ||
+    (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : new URL(req.url).origin)
+  );
+}
 
 async function shopifyFetch(path: string, init?: RequestInit) {
   const url = `https://${STORE}/admin/api/${API_VERSION}${path}`;
@@ -74,7 +81,12 @@ export async function GET(req: Request) {
 
     const products = resp.json?.products || [];
     // ne garder que ceux taggés mf_trainer (sécurité côté lecture)
-    const filtered = products.filter((p: any) => (p.tags || '').split(',').map((t: string) => t.trim().toLowerCase()).includes('mf_trainer'));
+    const filtered = products.filter((p: any) =>
+      (p.tags || '')
+        .split(',')
+        .map((t: string) => t.trim().toLowerCase())
+        .includes('mf_trainer')
+    );
 
     const items = filtered.map((p: any) => ({
       id: p.id,
@@ -94,7 +106,9 @@ export async function GET(req: Request) {
 }
 
 /* ---------- POST /api/courses  ---------- */
-/* Création d’une formation : payload minimal + ajouts post-création */
+/* Création d’une formation : payload minimal + ajouts post-création
+   + GATING ABONNEMENT : vérifie le plan actif et le quota mensuel avant création
+*/
 export async function POST(req: Request) {
   try {
     const ct = req.headers.get('content-type') || '';
@@ -113,8 +127,30 @@ export async function POST(req: Request) {
     if (!title || !description) {
       return jsonWithCors(req, { ok: false, error: 'missing_fields' }, { status: 400 });
     }
+    if (typeof customerId !== 'number') {
+      return jsonWithCors(req, { ok: false, error: 'customer_id_required' }, { status: 400 });
+    }
 
-    // 0) Ping boutique
+    // 0) Vérification abonnement + quota (Starter = 3/mois)
+    const base = baseUrlFromReq(req);
+    const subResp = await fetch(`${base}/api/subscription`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ shopifyCustomerId: customerId }),
+      cache: 'no-store',
+    });
+    if (!subResp.ok) {
+      return jsonWithCors(req, { ok: false, error: 'subscription_lookup_failed' }, { status: 402 });
+    }
+    const sub = await subResp.json();
+    if (!sub?.planKey) {
+      return jsonWithCors(req, { ok: false, error: 'subscription_required' }, { status: 402 });
+    }
+
+    // Lance l'assertion de quota (lève 402 si dépassé)
+    await assertCanPublish(customerId as any, sub.planKey);
+
+    // 1) Ping boutique
     const ping = await shopifyFetch('/shop.json');
     if (!ping.ok) {
       return jsonWithCors(req, {
@@ -125,7 +161,7 @@ export async function POST(req: Request) {
       }, { status: 502 });
     }
 
-    // 1) Création produit (minimal & robuste)
+    // 2) Création produit (minimal & robuste)
     const variantPrice = price ? (price / 100).toFixed(2) : '19.90';
     const productPayload = {
       product: {
@@ -157,7 +193,7 @@ export async function POST(req: Request) {
     const productId: number | undefined = product?.id;
     const handle: string | undefined = product?.handle;
 
-    // 2) Image après création
+    // 3) Image après création
     if (productId && coverUrl) {
       const img = await shopifyFetch(`/products/${productId}/images.json`, {
         method: 'POST',
@@ -167,7 +203,7 @@ export async function POST(req: Request) {
       if (!img.ok) console.warn('[courses] add image failed', img.status, img.text);
     }
 
-    // 3) Metafields owner & pdf
+    // 4) Metafields owner & pdf
     if (productId) {
       // owner email
       if (customerEmail) {
@@ -219,7 +255,7 @@ export async function POST(req: Request) {
       }
     }
 
-    // 4) Ajout à la collection par handle (optionnel)
+    // 5) Ajout à la collection par handle (optionnel)
     if (productId && collectionHandle) {
       const cc = await shopifyFetch(`/custom_collections.json?handle=${encodeURIComponent(collectionHandle)}`);
       const collId: number | undefined = cc.json?.custom_collections?.[0]?.id;
