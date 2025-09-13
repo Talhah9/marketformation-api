@@ -1,15 +1,18 @@
 // lib/plans.ts
 export const PLAN_CONFIG = {
-  starter: { priceEnv: 'STRIPE_PRICE_STARTER', monthlyLimit: 3 },
-  pro:      { priceEnv: 'STRIPE_PRICE_PRO',      monthlyLimit: Infinity },
-  business: { priceEnv: 'STRIPE_PRICE_BUSINESS', monthlyLimit: Infinity },
-};
+  starter:  { name: 'Starter',  monthlyLimit: 3 },
+  pro:      { name: 'Pro',      monthlyLimit: Infinity },
+  business: { name: 'Business', monthlyLimit: Infinity },
+} as const;
 
-export const priceIdToPlanKey = (priceId: string) => {
-  const map = {
+export type PlanKey = keyof typeof PLAN_CONFIG;
+
+export const priceIdToPlanKey = (priceId: string | undefined | null): PlanKey | null => {
+  if (!priceId) return null;
+  const map: Record<string, PlanKey> = {
     [process.env.STRIPE_PRICE_STARTER!]: 'starter',
     [process.env.STRIPE_PRICE_PRO!]: 'pro',
     [process.env.STRIPE_PRICE_BUSINESS!]: 'business',
-  } as Record<string,string>;
+  };
   return map[priceId] ?? null;
 };
