@@ -1,4 +1,7 @@
+// Retourne l'état d'abonnement Stripe d'un formateur (status, planKey, etc.)
+// Accepte { email } ou { shopifyCustomerId } ; tolérant (pas de 400 pour params manquants)
 // app/api/subscription/route.ts
+
 import Stripe from 'stripe';
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 
@@ -13,7 +16,7 @@ const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-07';
 
 type PlanKey = 'starter' | 'pro' | 'business' | null;
 
-function priceIdToPlanKey(priceId: string | null | undefined): PlanKey {
+function mapPriceId(priceId: string | null | undefined): PlanKey {
   if (!priceId) return null;
   const map: Record<string, PlanKey> = {
     [process.env.STRIPE_PRICE_STARTER ?? '']: 'starter',
@@ -60,10 +63,10 @@ export async function POST(req: Request) {
       customerEmail = await getShopifyCustomerEmail(shopifyCustomerId);
     }
     if (!customerEmail) {
-      return jsonWithCors(req, { status: 'none', reason: 'no_email' }); // 200, pas 400
+      return jsonWithCors(req, { status: 'none', reason: 'no_email' });
     }
 
-    // 2) Retrouver le customer Stripe par email
+    // 2) Retrouver le Customer Stripe par email
     const list = await stripe.customers.list({ email: customerEmail, limit: 1 });
     const customer = list.data[0];
     if (!customer) return jsonWithCors(req, { status: 'none', reason: 'no_customer' });
@@ -72,7 +75,7 @@ export async function POST(req: Request) {
     const subs = await stripe.subscriptions.list({
       customer: customer.id,
       status: 'all',
-      expand: ['data.items.data.price'], // pas de .product ici
+      expand: ['data.items.data.price'], // pas de .product (limite profondeur)
       limit: 10,
     });
     const active = subs.data.find(s => ['active','trialing','past_due','unpaid'].includes(s.status));
@@ -81,14 +84,14 @@ export async function POST(req: Request) {
     const price = active.items.data[0]?.price as Stripe.Price | undefined;
     const priceId = price?.id ?? null;
 
-    // 4) Trouver planKey (ENV → déduction → fallback metadata → fetch prix)
-    let planKey: PlanKey = priceIdToPlanKey(priceId);
+    // 4) Déterminer planKey (ENV → inférence → metadata → fetch prix)
+    let planKey: PlanKey = mapPriceId(priceId);
     if (!planKey && price) planKey = inferPlanKey(price);
     if (!planKey && active.metadata?.plan_from_price) {
-      planKey = priceIdToPlanKey(active.metadata.plan_from_price);
+      planKey = mapPriceId(active.metadata.plan_from_price);
     }
     if (!planKey && priceId) {
-      const pr = await stripe.prices.retrieve(priceId, { expand: ['product'] }); // appel séparé
+      const pr = await stripe.prices.retrieve(priceId, { expand: ['product'] });
       planKey = inferPlanKey(pr);
     }
 
@@ -101,7 +104,7 @@ export async function POST(req: Request) {
     });
   } catch (err: any) {
     const msg = err?.raw?.message || err?.message || 'subscription_failed';
-    // Même en erreur, on reste en 200 pour éviter les exceptions côté client
+    // Tolérant : reste en 200 pour éviter les exceptions côté client
     return jsonWithCors(req, { status: 'none', error: msg });
   }
 }
