@@ -1,4 +1,5 @@
-// Crée un produit Course et liste les courses d'un formateur via tag trainer:<email>
+// Crée un produit Course et liste les courses d'un formateur (vendor = email)
+// Gating abonnement : vérifie plan actif + quota avant création
 // app/api/courses/route.ts
 
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
@@ -38,6 +39,7 @@ async function shopifyFetch(path: string, init?: RequestInit) {
       'Accept': 'application/json',
       ...(init?.headers || {}),
     },
+    cache: 'no-store',
   });
   const text = await r.text();
   let json: any = undefined;
@@ -45,15 +47,25 @@ async function shopifyFetch(path: string, init?: RequestInit) {
   return { ok: r.ok, status: r.status, json, text, statusText: r.statusText };
 }
 
+// Résoudre l'ID client Shopify à partir de l'email (si besoin)
+async function shopifyFindCustomerIdByEmail(email: string): Promise<number | null> {
+  if (!email) return null;
+  const path = `/customers/search.json?query=${encodeURIComponent(`email:"${email}"`)}`;
+  const r = await shopifyFetch(path);
+  if (!r.ok) return null;
+  const id = r.json?.customers?.[0]?.id;
+  return typeof id === 'number' ? id : null;
+}
+
 /* ---------- CORS preflight ---------- */
 export async function OPTIONS(req: Request) {
   return handleOptions(req);
 }
 
-/* ---------- GET /api/courses?email=...  ---------- */
+/* ---------- GET /api/courses?email=... ---------- */
 /* Liste les formations de l’utilisateur :
    - filtre par vendor = email (défini à la création)
-   - renvoie un tableau items[] consumable par ton JS
+   - renvoie items[] consommables par le front
 */
 export async function GET(req: Request) {
   try {
@@ -65,7 +77,6 @@ export async function GET(req: Request) {
     const email = (url.searchParams.get('email') || '').trim();
     const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 250);
 
-    // champs utiles pour la liste
     let path = `/products.json?limit=${limit}&status=active&fields=id,title,handle,images,vendor,tags,created_at`;
     if (email) path += `&vendor=${encodeURIComponent(email)}`;
 
@@ -80,7 +91,6 @@ export async function GET(req: Request) {
     }
 
     const products = resp.json?.products || [];
-    // ne garder que ceux taggés mf_trainer (sécurité côté lecture)
     const filtered = products.filter((p: any) =>
       (p.tags || '')
         .split(',')
@@ -101,11 +111,12 @@ export async function GET(req: Request) {
 
     return jsonWithCors(req, { ok: true, items });
   } catch (e: any) {
+    console.error('[courses][GET] error', e?.message || e);
     return jsonWithCors(req, { ok: false, error: e?.message || 'list_failed' }, { status: 500 });
   }
 }
 
-/* ---------- POST /api/courses  ---------- */
+/* ---------- POST /api/courses ---------- */
 /* Création d’une formation : payload minimal + ajouts post-création
    + GATING ABONNEMENT : vérifie le plan actif et le quota mensuel avant création
 */
@@ -127,16 +138,24 @@ export async function POST(req: Request) {
     if (!title || !description) {
       return jsonWithCors(req, { ok: false, error: 'missing_fields' }, { status: 400 });
     }
-    if (typeof customerId !== 'number') {
-      return jsonWithCors(req, { ok: false, error: 'customer_id_required' }, { status: 400 });
+
+    // 0) Résoudre un customerId Shopify valide (via email si nécessaire)
+    let resolvedCustomerId: number | null =
+      typeof customerId === 'number' && customerId > 0 ? customerId : null;
+
+    if (!resolvedCustomerId && customerEmail) {
+      resolvedCustomerId = await shopifyFindCustomerIdByEmail(customerEmail);
+    }
+    if (!resolvedCustomerId) {
+      return jsonWithCors(req, { ok: false, error: 'shopify_customer_not_found' }, { status: 400 });
     }
 
-    // 0) Vérification abonnement + quota (Starter = 3/mois)
+    // 1) Vérification abonnement + quota (Starter = 3/mois)
     const base = baseUrlFromReq(req);
     const subResp = await fetch(`${base}/api/subscription`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ shopifyCustomerId, email: customerEmail }),
+      body: JSON.stringify({ shopifyCustomerId: resolvedCustomerId, email: customerEmail }),
       cache: 'no-store',
     });
     if (!subResp.ok) {
@@ -147,10 +166,10 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: 'subscription_required' }, { status: 402 });
     }
 
-    // Lance l'assertion de quota (lève 402 si dépassé)
-    await assertCanPublish(customerId as any, sub.planKey);
+    // Quota (peut renvoyer 402 si dépassé)
+    await assertCanPublish(resolvedCustomerId, sub.planKey);
 
-    // 1) Ping boutique
+    // 2) Ping boutique
     const ping = await shopifyFetch('/shop.json');
     if (!ping.ok) {
       return jsonWithCors(req, {
@@ -161,7 +180,7 @@ export async function POST(req: Request) {
       }, { status: 502 });
     }
 
-    // 2) Création produit (minimal & robuste)
+    // 3) Création produit
     const variantPrice = price ? (price / 100).toFixed(2) : '19.90';
     const productPayload = {
       product: {
@@ -169,8 +188,7 @@ export async function POST(req: Request) {
         body_html: description,
         status: 'active',
         tags: ['mf_trainer'],
-        // <— IMPORTANT : vendor = email pour pouvoir filtrer en GET
-        vendor: (customerEmail || 'mf').toString(),
+        vendor: (customerEmail || 'mf').toString(), // pour filtrer en GET
         variants: [{ price: variantPrice }],
       },
     };
@@ -193,7 +211,7 @@ export async function POST(req: Request) {
     const productId: number | undefined = product?.id;
     const handle: string | undefined = product?.handle;
 
-    // 3) Image après création
+    // 4) Image
     if (productId && coverUrl) {
       const img = await shopifyFetch(`/products/${productId}/images.json`, {
         method: 'POST',
@@ -203,9 +221,8 @@ export async function POST(req: Request) {
       if (!img.ok) console.warn('[courses] add image failed', img.status, img.text);
     }
 
-    // 4) Metafields owner & pdf
+    // 5) Metafields owner & pdf
     if (productId) {
-      // owner email
       if (customerEmail) {
         const mfOwner = await shopifyFetch(`/products/${productId}/metafields.json`, {
           method: 'POST',
@@ -221,23 +238,21 @@ export async function POST(req: Request) {
         });
         if (!mfOwner.ok) console.warn('[courses] owner_email metafield failed', mfOwner.status, mfOwner.text);
       }
-      // owner id
-      if (typeof customerId === 'number') {
-        const mfOwnerId = await shopifyFetch(`/products/${productId}/metafields.json`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            metafield: {
-              namespace: 'mf',
-              key: 'owner_id',
-              type: 'number_integer',
-              value: String(customerId),
-            },
-          }),
-        });
-        if (!mfOwnerId.ok) console.warn('[courses] owner_id metafield failed', mfOwnerId.status, mfOwnerId.text);
-      }
-      // pdf
+
+      const mfOwnerId = await shopifyFetch(`/products/${productId}/metafields.json`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          metafield: {
+            namespace: 'mf',
+            key: 'owner_id',
+            type: 'number_integer',
+            value: String(resolvedCustomerId),
+          },
+        }),
+      });
+      if (!mfOwnerId.ok) console.warn('[courses] owner_id metafield failed', mfOwnerId.status, mfOwnerId.text);
+
       if (pdfUrl) {
         const mfPdf = await shopifyFetch(`/products/${productId}/metafields.json`, {
           method: 'POST',
@@ -255,7 +270,7 @@ export async function POST(req: Request) {
       }
     }
 
-    // 5) Ajout à la collection par handle (optionnel)
+    // 6) Ajout à la collection (optionnel)
     if (productId && collectionHandle) {
       const cc = await shopifyFetch(`/custom_collections.json?handle=${encodeURIComponent(collectionHandle)}`);
       const collId: number | undefined = cc.json?.custom_collections?.[0]?.id;
@@ -272,9 +287,11 @@ export async function POST(req: Request) {
     }
 
     const onlineUrl = handle ? `https://${STORE}/products/${handle}` : undefined;
-
     return jsonWithCors(req, { ok: true, productId, handle, url: onlineUrl });
   } catch (e: any) {
+    // Si assertCanPublish a "throw" un NextResponse, le renvoyer tel quel
+    if (e instanceof Response) return e;
+    console.error('[courses][POST] error', e?.message || e);
     return jsonWithCors(req, { ok: false, error: e?.message || 'courses_failed' }, { status: 500 });
   }
 }
