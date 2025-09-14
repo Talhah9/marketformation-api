@@ -181,7 +181,7 @@ export async function POST(req: Request) {
     const subResp = await fetch(`${base}/api/subscription`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ shopifyCustomerId: resolvedCustomerId, email: customerEmail }),
+      body: JSON.stringify({ email: customerEmail }),
       cache: 'no-store',
     });
     if (!subResp.ok) {
