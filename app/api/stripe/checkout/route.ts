@@ -1,4 +1,5 @@
-// app/api/billing/checkout/route.ts  (ou app/api/stripe/checkout/route.ts)
+// app/api/stripe/checkout/route.ts
+// Checkout minimal : reçoit { priceId, email?, returnUrl? } et renvoie { url }
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 import Stripe from 'stripe';
 
@@ -15,9 +16,8 @@ export async function OPTIONS(req: Request) {
 
 type CheckoutBody = {
   priceId: string;          // ex: price_live_...
-  email?: string | null;    // optionnel — auto remplira la session
-  returnUrl?: string | null;// optionnel — fallback ci-dessous
-  promoCode?: string | null;// optionnel — ex: TEST100
+  email?: string | null;    // optionnel
+  returnUrl?: string | null;// optionnel
 };
 
 export async function POST(req: Request) {
@@ -27,37 +27,24 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: 'content_type_required_json' }, { status: 415 });
     }
 
-    const { priceId, email, returnUrl, promoCode } = (await req.json()) as CheckoutBody;
+    const { priceId, email, returnUrl } = (await req.json()) as CheckoutBody;
     if (!priceId) {
       return jsonWithCors(req, { ok: false, error: 'missing_priceId' }, { status: 400 });
     }
 
-    // URL de retour par défaut (prod)
+    // URL de retour par défaut
     const successBase =
       returnUrl ||
       process.env.MF_RETURN_URL ||
       'https://tqiccz-96.myshopify.com/pages/mon-compte-formateur';
 
-    // (Option) Résolution du code promo vers un promotion_code id (promo_***)
-    let discounts: Stripe.Checkout.SessionCreateParams.Discount[] | undefined = undefined;
-    if (promoCode) {
-      const list = await stripe.promotionCodes.list({ code: promoCode, active: true, limit: 1 });
-      const pc = list.data[0];
-      if (pc?.id) discounts = [{ promotion_code: pc.id }];
-    }
-
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer_email: email || undefined,
       line_items: [{ price: priceId, quantity: 1 }],
+      customer_email: email || undefined,
       success_url: `${successBase}?ok=1`,
       cancel_url: `${successBase}?canceled=1`,
-
-      // 👉 affiche le champ “Code promo” sur la page Stripe
-      allow_promotion_codes: true,
-
-      // 👉 auto-applique TEST100 si tu l’envoies dans le body
-      ...(discounts ? { discounts } : {}),
+      // Pas de promo codes / discounts ici (version simple)
     });
 
     return jsonWithCors(req, { ok: true, url: session.url });
