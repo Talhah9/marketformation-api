@@ -1,37 +1,52 @@
 // app/api/courses/route.ts
-// Crée un produit "Course" et liste les courses d'un formateur (vendor = email)
-// Vérifie l'abonnement Stripe (prod) + applique le quota Starter 3/mois
-// Comportement d'erreur explicite (pas de 500 silencieux)
+// Crée un produit "Course" pour un formateur (vendor = email) + liste des courses
+// Vérifie l'abonnement Stripe + applique le quota Starter (3 / mois)
+// Champs produits: image de couverture + métachamps owner_email / owner_id / pdf_url
+// Ajoute à une collection par handle (custom/smart)
+// Réponses CORS via handleOptions/jsonWithCors
 
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
-// Si tu as cette fonction, on l’utilise, sinon on tombera sur un fallback quota local.
 import Stripe from 'stripe';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const STORE = process.env.SHOPIFY_STORE_DOMAIN!;                    // ex: tqiccz-96.myshopify.com
-const TOKEN = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN!;          // shpat_...
+/* ===== ENV requis =====
+  SHOPIFY_STORE_DOMAIN             ex: tqiccz-96.myshopify.com
+  SHOPIFY_ADMIN_API_ACCESS_TOKEN   shpat_***
+  SHOPIFY_API_VERSION              ex: 2025-07 (défaut)
+  STRIPE_SECRET_KEY (ou STRIPE_SECRET_KEY_LIVE / STRIPE_LIVE_SECRET)
+  (facultatif)
+  STRIPE_PRICE_STARTER
+  STRIPE_PRICE_PRO
+  STRIPE_PRICE_BUSINESS
+*/
+
+const STORE = process.env.SHOPIFY_STORE_DOMAIN!;
+const TOKEN = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN!;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-07';
-const STRIPE_KEY = process.env.STRIPE_SECRET_KEY || '';
 
-const stripe = STRIPE_KEY ? new Stripe(STRIPE_KEY, { apiVersion: '2024-06-20' }) : (null as any);
+// Stripe key avec fallbacks fréquents
+const STRIPE_KEY =
+  process.env.STRIPE_SECRET_KEY ||
+  process.env.STRIPE_SECRET_KEY_LIVE ||
+  process.env.STRIPE_LIVE_SECRET ||
+  '';
 
-// ===== Types
+type PlanKey = 'starter' | 'pro' | 'business' | null;
+
 type CreateCourseBody = {
   title: string;
   description: string;
   collectionHandle?: string;
   coverUrl?: string;
   pdfUrl?: string;
-  price?: number;        // en centimes
+  price?: number; // en centimes (par défaut 1990 => 19,90 €)
   customerEmail?: string | null;
   customerId?: number | null;
 };
 
-type PlanKey = 'starter' | 'pro' | 'business' | null;
-
-// ===== Utils Stripe (plan)
+// ===== Stripe helpers =====
 function mapPriceId(priceId?: string | null): PlanKey {
   if (!priceId) return null;
   const map: Record<string, PlanKey> = {
@@ -54,7 +69,7 @@ function inferPlanKey(p: Stripe.Price): PlanKey {
   }
 }
 
-// ===== Utils divers
+// ===== Utils =====
 function ym(d = new Date()) {
   return d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0');
 }
@@ -76,16 +91,15 @@ async function shopifyFetch(path: string, init?: RequestInit) {
   return { ok: r.ok, status: r.status, json, text, statusText: r.statusText };
 }
 
-// ===== Clients Shopify
+// ===== Clients Shopify =====
 async function shopifyFindCustomerIdByEmail(email: string): Promise<number | null> {
   if (!email) return null;
-  const resp = await shopifyFetch(`/customers/search.json?query=${encodeURIComponent(`email:"${email}"`)}`);
-  return resp.ok ? (resp.json?.customers?.[0]?.id ?? null) : null;
+  const r = await shopifyFetch(`/customers/search.json?query=${encodeURIComponent(`email:"${email}"`)}`);
+  return r.ok ? (r.json?.customers?.[0]?.id ?? null) : null;
 }
 async function shopifyEnsureCustomerByEmail(email: string): Promise<number | null> {
   const found = await shopifyFindCustomerIdByEmail(email);
   if (found) return found;
-
   const r = await shopifyFetch(`/customers.json`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -102,30 +116,35 @@ async function shopifyGetCustomerEmailById(id: number | string): Promise<string 
   return r.ok ? (r.json?.customer?.email ?? null) : null;
 }
 
-// ===== Metafields quota sur Customer (fallback si assertCanPublish n’est pas dispo)
+// ===== Quota (Customer metafield: mfapp.published_YYYYMM = "YYYYMM:count") =====
 const NS = 'mfapp';
-const KEY_QUOTA = 'published_YYYYMM'; // valeur stockée format "YYYYMM:count"
+const KEY_QUOTA = 'published_YYYYMM';
 
-async function getCustomerQuota(customerId: number | string) {
+async function getQuotaMetafield(customerId: number | string) {
   const r = await shopifyFetch(`/customers/${customerId}/metafields.json`);
-  if (!r.ok) return { count: 0, ymKey: ym() };
+  if (!r.ok) return { mf: null, count: 0, currentYM: ym() };
 
   const mf = (r.json?.metafields || []).find((m: any) => m.namespace === NS && m.key === KEY_QUOTA);
-  const current = ym();
+  const currentYM = ym();
 
-  if (!mf?.value) return { count: 0, ymKey: current };
+  if (!mf?.value) return { mf: null, count: 0, currentYM };
 
   const raw = String(mf.value);
   if (raw.includes(':')) {
     const [ymKey, cnt] = raw.split(':');
-    return ymKey === current ? { count: Number(cnt || 0), ymKey: current } : { count: 0, ymKey: current };
+    return { mf, count: ymKey === currentYM ? Number(cnt || 0) : 0, currentYM };
   }
-  return { count: Number(mf.value || 0), ymKey: current };
+  // ancien format numérique
+  return { mf, count: Number(mf.value || 0), currentYM };
 }
-async function setCustomerQuota(customerId: number | string, value: string, mfId?: number | string) {
+
+async function setQuotaMetafield(customerId: number | string, value: string, mfId?: number | string) {
   const body = JSON.stringify({
     metafield: {
-      namespace: NS, key: KEY_QUOTA, type: 'single_line_text_field', value,
+      namespace: NS,
+      key: KEY_QUOTA,
+      type: 'single_line_text_field',
+      value,
       ...(mfId ? { id: mfId } : { owner_resource: 'customer', owner_id: customerId }),
     },
   });
@@ -134,53 +153,42 @@ async function setCustomerQuota(customerId: number | string, value: string, mfId
     : await shopifyFetch(`/metafields.json`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
   return r.ok;
 }
-async function bumpQuotaOrThrow(customerId: number | string, planKey: Exclude<PlanKey,null>) {
+
+async function enforceQuotaOrThrow(customerId: number | string, planKey: Exclude<PlanKey, null>) {
   // Pro/Business → illimité
   if (planKey !== 'starter') return;
 
-  const r = await shopifyFetch(`/customers/${customerId}/metafields.json`);
-  const current = ym();
-  let mf: any = null;
-  if (r.ok) mf = (r.json?.metafields || []).find((m: any) => m.namespace === NS && m.key === KEY_QUOTA);
-
-  let count = 0;
-  let next = `${current}:1`;
-
-  if (mf?.value) {
-    const raw = String(mf.value);
-    if (raw.includes(':')) {
-      const [ymKey, cnt] = raw.split(':');
-      count = ymKey === current ? Number(cnt || 0) : 0;
-    } else {
-      count = Number(mf.value || 0);
-    }
-    if (count >= 3) {
-      const err = new Error('quota_reached');
-      // @ts-ignore
-      err.httpStatus = 402;
-      throw err;
-    }
-    next = `${current}:${count + 1}`;
+  const { mf, count, currentYM } = await getQuotaMetafield(customerId);
+  if (count >= 3) {
+    const err: any = new Error('quota_reached');
+    err.httpStatus = 402;
+    throw err;
   }
-
-  await setCustomerQuota(customerId, next, mf?.id);
+  const next = `${currentYM}:${count + 1}`;
+  await setQuotaMetafield(customerId, next, mf?.id);
 }
 
-// ===== Collections (support custom & smart)
+// ===== Collections =====
 async function findCollectionIdByHandle(handle: string): Promise<number | null> {
-  // 1) custom
-  let r = await shopifyFetch(`/custom_collections.json?handle=${encodeURIComponent(handle)}`);
-  if (r.ok && r.json?.custom_collections?.[0]?.id) return r.json.custom_collections[0].id;
-
-  // 2) smart
-  r = await shopifyFetch(`/smart_collections.json?handle=${encodeURIComponent(handle)}`);
-  if (r.ok && r.json?.smart_collections?.[0]?.id) return r.json.smart_collections[0].id;
-
-  // 3) fallback: liste (au cas où)
+  // custom collections (liste & filtre)
+  let r = await shopifyFetch(`/custom_collections.json?limit=250`);
+  if (r.ok) {
+    const arr = r.json?.custom_collections || [];
+    const found = arr.find((c: any) => c.handle === handle);
+    if (found?.id) return found.id;
+  }
+  // smart collections
+  r = await shopifyFetch(`/smart_collections.json?limit=250`);
+  if (r.ok) {
+    const arr = r.json?.smart_collections || [];
+    const found = arr.find((c: any) => c.handle === handle);
+    if (found?.id) return found.id;
+  }
+  // fallback global
   r = await shopifyFetch(`/collections.json?limit=250`);
   if (r.ok) {
-    const all = r.json?.collections || [];
-    const found = all.find((c: any) => c.handle === handle);
+    const arr = r.json?.collections || [];
+    const found = arr.find((c: any) => c.handle === handle);
     if (found?.id) return found.id;
   }
   return null;
@@ -215,8 +223,8 @@ export async function GET(req: Request) {
       }, { status: 502 });
     }
 
-    // On filtre par tag "mf_trainer" (sécurité)
     const products = resp.json?.products || [];
+    // sécurité: on garde uniquement ceux taggés mf_trainer
     const filtered = products.filter((p: any) =>
       (p.tags || '')
         .split(',')
@@ -266,7 +274,7 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: 'missing_fields' }, { status: 400 });
     }
 
-    // 0) Email formateur
+    // 0) Résoudre l'email
     let customerEmail = (emailFromBody || '').trim();
     if (!customerEmail && typeof customerId === 'number' && customerId > 0) {
       const e = await shopifyGetCustomerEmailById(customerId);
@@ -286,13 +294,13 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: 'shopify_customer_not_found', email: customerEmail }, { status: 400 });
     }
 
-    // 2) Vérif abonnement Stripe (pro/actif/…)
+    // 2) Vérif abonnement Stripe
+    const stripe = new Stripe(STRIPE_KEY, { apiVersion: '2024-06-20' });
     const list = await stripe.customers.list({ email: customerEmail, limit: 1 });
     const stripeCustomer = list.data[0];
     if (!stripeCustomer) {
       return jsonWithCors(req, { ok: false, error: 'subscription_required' }, { status: 402 });
     }
-
     const subs = await stripe.subscriptions.list({
       customer: stripeCustomer.id,
       status: 'all',
@@ -303,27 +311,24 @@ export async function POST(req: Request) {
     if (!active) {
       return jsonWithCors(req, { ok: false, error: 'subscription_required' }, { status: 402 });
     }
-
     const priceObj = active.items.data[0]?.price as Stripe.Price | undefined;
     const priceId = priceObj?.id ?? null;
-
-    let planKey: PlanKey = mapPriceId(priceId);
-    if (!planKey && priceObj) planKey = inferPlanKey(priceObj);
+    let planKey: PlanKey = mapPriceId(priceId) || (priceObj ? inferPlanKey(priceObj) : null);
     if (!planKey && active.metadata?.plan_from_price) planKey = mapPriceId(active.metadata.plan_from_price);
     if (!planKey) {
       return jsonWithCors(req, { ok: false, error: 'plan_unmapped' }, { status: 402 });
     }
 
-    // 3) Quota (fallback local si besoin)
+    // 3) Quota Starter (3/mois) — Pro/Business illimité
     try {
-      await bumpQuotaOrThrow(resolvedCustomerId, planKey as Exclude<PlanKey,null>);
+      await enforceQuotaOrThrow(resolvedCustomerId, planKey as Exclude<PlanKey, null>);
     } catch (err: any) {
       const msg = err?.message || 'quota_error';
       const sc = err?.httpStatus || 402;
       return jsonWithCors(req, { ok: false, error: msg }, { status: sc });
     }
 
-    // 4) Création produit
+    // 4) Création du produit
     const variantPrice = price ? (price / 100).toFixed(2) : '19.90';
     const productPayload = {
       product: {
@@ -331,11 +336,10 @@ export async function POST(req: Request) {
         body_html: description,
         status: 'active',
         tags: 'mf_trainer',
-        vendor: customerEmail,
+        vendor: customerEmail,              // utilisé pour le filtrage en GET
         variants: [{ price: variantPrice }],
       },
     };
-
     const create = await shopifyFetch('/products.json', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -349,12 +353,11 @@ export async function POST(req: Request) {
         status: create.status,
       }, { status: 502 });
     }
-
     const product = create.json?.product;
     const productId: number | undefined = product?.id;
     const handle: string | undefined = product?.handle;
 
-    // 5) Image
+    // 5) Image (post-création)
     if (productId && coverUrl) {
       const img = await shopifyFetch(`/products/${productId}/images.json`, {
         method: 'POST',
@@ -364,57 +367,42 @@ export async function POST(req: Request) {
       if (!img.ok) console.warn('[courses] add image failed', img.status, img.text);
     }
 
-    // 6) Metafields owner & pdf
+    // 6) Metafields (owner_email, owner_id, pdf_url)
     if (productId) {
       // owner_email
-      const mfOwner = await shopifyFetch(`/products/${productId}/metafields.json`, {
+      const mf1 = await shopifyFetch(`/products/${productId}/metafields.json`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          metafield: {
-            namespace: 'mf',
-            key: 'owner_email',
-            type: 'single_line_text_field',
-            value: customerEmail,
-          },
+          metafield: { namespace: 'mf', key: 'owner_email', type: 'single_line_text_field', value: customerEmail },
         }),
       });
-      if (!mfOwner.ok) console.warn('[courses] owner_email metafield failed', mfOwner.status, mfOwner.text);
+      if (!mf1.ok) console.warn('[courses] owner_email metafield failed', mf1.status, mf1.text);
 
       // owner_id
-      const mfOwnerId = await shopifyFetch(`/products/${productId}/metafields.json`, {
+      const mf2 = await shopifyFetch(`/products/${productId}/metafields.json`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          metafield: {
-            namespace: 'mf',
-            key: 'owner_id',
-            type: 'number_integer',
-            value: String(resolvedCustomerId),
-          },
+          metafield: { namespace: 'mf', key: 'owner_id', type: 'number_integer', value: String(resolvedCustomerId) },
         }),
       });
-      if (!mfOwnerId.ok) console.warn('[courses] owner_id metafield failed', mfOwnerId.status, mfOwnerId.text);
+      if (!mf2.ok) console.warn('[courses] owner_id metafield failed', mf2.status, mf2.text);
 
       // pdf_url
       if (pdfUrl) {
-        const mfPdf = await shopifyFetch(`/products/${productId}/metafields.json`, {
+        const mf3 = await shopifyFetch(`/products/${productId}/metafields.json`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            metafield: {
-              namespace: 'mf',
-              key: 'pdf_url',
-              type: 'single_line_text_field',
-              value: pdfUrl,
-            },
+            metafield: { namespace: 'mf', key: 'pdf_url', type: 'single_line_text_field', value: pdfUrl },
           }),
         });
-        if (!mfPdf.ok) console.warn('[courses] pdf_url metafield failed', mfPdf.status, mfPdf.text);
+        if (!mf3.ok) console.warn('[courses] pdf_url metafield failed', mf3.status, mf3.text);
       }
     }
 
-    // 7) Ajout à la collection (handle peut être custom ou smart)
+    // 7) Ajout à la collection (handle custom/smart)
     if (productId && collectionHandle) {
       const collId = await findCollectionIdByHandle(collectionHandle);
       if (collId) {
@@ -429,11 +417,11 @@ export async function POST(req: Request) {
       }
     }
 
+    const adminUrl = productId ? `https://${STORE}/admin/products/${productId}` : undefined;
     const onlineUrl = handle ? `https://${STORE}/products/${handle}` : undefined;
-    return jsonWithCors(req, { ok: true, productId, handle, url: onlineUrl });
+    return jsonWithCors(req, { ok: true, productId, handle, url: onlineUrl, adminUrl });
   } catch (e: any) {
     console.error('[courses][POST] error', e?.message || e);
-    // Erreur explicite → pas de 500 muet
     return jsonWithCors(req, { ok: false, error: e?.message || 'courses_failed' }, { status: e?.httpStatus || 500 });
   }
 }
