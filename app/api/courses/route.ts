@@ -1,9 +1,10 @@
 // Crée un produit "Course" et liste les courses d'un formateur (vendor = email)
-// Gating abonnement : vérifie plan actif + quota avant création
+// Vérifie l'abonnement Stripe directement (sans appel HTTP interne) + applique le quota
 // app/api/courses/route.ts
 
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 import { assertCanPublish } from '@/lib/gating';
+import Stripe from 'stripe';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -11,6 +12,8 @@ export const dynamic = 'force-dynamic';
 const STORE = process.env.SHOPIFY_STORE_DOMAIN!;                     // ex: tqiccz-96.myshopify.com (sans https)
 const TOKEN = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN!;           // shpat_...
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-07';
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2024-06-20' });
 
 type CreateCourseBody = {
   title: string;
@@ -22,6 +25,31 @@ type CreateCourseBody = {
   customerEmail?: string | null;
   customerId?: number | null;
 };
+
+type PlanKey = 'starter' | 'pro' | 'business' | null;
+
+function mapPriceId(priceId?: string | null): PlanKey {
+  if (!priceId) return null;
+  const map: Record<string, PlanKey> = {
+    [process.env.STRIPE_PRICE_STARTER ?? '']: 'starter',
+    [process.env.STRIPE_PRICE_PRO ?? '']: 'pro',
+    [process.env.STRIPE_PRICE_BUSINESS ?? '']: 'business',
+  };
+  return map[priceId] ?? null;
+}
+
+function inferPlanKey(p: Stripe.Price): PlanKey {
+  const name = `${p.nickname || ''} ${(typeof p.product !== 'string' && p.product?.name) || ''}`.toLowerCase();
+  if (name.includes('starter')) return 'starter';
+  if (name.includes('pro')) return 'pro';
+  if (name.includes('business') || name.includes('entreprise')) return 'business';
+  switch (p.unit_amount) {
+    case 1990: return 'starter';
+    case 3990: return 'pro';
+    case 6990: return 'business';
+    default: return null;
+  }
+}
 
 function baseUrlFromReq(req: Request) {
   return (
@@ -49,7 +77,6 @@ async function shopifyFetch(path: string, init?: RequestInit) {
 
 // --- Helpers Clients Shopify ---
 
-// Trouve un client par email, retourne son ID numérique
 async function shopifyFindCustomerIdByEmail(email: string): Promise<number | null> {
   if (!email) return null;
   const path = `/customers/search.json?query=${encodeURIComponent(`email:"${email}"`)}`;
@@ -59,7 +86,6 @@ async function shopifyFindCustomerIdByEmail(email: string): Promise<number | nul
   return typeof id === 'number' ? id : null;
 }
 
-// Garantit l’existence d’un client pour cet email : le trouve ou le crée
 async function shopifyEnsureCustomerByEmail(email: string): Promise<number | null> {
   const found = await shopifyFindCustomerIdByEmail(email);
   if (found) return found;
@@ -67,12 +93,7 @@ async function shopifyEnsureCustomerByEmail(email: string): Promise<number | nul
   const r = await shopifyFetch(`/customers.json`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      customer: {
-        email,
-        tags: 'mf_trainer',
-      },
-    }),
+    body: JSON.stringify({ customer: { email, tags: 'mf_trainer' } }),
   });
   if (!r.ok) {
     console.warn('[courses] create customer failed', r.status, r.text || r.statusText);
@@ -82,16 +103,18 @@ async function shopifyEnsureCustomerByEmail(email: string): Promise<number | nul
   return typeof id === 'number' ? id : null;
 }
 
+// Si l'email n'est pas fourni, on peut le retrouver via Shopify ID
+async function shopifyGetCustomerEmailById(id: number | string): Promise<string | null> {
+  const r = await shopifyFetch(`/customers/${id}.json`);
+  return r.ok ? (r.json?.customer?.email ?? null) : null;
+}
+
 /* ---------- CORS preflight ---------- */
 export async function OPTIONS(req: Request) {
   return handleOptions(req);
 }
 
 /* ---------- GET /api/courses?email=... ---------- */
-/* Liste les formations d’un formateur :
-   - filtre par vendor = email (défini à la création)
-   - renvoie items[] consommables par le front
-*/
 export async function GET(req: Request) {
   try {
     if (!STORE || !TOKEN) {
@@ -142,60 +165,82 @@ export async function GET(req: Request) {
 }
 
 /* ---------- POST /api/courses ---------- */
-/* Création d’une formation : payload minimal + ajouts post-création
-   + GATING ABONNEMENT : vérifie le plan actif et le quota mensuel avant création
-*/
 export async function POST(req: Request) {
   try {
     const ct = req.headers.get('content-type') || '';
     if (!ct.includes('application/json')) {
       return jsonWithCors(req, { ok: false, error: 'content_type_required_json' }, { status: 415 });
     }
-    if (!STORE || !TOKEN) {
+    if (!STORE || !TOKEN || !process.env.STRIPE_SECRET_KEY) {
       return jsonWithCors(req, { ok: false, error: 'server_misconfigured' }, { status: 500 });
     }
 
     const body = (await req.json()) as CreateCourseBody;
     const {
       title, description, collectionHandle, coverUrl, pdfUrl, price,
-      customerEmail, customerId,
+      customerEmail: emailFromBody, customerId
     } = body || {};
 
     if (!title || !description) {
       return jsonWithCors(req, { ok: false, error: 'missing_fields' }, { status: 400 });
     }
 
-    // 0) Résoudre un customerId Shopify valide (via email si nécessaire, sinon le créer)
+    // 0) Résoudre email
+    let customerEmail = (emailFromBody || '').trim();
+    if (!customerEmail && typeof customerId === 'number' && customerId > 0) {
+      const e = await shopifyGetCustomerEmailById(customerId);
+      if (e) customerEmail = e;
+    }
+    if (!customerEmail) {
+      return jsonWithCors(req, { ok: false, error: 'email_required' }, { status: 400 });
+    }
+
+    // 1) Résoudre/Créer un customerId Shopify valide (quota sur Customer)
     let resolvedCustomerId: number | null =
       (typeof customerId === 'number' && customerId > 0) ? customerId : null;
 
-    if (!resolvedCustomerId && customerEmail) {
+    if (!resolvedCustomerId) {
       resolvedCustomerId = await shopifyEnsureCustomerByEmail(customerEmail);
     }
     if (!resolvedCustomerId) {
-      return jsonWithCors(req, { ok: false, error: 'shopify_customer_not_found' }, { status: 400 });
+      return jsonWithCors(req, { ok: false, error: 'shopify_customer_not_found', email: customerEmail }, { status: 400 });
     }
 
-    // 1) Vérification abonnement + quota (Starter = 3/mois)
-    const base = baseUrlFromReq(req);
-    const subResp = await fetch(`${base}/api/subscription`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ email: customerEmail }),
-      cache: 'no-store',
-    });
-    if (!subResp.ok) {
-      return jsonWithCors(req, { ok: false, error: 'subscription_lookup_failed' }, { status: 402 });
-    }
-    const sub = await subResp.json();
-    if (!sub?.planKey) {
+    // 2) Vérifier l'abonnement Stripe (direct Stripe, pas d'appel HTTP interne)
+    //    - retrouve le Customer Stripe par email
+    const list = await stripe.customers.list({ email: customerEmail, limit: 1 });
+    const stripeCustomer = list.data[0];
+    if (!stripeCustomer) {
       return jsonWithCors(req, { ok: false, error: 'subscription_required' }, { status: 402 });
     }
 
-    // Quota (peut renvoyer 402 si dépassé)
-    await assertCanPublish(resolvedCustomerId, sub.planKey);
+    const subs = await stripe.subscriptions.list({
+      customer: stripeCustomer.id,
+      status: 'all',
+      expand: ['data.items.data.price'],
+      limit: 10,
+    });
+    const active = subs.data.find(s => ['active', 'trialing', 'past_due', 'unpaid'].includes(s.status));
+    if (!active) {
+      return jsonWithCors(req, { ok: false, error: 'subscription_required' }, { status: 402 });
+    }
 
-    // 2) Ping boutique
+    const priceObj = active.items.data[0]?.price as Stripe.Price | undefined;
+    const priceId = priceObj?.id ?? null;
+
+    let planKey: PlanKey = mapPriceId(priceId);
+    if (!planKey && priceObj) planKey = inferPlanKey(priceObj);
+    if (!planKey && active.metadata?.plan_from_price) {
+      planKey = mapPriceId(active.metadata.plan_from_price);
+    }
+    if (!planKey) {
+      return jsonWithCors(req, { ok: false, error: 'plan_unmapped' }, { status: 402 });
+    }
+
+    // 3) Quota (peut renvoyer 402 si dépassé)
+    await assertCanPublish(resolvedCustomerId, planKey as Exclude<PlanKey, null>);
+
+    // 4) Ping boutique
     const ping = await shopifyFetch('/shop.json');
     if (!ping.ok) {
       return jsonWithCors(req, {
@@ -206,15 +251,15 @@ export async function POST(req: Request) {
       }, { status: 502 });
     }
 
-    // 3) Création produit
+    // 5) Création produit
     const variantPrice = price ? (price / 100).toFixed(2) : '19.90';
     const productPayload = {
       product: {
         title,
         body_html: description,
         status: 'active',
-        tags: 'mf_trainer',                     // chaîne CSV côté REST
-        vendor: (customerEmail || 'mf').toString(), // pour filtrer en GET
+        tags: 'mf_trainer',                        // CSV attendu côté REST
+        vendor: customerEmail,                     // pour filtrer en GET
         variants: [{ price: variantPrice }],
       },
     };
@@ -237,7 +282,7 @@ export async function POST(req: Request) {
     const productId: number | undefined = product?.id;
     const handle: string | undefined = product?.handle;
 
-    // 4) Image (post-création)
+    // 6) Image (post-création)
     if (productId && coverUrl) {
       const img = await shopifyFetch(`/products/${productId}/images.json`, {
         method: 'POST',
@@ -247,7 +292,7 @@ export async function POST(req: Request) {
       if (!img.ok) console.warn('[courses] add image failed', img.status, img.text);
     }
 
-    // 5) Metafields owner & pdf
+    // 7) Metafields owner & pdf
     if (productId) {
       if (customerEmail) {
         const mfOwner = await shopifyFetch(`/products/${productId}/metafields.json`, {
@@ -296,7 +341,7 @@ export async function POST(req: Request) {
       }
     }
 
-    // 6) Ajout à la collection (optionnel)
+    // 8) Ajout à la collection (optionnel)
     if (productId && collectionHandle) {
       const cc = await shopifyFetch(`/custom_collections.json?handle=${encodeURIComponent(collectionHandle)}`);
       const collId: number | undefined = cc.json?.custom_collections?.[0]?.id;
@@ -315,8 +360,7 @@ export async function POST(req: Request) {
     const onlineUrl = handle ? `https://${STORE}/products/${handle}` : undefined;
     return jsonWithCors(req, { ok: true, productId, handle, url: onlineUrl });
   } catch (e: any) {
-    // Si assertCanPublish a "throw" un NextResponse/Response, le renvoyer tel quel
-    if (e instanceof Response) return e;
+    if (e instanceof Response) return e; // pour un éventuel throw Response depuis assertCanPublish
     console.error('[courses][POST] error', e?.message || e);
     return jsonWithCors(req, { ok: false, error: e?.message || 'courses_failed' }, { status: 500 });
   }
