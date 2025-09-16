@@ -6,7 +6,7 @@
 // Réponses CORS via handleOptions/jsonWithCors
 
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
-import Stripe from 'stripe';
+import stripe from '@/lib/stripe';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
