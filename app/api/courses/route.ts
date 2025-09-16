@@ -44,6 +44,7 @@ type CreateCourseBody = {
   price?: number; // en centimes (par défaut 1990 => 19,90 €)
   customerEmail?: string | null;
   customerId?: number | null;
+  stripeCustomerId?: string | null;
 };
 
 // ===== Stripe helpers =====
@@ -294,30 +295,55 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: 'shopify_customer_not_found', email: customerEmail }, { status: 400 });
     }
 
-    // 2) Vérif abonnement Stripe
-    const stripe = new Stripe(STRIPE_KEY, { apiVersion: '2024-06-20' });
-    const list = await stripe.customers.list({ email: customerEmail, limit: 1 });
-    const stripeCustomer = list.data[0];
-    if (!stripeCustomer) {
-      return jsonWithCors(req, { ok: false, error: 'subscription_required' }, { status: 402 });
+    // 2) Vérifier l'abonnement Stripe
+// (Réutilise l'instance `stripe` déjà créée en haut du fichier)
+let stripeCustomer: Stripe.Customer | null = null;
+
+if (body.stripeCustomerId) {
+  try {
+    const c = await stripe.customers.retrieve(body.stripeCustomerId);
+    if (!("deleted" in c) || !c.deleted) {
+      stripeCustomer = c as Stripe.Customer;
     }
-    const subs = await stripe.subscriptions.list({
-      customer: stripeCustomer.id,
-      status: 'all',
-      expand: ['data.items.data.price'],
-      limit: 10,
-    });
-    const active = subs.data.find(s => ['active', 'trialing', 'past_due', 'unpaid'].includes(s.status));
-    if (!active) {
-      return jsonWithCors(req, { ok: false, error: 'subscription_required' }, { status: 402 });
-    }
-    const priceObj = active.items.data[0]?.price as Stripe.Price | undefined;
-    const priceId = priceObj?.id ?? null;
-    let planKey: PlanKey = mapPriceId(priceId) || (priceObj ? inferPlanKey(priceObj) : null);
-    if (!planKey && active.metadata?.plan_from_price) planKey = mapPriceId(active.metadata.plan_from_price);
-    if (!planKey) {
-      return jsonWithCors(req, { ok: false, error: 'plan_unmapped' }, { status: 402 });
-    }
+  } catch {
+    // ignore: on tentera la recherche par email
+  }
+}
+
+if (!stripeCustomer && customerEmail) {
+  const list = await stripe.customers.list({ email: customerEmail, limit: 1 });
+  stripeCustomer = list.data[0] || null;
+}
+
+if (!stripeCustomer) {
+  return jsonWithCors(req, { ok: false, error: "subscription_required" }, { status: 402 });
+}
+
+const subs = await stripe.subscriptions.list({
+  customer: stripeCustomer.id,
+  status: "all",
+  expand: ["data.items.data.price"],
+  limit: 10,
+});
+
+const active = subs.data.find(s =>
+  ["active", "trialing", "past_due", "unpaid"].includes(s.status)
+);
+
+if (!active) {
+  return jsonWithCors(req, { ok: false, error: "subscription_required" }, { status: 402 });
+}
+
+const priceObj = active.items.data[0]?.price as Stripe.Price | undefined;
+const priceId = priceObj?.id ?? null;
+
+let planKey: PlanKey = mapPriceId(priceId);
+if (!planKey && priceObj) planKey = inferPlanKey(priceObj);
+if (!planKey && active.metadata?.plan_from_price) planKey = mapPriceId(active.metadata.plan_from_price);
+
+if (!planKey) {
+  return jsonWithCors(req, { ok: false, error: "plan_unmapped" }, { status: 402 });
+}
 
     // 3) Quota Starter (3/mois) — Pro/Business illimité
     try {
