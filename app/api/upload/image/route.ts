@@ -1,18 +1,18 @@
-// Upload image vers Vercel Blob (public) — CORS unifié
-import { put } from '@vercel/blob';
-import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
+// app/api/upload/image/route.ts
+import { put } from "@vercel/blob";
+import { handleOptions, jsonWithCors } from "@/app/api/_lib/cors";
 
-export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-const ALLOWED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp'] as const;
+const ALLOWED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp"] as const;
 const MAX_IMAGE_SIZE = 10 * 1024 * 1024; // 10 MB
 
 function sanitizeName(name: string) {
-  return (name || 'image')
+  return (name || "image")
     .toLowerCase()
-    .replace(/\s+/g, '-')
-    .replace(/[^a-z0-9._-]/g, '');
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9._-]/g, "");
 }
 
 export async function OPTIONS(req: Request) {
@@ -23,33 +23,34 @@ export async function POST(req: Request) {
   try {
     const token = process.env.BLOB_READ_WRITE_TOKEN;
     if (!token) {
-      return jsonWithCors(req, { ok: false, error: 'blob_token_missing' }, { status: 500 });
+      return jsonWithCors(req, { ok: false, error: "blob_token_missing" }, { status: 500 });
     }
 
     const form = await req.formData();
-    const file = form.get('image');
+    const file = form.get("image");
 
     if (!file || !(file instanceof File)) {
-      return jsonWithCors(req, { ok: false, error: 'missing_field_image' }, { status: 400 });
+      return jsonWithCors(req, { ok: false, error: "missing_field_image" }, { status: 400 });
     }
     if (!ALLOWED_IMAGE_TYPES.includes(file.type as any)) {
       return jsonWithCors(
         req,
-        { ok: false, error: 'invalid_mime', received: file.type, allowed: ALLOWED_IMAGE_TYPES },
+        { ok: false, error: "invalid_mime", received: file.type, allowed: ALLOWED_IMAGE_TYPES },
         { status: 415 }
       );
     }
     if (file.size > MAX_IMAGE_SIZE) {
       return jsonWithCors(
         req,
-        { ok: false, error: 'file_too_large', max: MAX_IMAGE_SIZE },
+        { ok: false, error: "file_too_large", max: MAX_IMAGE_SIZE },
         { status: 413 }
       );
     }
 
     const key = `uploads/images/${Date.now()}-${sanitizeName(file.name)}`;
+
     const uploaded = await put(key, file, {
-      access: 'public',
+      access: "public",
       contentType: file.type,
       addRandomSuffix: false,
       token,
@@ -63,7 +64,7 @@ export async function POST(req: Request) {
       mime: file.type,
     });
   } catch (e: any) {
-    console.error('upload/image error:', e);
-    return jsonWithCors(req, { ok: false, error: e?.message || 'upload_failed' }, { status: 500 });
+    console.error("upload/image error:", e);
+    return jsonWithCors(req, { ok: false, error: e?.message || "upload_failed" }, { status: 500 });
   }
 }
