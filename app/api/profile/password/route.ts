@@ -1,80 +1,299 @@
-// app/api/profile/password/route.ts
-import { NextRequest, NextResponse } from "next/server";
+// app/api/profile/route.ts
+import { NextResponse } from "next/server";
 
-const SHOP_DOMAIN = process.env.SHOP_DOMAIN || "";
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
-const API_VERSION = "2025-07";
+/** ====== ENV ====== */
+const SHOP_DOMAIN = process.env.SHOP_DOMAIN; // ex: tqiccz-96.myshopify.com
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN; // Admin API access token
+const API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-10";
+const ORIGIN = process.env.CORS_ORIGIN || "https://tqiccz-96.myshopify.com";
 
-function requireEnv() {
-  if (!SHOP_DOMAIN || !ADMIN_TOKEN) {
-    throw new Error("Server misconfigured: missing SHOP_DOMAIN or ADMIN_TOKEN");
-  }
-}
+/** ====== CORS helpers ====== */
+const corsHeaders: Record<string, string> = {
+  "Access-Control-Allow-Origin": ORIGIN,
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Max-Age": "86400",
+  Vary: "Origin",
+};
 
-async function shopify(path: string, init?: RequestInit) {
-  requireEnv();
-  const res = await fetch(`https://${SHOP_DOMAIN}/admin/api/${API_VERSION}${path}`, {
+function withCorsJSON(data: any, init: ResponseInit = {}) {
+  return new NextResponse(JSON.stringify(data), {
     ...init,
     headers: {
-      "X-Shopify-Access-Token": ADMIN_TOKEN,
-      "Content-Type": "application/json",
-      ...(init?.headers || {}),
+      "content-type": "application/json",
+      ...corsHeaders,
+      ...(init.headers as any),
     },
+  });
+}
+export async function OPTIONS() {
+  return new NextResponse(null, { status: 204, headers: corsHeaders });
+}
+
+/** ====== Utils ====== */
+function assertEnv() {
+  if (!SHOP_DOMAIN || !ADMIN_TOKEN)
+    throw new Error("Missing SHOP_DOMAIN or ADMIN_TOKEN");
+}
+
+async function adminGraphQL<T = any>(
+  query: string,
+  variables?: Record<string, any>
+): Promise<T> {
+  assertEnv();
+  const url = `https://${SHOP_DOMAIN}/admin/api/${API_VERSION}/graphql.json`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": ADMIN_TOKEN!,
+    },
+    body: JSON.stringify({ query, variables }),
     cache: "no-store",
   });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Shopify ${init?.method || "GET"} ${path} -> ${res.status}: ${text}`);
+  const j = await r.json();
+  if (!r.ok || j?.errors) {
+    throw new Error(
+      j?.errors?.[0]?.message || `Shopify GraphQL error (${r.status})`
+    );
   }
-  return res.json();
+  return j.data;
 }
 
-async function resolveCustomer({ id, email }: { id?: string | number | null; email?: string | null; }) {
+const MF_NS = "mf";
+
+/** Mappe les metafields (namespace "mf") vers {bio, avatar_url, expertise_url} */
+function pickPublicMetas(nodes?: Array<{ key: string; value: string }>) {
+  const out: Record<string, string> = {};
+  for (const n of nodes || []) out[n.key] = n.value;
+  return {
+    bio: out["bio"] || "",
+    avatar_url: out["avatar_url"] || "",
+    expertise_url: out["expertise_url"] || "",
+  };
+}
+
+function toGID(id: string | number) {
+  const s = String(id);
+  return s.startsWith("gid://") ? s : `gid://shopify/Customer/${s}`;
+}
+
+/** Cherche un client par id GID ou par email (retourne id + champs + metas) */
+async function findCustomer({
+  id,
+  email,
+}: {
+  id?: string;
+  email?: string;
+}): Promise<
+  | {
+      id: string;
+      firstName: string | null;
+      lastName: string | null;
+      email: string | null;
+      phone: string | null;
+      metas: { key: string; value: string }[];
+    }
+  | null
+> {
   if (id) {
-    const data = await shopify(`/customers/${id}.json`);
-    return data.customer;
-  }
-  if (email) {
-    const q = encodeURIComponent(`email:${email}`);
-    const data = await shopify(`/customers/search.json?query=${q}`);
-    if (!data.customers?.length) throw new Error("Customer not found for email");
-    return data.customers[0];
-  }
-  throw new Error("Provide shopifyCustomerId or email");
-}
-
-export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json();
-    const { shopifyCustomerId, email } = body;
-    const customer = await resolveCustomer({ id: shopifyCustomerId, email });
-
-    // Envoie une invitation (le client recevra un email pour définir / réinitialiser son mot de passe)
-    const payload = {
-      customer_invite: {
-        to: customer.email,
-        from: null,
-        subject: null,
-        custom_message: null
-      }
+    const data = await adminGraphQL<{
+      customer: {
+        id: string;
+        firstName: string | null;
+        lastName: string | null;
+        email: string | null;
+        phone: string | null;
+        metafields: { edges: { node: { key: string; value: string } }[] };
+      } | null;
+    }>(
+      `
+      query GetCustomer($id: ID!) {
+        customer(id: $id) {
+          id firstName lastName email phone
+          metafields(first: 10, namespace: "${MF_NS}") {
+            edges { node { key value } }
+          }
+        }
+      }`,
+      { id }
+    );
+    const c = data.customer;
+    if (!c) return null;
+    return {
+      id: c.id,
+      firstName: c.firstName,
+      lastName: c.lastName,
+      email: c.email,
+      phone: c.phone,
+      metas: c.metafields.edges.map((e) => e.node),
     };
-    await shopify(`/customers/${customer.id}/send_invite.json`, {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
+  }
 
-    return NextResponse.json({ ok: true, sent: true });
+  if (email) {
+    const q = `email:"${email.replace(/"/g, '\\"')}"`;
+    const data = await adminGraphQL<{
+      customers: {
+        edges: {
+          node: {
+            id: string;
+            firstName: string | null;
+            lastName: string | null;
+            email: string | null;
+            phone: string | null;
+            metafields: { edges: { node: { key: string; value: string } }[] };
+          };
+        }[];
+      };
+    }>(
+      `
+      query FindCustomerByEmail($q: String!) {
+        customers(first: 1, query: $q) {
+          edges {
+            node {
+              id firstName lastName email phone
+              metafields(first: 10, namespace: "${MF_NS}") {
+                edges { node { key value } }
+              }
+            }
+          }
+        }
+      }`,
+      { q }
+    );
+    const edge = data.customers.edges?.[0];
+    if (!edge) return null;
+    const c = edge.node;
+    return {
+      id: c.id,
+      firstName: c.firstName,
+      lastName: c.lastName,
+      email: c.email,
+      phone: c.phone,
+      metas: c.metafields.edges.map((e) => e.node),
+    };
+  }
+
+  return null;
+}
+
+/** ====== GET ======
+ * Query params: ?shopifyCustomerId=123 | ?email=foo@bar.com
+ */
+export async function GET(req: Request) {
+  try {
+    const { searchParams } = new URL(req.url);
+    const idRaw = searchParams.get("shopifyCustomerId") || undefined;
+    const email = searchParams.get("email") || undefined;
+
+    if (!idRaw && !email) {
+      return withCorsJSON({ ok: false, error: "Missing identifier." }, { status: 400 });
+    }
+
+    const id = idRaw ? toGID(idRaw) : undefined;
+    const c = await findCustomer({ id, email });
+    if (!c) return withCorsJSON({ ok: false, error: "Customer not found." }, { status: 404 });
+
+    const profile = pickPublicMetas(c.metas);
+    return withCorsJSON({
+      ok: true,
+      profile,
+      customer: {
+        id: c.id,
+        firstName: c.firstName,
+        lastName: c.lastName,
+        email: c.email,
+        phone: c.phone,
+      },
+    });
   } catch (e: any) {
-    return NextResponse.json({ ok: false, error: e.message }, { status: 400 });
+    return withCorsJSON({ ok: false, error: e?.message || "Server error" }, { status: 500 });
   }
 }
 
-export function OPTIONS() {
-  return new NextResponse(null, {
-    status: 204,
-    headers: {
-      "Access-Control-Allow-Methods": "POST,OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
-    },
-  });
+/** ====== POST ======
+ * Body JSON (tout optionnel mais il faut un identifiant):
+ * {
+ *   shopifyCustomerId?: string, email?: string,
+ *   // Métas publics
+ *   bio?: string, avatar_url?: string, expertise_url?: string,
+ *   // Infos compte (non public)
+ *   firstName?: string, lastName?: string, emailNew?: string, phone?: string
+ * }
+ */
+export async function POST(req: Request) {
+  try {
+    const body = await req.json().catch(() => ({}));
+    const idRaw: string | undefined = body.shopifyCustomerId;
+    const email: string | undefined = body.email;
+    if (!idRaw && !email) {
+      return withCorsJSON({ ok: false, error: "Missing identifier." }, { status: 400 });
+    }
+
+    const found = await findCustomer({ id: idRaw ? toGID(idRaw) : undefined, email });
+    if (!found) return withCorsJSON({ ok: false, error: "Customer not found." }, { status: 404 });
+
+    const customerId = found.id;
+
+    // 1) Update infos compte si fourni
+    const updInput: Record<string, any> = { id: customerId };
+    if (typeof body.firstName === "string") updInput.firstName = body.firstName;
+    if (typeof body.lastName === "string") updInput.lastName = body.lastName;
+    if (typeof body.emailNew === "string" && body.emailNew) updInput.email = body.emailNew;
+    if (typeof body.phone === "string") updInput.phone = body.phone;
+
+    if (Object.keys(updInput).length > 1) {
+      const data = await adminGraphQL<{
+        customerUpdate: { customer: { id: string } | null; userErrors: { message: string }[] };
+      }>(
+        `
+        mutation UpdateCustomer($input: CustomerInput!) {
+          customerUpdate(input: $input) {
+            customer { id }
+            userErrors { message }
+          }
+        }`,
+        { input: updInput }
+      );
+      const errs = data.customerUpdate.userErrors;
+      if (errs?.length) {
+        return withCorsJSON({ ok: false, error: errs.map((e) => e.message).join("; ") }, { status: 400 });
+      }
+    }
+
+    // 2) Update métas publics si fourni
+    const metas: any[] = [];
+    if (typeof body.bio === "string")
+      metas.push({ ownerId: customerId, namespace: MF_NS, key: "bio", type: "multi_line_text_field", value: body.bio });
+    if (typeof body.avatar_url === "string" && body.avatar_url)
+      metas.push({ ownerId: customerId, namespace: MF_NS, key: "avatar_url", type: "url", value: body.avatar_url });
+    if (typeof body.expertise_url === "string" && body.expertise_url)
+      metas.push({ ownerId: customerId, namespace: MF_NS, key: "expertise_url", type: "url", value: body.expertise_url });
+
+    if (metas.length) {
+      const data = await adminGraphQL<{
+        metafieldsSet: { metafields: { key: string }[]; userErrors: { message: string }[] };
+      }>(
+        `
+        mutation SetMetas($metas: [MetafieldsSetInput!]!) {
+          metafieldsSet(metafields: $metas) {
+            metafields { key }
+            userErrors { message }
+          }
+        }`,
+        { metas }
+      );
+      const errs = data.metafieldsSet.userErrors;
+      if (errs?.length) {
+        return withCorsJSON({ ok: false, error: errs.map((e) => e.message).join("; ") }, { status: 400 });
+      }
+    }
+
+    // 3) Relire et renvoyer l'état
+    const c = await findCustomer({ id: customerId });
+    const profile = pickPublicMetas(c?.metas);
+    return withCorsJSON({ ok: true, profile, customer: { id: c?.id, firstName: c?.firstName, lastName: c?.lastName, email: c?.email, phone: c?.phone } });
+  } catch (e: any) {
+    return withCorsJSON({ ok: false, error: e?.message || "Server error" }, { status: 500 });
+  }
 }
