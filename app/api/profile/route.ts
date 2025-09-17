@@ -1,39 +1,26 @@
 // app/api/profile/route.ts
 import { NextResponse } from "next/server";
+import { handleOptions, jsonWithCors } from "@/app/api/_lib/cors";
 
-/** ====== ENV ====== */
-const SHOP_DOMAIN = process.env.SHOP_DOMAIN; // ex: tqiccz-96.myshopify.com
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN; // Admin API access token
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+/** ====== ENV (compat) ====== */
+const STORE =
+  process.env.SHOPIFY_STORE_DOMAIN ||
+  process.env.SHOP_DOMAIN ||
+  "";
+const TOKEN =
+  process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN ||
+  process.env.ADMIN_TOKEN ||
+  "";
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-10";
-const ORIGIN = process.env.CORS_ORIGIN || "https://tqiccz-96.myshopify.com";
-
-/** ====== CORS helpers ====== */
-const corsHeaders: Record<string, string> = {
-  "Access-Control-Allow-Origin": ORIGIN,
-  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-  "Access-Control-Max-Age": "86400",
-  Vary: "Origin",
-};
-
-function withCorsJSON(data: any, init: ResponseInit = {}) {
-  return new NextResponse(JSON.stringify(data), {
-    ...init,
-    headers: {
-      "content-type": "application/json",
-      ...corsHeaders,
-      ...(init.headers as any),
-    },
-  });
-}
-export async function OPTIONS() {
-  return new NextResponse(null, { status: 204, headers: corsHeaders });
-}
 
 /** ====== Utils ====== */
 function assertEnv() {
-  if (!SHOP_DOMAIN || !ADMIN_TOKEN)
-    throw new Error("Missing SHOP_DOMAIN or ADMIN_TOKEN");
+  if (!STORE || !TOKEN) {
+    throw new Error("Missing SHOPIFY_STORE_DOMAIN/SHOP_DOMAIN or SHOPIFY_ADMIN_API_ACCESS_TOKEN/ADMIN_TOKEN");
+  }
 }
 
 async function adminGraphQL<T = any>(
@@ -41,28 +28,32 @@ async function adminGraphQL<T = any>(
   variables?: Record<string, any>
 ): Promise<T> {
   assertEnv();
-  const url = `https://${SHOP_DOMAIN}/admin/api/${API_VERSION}/graphql.json`;
+  const url = `https://${STORE}/admin/api/${API_VERSION}/graphql.json`;
   const r = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Shopify-Access-Token": ADMIN_TOKEN!,
+      "X-Shopify-Access-Token": TOKEN,
+      "Accept": "application/json",
     },
     body: JSON.stringify({ query, variables }),
     cache: "no-store",
   });
-  const j = await r.json();
+  const text = await r.text();
+  let j: any = {};
+  try { j = text ? JSON.parse(text) : {}; } catch {}
   if (!r.ok || j?.errors) {
-    throw new Error(
-      j?.errors?.[0]?.message || `Shopify GraphQL error (${r.status})`
-    );
+    throw new Error(j?.errors?.[0]?.message || `Shopify GraphQL error (${r.status})`);
   }
   return j.data;
 }
 
 const MF_NS = "mf";
+function toGID(id: string | number) {
+  const s = String(id);
+  return s.startsWith("gid://") ? s : `gid://shopify/Customer/${s}`;
+}
 
-/** Mappe les metafields (namespace "mf") vers {bio, avatar_url, expertise_url} */
 function pickPublicMetas(nodes?: Array<{ key: string; value: string }>) {
   const out: Record<string, string> = {};
   for (const n of nodes || []) out[n.key] = n.value;
@@ -73,37 +64,18 @@ function pickPublicMetas(nodes?: Array<{ key: string; value: string }>) {
   };
 }
 
-function toGID(id: string | number) {
-  const s = String(id);
-  return s.startsWith("gid://") ? s : `gid://shopify/Customer/${s}`;
-}
-
-/** Cherche un client par id GID ou par email (retourne id + champs + metas) */
-async function findCustomer({
-  id,
-  email,
-}: {
-  id?: string;
-  email?: string;
-}): Promise<
-  | {
-      id: string;
-      firstName: string | null;
-      lastName: string | null;
-      email: string | null;
-      phone: string | null;
-      metas: { key: string; value: string }[];
-    }
-  | null
-> {
-  if (id) {
+async function findCustomer(opts: { id?: string; email?: string }): Promise<{
+  id: string;
+  firstName: string | null;
+  lastName: string | null;
+  email: string | null;
+  phone: string | null;
+  metas: { key: string; value: string }[];
+} | null> {
+  if (opts.id) {
     const data = await adminGraphQL<{
       customer: {
-        id: string;
-        firstName: string | null;
-        lastName: string | null;
-        email: string | null;
-        phone: string | null;
+        id: string; firstName: string | null; lastName: string | null; email: string | null; phone: string | null;
         metafields: { edges: { node: { key: string; value: string } }[] };
       } | null;
     }>(
@@ -116,7 +88,7 @@ async function findCustomer({
           }
         }
       }`,
-      { id }
+      { id: opts.id }
     );
     const c = data.customer;
     if (!c) return null;
@@ -126,25 +98,17 @@ async function findCustomer({
       lastName: c.lastName,
       email: c.email,
       phone: c.phone,
-      metas: c.metafields.edges.map((e) => e.node),
+      metas: c.metafields.edges.map(e => e.node),
     };
   }
 
-  if (email) {
-    const q = `email:"${email.replace(/"/g, '\\"')}"`;
+  if (opts.email) {
+    const q = `email:"${opts.email.replace(/"/g, '\\"')}"`;
     const data = await adminGraphQL<{
-      customers: {
-        edges: {
-          node: {
-            id: string;
-            firstName: string | null;
-            lastName: string | null;
-            email: string | null;
-            phone: string | null;
-            metafields: { edges: { node: { key: string; value: string } }[] };
-          };
-        }[];
-      };
+      customers: { edges: { node: {
+        id: string; firstName: string | null; lastName: string | null; email: string | null; phone: string | null;
+        metafields: { edges: { node: { key: string; value: string } }[] };
+      } }[] };
     }>(
       `
       query FindCustomerByEmail($q: String!) {
@@ -170,16 +134,19 @@ async function findCustomer({
       lastName: c.lastName,
       email: c.email,
       phone: c.phone,
-      metas: c.metafields.edges.map((e) => e.node),
+      metas: c.metafields.edges.map(e => e.node),
     };
   }
 
   return null;
 }
 
-/** ====== GET ======
- * Query params: ?shopifyCustomerId=123 | ?email=foo@bar.com
- */
+/** ---------- CORS preflight ---------- */
+export async function OPTIONS(req: Request) {
+  return handleOptions(req);
+}
+
+/** ---------- GET /api/profile?shopifyCustomerId=123 | ?email=foo@bar.com ---------- */
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
@@ -187,37 +154,31 @@ export async function GET(req: Request) {
     const email = searchParams.get("email") || undefined;
 
     if (!idRaw && !email) {
-      return withCorsJSON({ ok: false, error: "Missing identifier." }, { status: 400 });
+      return jsonWithCors(req, { ok: false, error: "Missing identifier." }, { status: 400 });
     }
 
     const id = idRaw ? toGID(idRaw) : undefined;
     const c = await findCustomer({ id, email });
-    if (!c) return withCorsJSON({ ok: false, error: "Customer not found." }, { status: 404 });
+    if (!c) return jsonWithCors(req, { ok: false, error: "Customer not found." }, { status: 404 });
 
     const profile = pickPublicMetas(c.metas);
-    return withCorsJSON({
+    return jsonWithCors(req, {
       ok: true,
       profile,
-      customer: {
-        id: c.id,
-        firstName: c.firstName,
-        lastName: c.lastName,
-        email: c.email,
-        phone: c.phone,
-      },
+      customer: { id: c.id, firstName: c.firstName, lastName: c.lastName, email: c.email, phone: c.phone },
     });
   } catch (e: any) {
-    return withCorsJSON({ ok: false, error: e?.message || "Server error" }, { status: 500 });
+    return jsonWithCors(req, { ok: false, error: e?.message || "Server error" }, { status: 500 });
   }
 }
 
-/** ====== POST ======
- * Body JSON (tout optionnel mais il faut un identifiant):
+/** ---------- POST /api/profile ----------
+ * Body JSON (id ou email requis):
  * {
  *   shopifyCustomerId?: string, email?: string,
  *   // Métas publics
  *   bio?: string, avatar_url?: string, expertise_url?: string,
- *   // Infos compte (non public)
+ *   // Infos compte
  *   firstName?: string, lastName?: string, emailNew?: string, phone?: string
  * }
  */
@@ -227,11 +188,11 @@ export async function POST(req: Request) {
     const idRaw: string | undefined = body.shopifyCustomerId;
     const email: string | undefined = body.email;
     if (!idRaw && !email) {
-      return withCorsJSON({ ok: false, error: "Missing identifier." }, { status: 400 });
+      return jsonWithCors(req, { ok: false, error: "Missing identifier." }, { status: 400 });
     }
 
     const found = await findCustomer({ id: idRaw ? toGID(idRaw) : undefined, email });
-    if (!found) return withCorsJSON({ ok: false, error: "Customer not found." }, { status: 404 });
+    if (!found) return jsonWithCors(req, { ok: false, error: "Customer not found." }, { status: 404 });
 
     const customerId = found.id;
 
@@ -257,18 +218,21 @@ export async function POST(req: Request) {
       );
       const errs = data.customerUpdate.userErrors;
       if (errs?.length) {
-        return withCorsJSON({ ok: false, error: errs.map((e) => e.message).join("; ") }, { status: 400 });
+        return jsonWithCors(req, { ok: false, error: errs.map(e => e.message).join("; ") }, { status: 400 });
       }
     }
 
     // 2) Update métas publics si fourni
     const metas: any[] = [];
-    if (typeof body.bio === "string")
+    if (typeof body.bio === "string") {
       metas.push({ ownerId: customerId, namespace: MF_NS, key: "bio", type: "multi_line_text_field", value: body.bio });
-    if (typeof body.avatar_url === "string" && body.avatar_url)
+    }
+    if (typeof body.avatar_url === "string" && body.avatar_url) {
       metas.push({ ownerId: customerId, namespace: MF_NS, key: "avatar_url", type: "url", value: body.avatar_url });
-    if (typeof body.expertise_url === "string" && body.expertise_url)
+    }
+    if (typeof body.expertise_url === "string" && body.expertise_url) {
       metas.push({ ownerId: customerId, namespace: MF_NS, key: "expertise_url", type: "url", value: body.expertise_url });
+    }
 
     if (metas.length) {
       const data = await adminGraphQL<{
@@ -285,15 +249,19 @@ export async function POST(req: Request) {
       );
       const errs = data.metafieldsSet.userErrors;
       if (errs?.length) {
-        return withCorsJSON({ ok: false, error: errs.map((e) => e.message).join("; ") }, { status: 400 });
+        return jsonWithCors(req, { ok: false, error: errs.map(e => e.message).join("; ") }, { status: 400 });
       }
     }
 
-    // 3) Relire et renvoyer l'état
+    // 3) Relire et renvoyer
     const c = await findCustomer({ id: customerId });
     const profile = pickPublicMetas(c?.metas);
-    return withCorsJSON({ ok: true, profile, customer: { id: c?.id, firstName: c?.firstName, lastName: c?.lastName, email: c?.email, phone: c?.phone } });
+    return jsonWithCors(req, {
+      ok: true,
+      profile,
+      customer: { id: c?.id, firstName: c?.firstName, lastName: c?.lastName, email: c?.email, phone: c?.phone },
+    });
   } catch (e: any) {
-    return withCorsJSON({ ok: false, error: e?.message || "Server error" }, { status: 500 });
+    return jsonWithCors(req, { ok: false, error: e?.message || "Server error" }, { status: 500 });
   }
 }
