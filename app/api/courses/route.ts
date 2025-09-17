@@ -1,12 +1,13 @@
 // app/api/courses/route.ts
-// Crée un produit "Course" pour un formateur (vendor = email) + liste des courses
-// Vérifie l'abonnement Stripe + applique le quota Starter (3 / mois)
-// Champs produits: image de couverture + métachamps owner_email / owner_id / pdf_url
-// Ajoute à une collection par handle (custom/smart)
-// Réponses CORS via handleOptions/jsonWithCors
+// Crée un produit "Course" (vendor = email) + liste les courses.
+// Vérifie l'abonnement Stripe + applique le quota Starter (3 / mois).
+// Champs produits: image de couverture + métachamps mf.owner_email / mf.owner_id / mf.pdf_url.
+// Ajoute à une collection par handle (custom/smart).
+// Toutes les réponses passent par jsonWithCors (CORS via ton util).
 
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 import stripe from '@/lib/stripe';
+import type Stripe from 'stripe';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -26,7 +27,7 @@ const STORE = process.env.SHOPIFY_STORE_DOMAIN!;
 const TOKEN = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN!;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-07';
 
-// Stripe key avec fallbacks fréquents
+// Check Stripe env — on n'utilise pas STRIPE_KEY directement mais on valide la config
 const STRIPE_KEY =
   process.env.STRIPE_SECRET_KEY ||
   process.env.STRIPE_SECRET_KEY_LIVE ||
@@ -36,39 +37,25 @@ const STRIPE_KEY =
 type PlanKey = 'starter' | 'pro' | 'business' | null;
 
 type CreateCourseBody = {
-  title: string;
-  description: string;
+  // champs “officiels”
+  title?: string;
+  description?: string;
   collectionHandle?: string;
   coverUrl?: string;
   pdfUrl?: string;
   price?: number; // en centimes (par défaut 1990 => 19,90 €)
   customerEmail?: string | null;
-  customerId?: number | null;
+  customerId?: number | string | null;
   stripeCustomerId?: string | null;
-};
 
-// ===== Stripe helpers =====
-function mapPriceId(priceId?: string | null): PlanKey {
-  if (!priceId) return null;
-  const map: Record<string, PlanKey> = {
-    [process.env.STRIPE_PRICE_STARTER ?? '']: 'starter',
-    [process.env.STRIPE_PRICE_PRO ?? '']: 'pro',
-    [process.env.STRIPE_PRICE_BUSINESS ?? '']: 'business',
-  };
-  return map[priceId] ?? null;
-}
-function inferPlanKey(p: Stripe.Price): PlanKey {
-  const name = `${p.nickname || ''} ${(typeof p.product !== 'string' && p.product?.name) || ''}`.toLowerCase();
-  if (name.includes('starter')) return 'starter';
-  if (name.includes('pro')) return 'pro';
-  if (name.includes('business') || name.includes('entreprise')) return 'business';
-  switch (p.unit_amount) {
-    case 1990: return 'starter';
-    case 3990: return 'pro';
-    case 6990: return 'business';
-    default: return null;
-  }
-}
+  // champs “compat” (depuis ton front)
+  email?: string | null;
+  shopifyCustomerId?: number | string | null;
+  imageUrl?: string;
+  image_url?: string;
+  pdf_url?: string;
+  collection_handle?: string;
+};
 
 // ===== Utils =====
 function ym(d = new Date()) {
@@ -171,7 +158,7 @@ async function enforceQuotaOrThrow(customerId: number | string, planKey: Exclude
 
 // ===== Collections =====
 async function findCollectionIdByHandle(handle: string): Promise<number | null> {
-  // custom collections (liste & filtre)
+  // custom collections
   let r = await shopifyFetch(`/custom_collections.json?limit=250`);
   if (r.ok) {
     const arr = r.json?.custom_collections || [];
@@ -195,6 +182,29 @@ async function findCollectionIdByHandle(handle: string): Promise<number | null> 
   return null;
 }
 
+// ===== Stripe helpers =====
+function mapPriceId(priceId?: string | null): PlanKey {
+  if (!priceId) return null;
+  const map: Record<string, PlanKey> = {
+    [process.env.STRIPE_PRICE_STARTER ?? '']: 'starter',
+    [process.env.STRIPE_PRICE_PRO ?? '']: 'pro',
+    [process.env.STRIPE_PRICE_BUSINESS ?? '']: 'business',
+  };
+  return map[priceId] ?? null;
+}
+function inferPlanKey(p: Stripe.Price): PlanKey {
+  const name = `${p.nickname || ''} ${(typeof p.product !== 'string' && p.product?.name) || ''}`.toLowerCase();
+  if (name.includes('starter')) return 'starter';
+  if (name.includes('pro')) return 'pro';
+  if (name.includes('business') || name.includes('entreprise')) return 'business';
+  switch (p.unit_amount) {
+    case 1990: return 'starter';
+    case 3990: return 'pro';
+    case 6990: return 'business';
+    default: return null;
+  }
+}
+
 /* ---------- CORS preflight ---------- */
 export async function OPTIONS(req: Request) {
   return handleOptions(req);
@@ -211,29 +221,38 @@ export async function GET(req: Request) {
     const email = (url.searchParams.get('email') || '').trim();
     const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 250);
 
-    let path = `/products.json?limit=${limit}&status=active&fields=id,title,handle,images,vendor,tags,created_at`;
-    if (email) path += `&vendor=${encodeURIComponent(email)}`;
+    // On veut voir Publiés ET Brouillons → on agrège active + draft (archived optionnel)
+    const statuses: Array<'active' | 'draft'> = ['active', 'draft'];
 
-    const resp = await shopifyFetch(path);
-    if (!resp.ok) {
-      return jsonWithCors(req, {
-        ok: false,
-        error: 'list_failed',
-        detail: resp.json?.errors || resp.text || resp.statusText,
-        status: resp.status,
-      }, { status: 502 });
+    const results: any[] = [];
+    for (const st of statuses) {
+      let path = `/products.json?limit=${limit}&status=${st}&fields=id,title,handle,images,vendor,tags,created_at`;
+      if (email) path += `&vendor=${encodeURIComponent(email)}`;
+      const resp = await shopifyFetch(path);
+      if (!resp.ok) {
+        return jsonWithCors(req, {
+          ok: false,
+          error: 'list_failed',
+          detail: resp.json?.errors || resp.text || resp.statusText,
+          status: resp.status,
+        }, { status: 502 });
+      }
+      results.push(...(resp.json?.products || []));
     }
 
-    const products = resp.json?.products || [];
     // sécurité: on garde uniquement ceux taggés mf_trainer
-    const filtered = products.filter((p: any) =>
+    const filtered = results.filter((p: any) =>
       (p.tags || '')
         .split(',')
         .map((t: string) => t.trim().toLowerCase())
         .includes('mf_trainer')
     );
 
-    const items = filtered.map((p: any) => ({
+    // dédup par id (si un produit sort des deux appels)
+    const dedupMap = new Map<number, any>();
+    for (const p of filtered) dedupMap.set(p.id, p);
+
+    const items = Array.from(dedupMap.values()).map((p: any) => ({
       id: p.id,
       title: p.title,
       handle: p.handle,
@@ -242,7 +261,22 @@ export async function GET(req: Request) {
       tags: p.tags,
       createdAt: p.created_at,
       url: p.handle ? `https://${STORE}/products/${p.handle}` : null,
+      // hint UI: publié si présent dans "active", sinon brouillon
+      published: true, // défaut, corrigé ci-dessous via heuristique
     }));
+
+    // Heuristique “published”: si on n'a pas l'info de status par item, on considère:
+    // - actif => publié ; draft => brouillon. On reconstruit depuis la liste brute.
+    const byIdStatus = new Map<number, 'active' | 'draft'>();
+    for (const st of statuses) {
+      let path = `/products.json?limit=${limit}&status=${st}&fields=id`;
+      if (email) path += `&vendor=${encodeURIComponent(email)}`;
+      const resp = await shopifyFetch(path);
+      if (resp.ok) {
+        for (const p of resp.json?.products || []) byIdStatus.set(p.id, st);
+      }
+    }
+    items.forEach(it => { it.published = (byIdStatus.get(it.id) === 'active'); });
 
     return jsonWithCors(req, { ok: true, items });
   } catch (e: any) {
@@ -266,19 +300,26 @@ export async function POST(req: Request) {
     }
 
     const body = (await req.json()) as CreateCourseBody;
-    const {
-      title, description, collectionHandle, coverUrl, pdfUrl, price,
-      customerEmail: emailFromBody, customerId
-    } = body || {};
+
+    // ==== Compat des champs envoyés par le front ====
+    const title        = (body.title || '').trim();
+    const description  = (body.description || '').trim();
+    const collectionHandle = body.collectionHandle || body.collection_handle || undefined;
+    const coverUrl     = body.coverUrl || body.imageUrl || body.image_url || undefined;
+    const pdfUrl       = body.pdfUrl   || body.pdf_url   || undefined;
+    const priceCents   = typeof body.price === 'number' ? body.price : 1990; // default 19,90 €
+
+    // Email / ID client : on accepte customerEmail || email ; customerId || shopifyCustomerId
+    let customerEmail = (body.customerEmail || body.email || '' ).trim();
+    let incomingCustomerId = body.customerId ?? body.shopifyCustomerId ?? null;
 
     if (!title || !description) {
       return jsonWithCors(req, { ok: false, error: 'missing_fields' }, { status: 400 });
     }
 
-    // 0) Résoudre l'email
-    let customerEmail = (emailFromBody || '').trim();
-    if (!customerEmail && typeof customerId === 'number' && customerId > 0) {
-      const e = await shopifyGetCustomerEmailById(customerId);
+    // 0) Résoudre l'email si absent mais ID fourni
+    if (!customerEmail && (incomingCustomerId !== null && incomingCustomerId !== undefined)) {
+      const e = await shopifyGetCustomerEmailById(incomingCustomerId as number | string);
       if (e) customerEmail = e;
     }
     if (!customerEmail) {
@@ -287,8 +328,11 @@ export async function POST(req: Request) {
 
     // 1) ID client Shopify (pour quota)
     let resolvedCustomerId: number | null =
-      (typeof customerId === 'number' && customerId > 0) ? customerId : null;
-    if (!resolvedCustomerId) {
+      (incomingCustomerId !== null && incomingCustomerId !== undefined)
+        ? Number(incomingCustomerId)
+        : null;
+
+    if (!resolvedCustomerId || Number.isNaN(resolvedCustomerId)) {
       resolvedCustomerId = await shopifyEnsureCustomerByEmail(customerEmail);
     }
     if (!resolvedCustomerId) {
@@ -296,54 +340,54 @@ export async function POST(req: Request) {
     }
 
     // 2) Vérifier l'abonnement Stripe
-// (Réutilise l'instance `stripe` déjà créée en haut du fichier)
-let stripeCustomer: Stripe.Customer | null = null;
+    let stripeCustomer: Stripe.Customer | null = null;
 
-if (body.stripeCustomerId) {
-  try {
-    const c = await stripe.customers.retrieve(body.stripeCustomerId);
-    if (!("deleted" in c) || !c.deleted) {
-      stripeCustomer = c as Stripe.Customer;
+    if (body.stripeCustomerId) {
+      try {
+        const c = await stripe.customers.retrieve(body.stripeCustomerId);
+        if (!('deleted' in c) || !c.deleted) {
+          stripeCustomer = c as Stripe.Customer;
+        }
+      } catch {
+        // ignore: on tentera la recherche par email
+      }
     }
-  } catch {
-    // ignore: on tentera la recherche par email
-  }
-}
 
-if (!stripeCustomer && customerEmail) {
-  const list = await stripe.customers.list({ email: customerEmail, limit: 1 });
-  stripeCustomer = list.data[0] || null;
-}
+    if (!stripeCustomer && customerEmail) {
+      const list = await stripe.customers.list({ email: customerEmail, limit: 1 });
+      stripeCustomer = list.data[0] || null;
+    }
 
-if (!stripeCustomer) {
-  return jsonWithCors(req, { ok: false, error: "subscription_required" }, { status: 402 });
-}
+    if (!stripeCustomer) {
+      return jsonWithCors(req, { ok: false, error: 'subscription_required' }, { status: 402 });
+    }
 
-const subs = await stripe.subscriptions.list({
-  customer: stripeCustomer.id,
-  status: "all",
-  expand: ["data.items.data.price"],
-  limit: 10,
-});
+    const subs = await stripe.subscriptions.list({
+      customer: stripeCustomer.id,
+      status: 'all',
+      expand: ['data.items.data.price'],
+      limit: 10,
+    });
 
-const active = subs.data.find(s =>
-  ["active", "trialing", "past_due", "unpaid"].includes(s.status)
-);
+    const active = subs.data.find(s =>
+      ['active', 'trialing', 'past_due', 'unpaid'].includes(s.status)
+    );
 
-if (!active) {
-  return jsonWithCors(req, { ok: false, error: "subscription_required" }, { status: 402 });
-}
+    if (!active) {
+      return jsonWithCors(req, { ok: false, error: 'subscription_required' }, { status: 402 });
+    }
 
-const priceObj = active.items.data[0]?.price as Stripe.Price | undefined;
-const priceId = priceObj?.id ?? null;
+    const priceObj = active.items.data[0]?.price as Stripe.Price | undefined;
+    const priceId = priceObj?.id ?? null;
 
-let planKey: PlanKey = mapPriceId(priceId);
-if (!planKey && priceObj) planKey = inferPlanKey(priceObj);
-if (!planKey && active.metadata?.plan_from_price) planKey = mapPriceId(active.metadata.plan_from_price);
-
-if (!planKey) {
-  return jsonWithCors(req, { ok: false, error: "plan_unmapped" }, { status: 402 });
-}
+    let planKey: PlanKey = mapPriceId(priceId);
+    if (!planKey && priceObj) planKey = inferPlanKey(priceObj);
+    if (!planKey && (active as any).metadata?.plan_from_price) {
+      planKey = mapPriceId((active as any).metadata.plan_from_price);
+    }
+    if (!planKey) {
+      return jsonWithCors(req, { ok: false, error: 'plan_unmapped' }, { status: 402 });
+    }
 
     // 3) Quota Starter (3/mois) — Pro/Business illimité
     try {
@@ -354,8 +398,8 @@ if (!planKey) {
       return jsonWithCors(req, { ok: false, error: msg }, { status: sc });
     }
 
-    // 4) Création du produit
-    const variantPrice = price ? (price / 100).toFixed(2) : '19.90';
+    // 4) Création du produit (status: active par défaut)
+    const variantPrice = (priceCents / 100).toFixed(2);
     const productPayload = {
       product: {
         title,
