@@ -1,6 +1,5 @@
 // app/api/upload/pdf/route.ts
 import { put } from '@vercel/blob';
-import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -8,94 +7,83 @@ export const dynamic = 'force-dynamic';
 const PDF_MIME = 'application/pdf';
 const MAX_PDF_SIZE = 50 * 1024 * 1024; // 50 MB
 
-function sanitizeName(name: string) {
-  return (name || 'document.pdf')
-    .toLowerCase()
-    .replace(/\s+/g, '-')
-    .replace(/[^a-z0-9._-]/g, '');
+// --- CORS utils (autonomes) ---
+const RAW = (process.env.CORS_ORIGINS || process.env.CORS_ORIGIN || '').trim();
+const ALLOWED = RAW ? RAW.split(',').map(s => s.trim()).filter(Boolean) : [];
+
+function allowOrigin(req: Request) {
+  const origin = req.headers.get('origin') || '';
+  if (!ALLOWED.length) {
+    try {
+      const u = new URL(origin);
+      if (u.hostname.endsWith('.myshopify.com')) return origin;
+    } catch {}
+    return '*';
+  }
+  return ALLOWED.includes(origin) ? origin : (ALLOWED[0] || '*');
+}
+function withCORS(req: Request, res: Response) {
+  res.headers.set('Access-Control-Allow-Origin', allowOrigin(req));
+  res.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.headers.set(
+    'Access-Control-Allow-Headers',
+    req.headers.get('access-control-request-headers') || 'Content-Type, Accept'
+  );
+  res.headers.set('Access-Control-Max-Age', '86400');
+  res.headers.set('Vary', 'Origin, Access-Control-Request-Headers');
+  res.headers.set('Cache-Control', 'no-store');
+  res.headers.set('x-route', 'upload-pdf');
+  return res;
+}
+function json(req: Request, data: any, status = 200) {
+  return withCORS(req, new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  }));
 }
 
-/** Préflight CORS */
+// --- Préflight CORS ---
 export async function OPTIONS(req: Request) {
-  return handleOptions(req);
+  return withCORS(req, new Response(null, { status: 204 }));
 }
 
-/** Petit GET de debug (permet de vérifier les headers CORS dans le navigateur) */
+// --- GET de ping/debug (ouvre l’URL dans le navigateur) ---
 export async function GET(req: Request) {
-  return jsonWithCors(req, { ok: true, endpoint: 'upload/pdf', method: 'GET' });
+  return json(req, { ok: true, endpoint: 'upload/pdf', method: 'GET' });
 }
 
-/** Upload PDF */
+// --- POST upload ---
 export async function POST(req: Request) {
   try {
-    // IMPORTANT: si le token n’est pas là, on renvoie quand même une réponse CORS (pas de throw brut)
     const token = process.env.BLOB_READ_WRITE_TOKEN;
-    if (!token) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'blob_token_missing' },
-        { status: 500 }
-      );
-    }
+    if (!token) return json(req, { ok: false, error: 'blob_token_missing' }, 500);
 
     const form = await req.formData().catch(() => null);
-    if (!form) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'invalid_formdata' },
-        { status: 400 }
-      );
-    }
-
-    const file = form.get('pdf');
+    const file = form?.get('pdf');
     if (!file || !(file instanceof File)) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'missing_field_pdf' },
-        { status: 400 }
-      );
+      return json(req, { ok: false, error: 'missing_field_pdf' }, 400);
     }
-
-    // Validations simples (toujours avant l’upload)
     if (file.type !== PDF_MIME) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'invalid_mime', received: file.type, expected: PDF_MIME },
-        { status: 415 }
-      );
+      return json(req, { ok: false, error: 'invalid_mime', received: file.type, expected: PDF_MIME }, 415);
     }
     if (file.size > MAX_PDF_SIZE) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'file_too_large', max: MAX_PDF_SIZE },
-        { status: 413 }
-      );
+      return json(req, { ok: false, error: 'file_too_large', max: MAX_PDF_SIZE }, 413);
     }
 
-    // Upload → Vercel Blob
-    const key = `uploads/pdfs/${Date.now()}-${sanitizeName(file.name)}`;
-    const uploaded = await put(key, file, {
+    const safe = (name: string) =>
+      (name || 'document.pdf').toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9._-]/g, '');
+    const key = `uploads/pdfs/${Date.now()}-${safe((file as File).name)}`;
+
+    const up = await put(key, file, {
       access: 'public',
       contentType: file.type,
       addRandomSuffix: false,
-      token, // OBLIGATOIRE: sinon 401/403 côté Blob
+      token,
     });
 
-    // Réponse CORS OK
-    return jsonWithCors(req, {
-      ok: true,
-      url: uploaded.url,
-      pathname: uploaded.pathname,
-      size: file.size,
-      mime: file.type,
-    });
+    return json(req, { ok: true, url: up.url, pathname: up.pathname, size: file.size, mime: file.type });
   } catch (e: any) {
-    // On log côté serveur, mais on renvoie TOUJOURS via jsonWithCors pour éviter l’erreur CORS
     console.error('upload/pdf error:', e);
-    return jsonWithCors(
-      req,
-      { ok: false, error: e?.message || 'upload_failed' },
-      { status: 500 }
-    );
+    return json(req, { ok: false, error: e?.message || 'upload_failed' }, 500);
   }
 }
