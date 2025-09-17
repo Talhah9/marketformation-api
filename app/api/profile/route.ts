@@ -1,43 +1,35 @@
 // app/api/profile/route.ts
 import { NextRequest, NextResponse } from "next/server";
 
-const SHOP_DOMAIN = process.env.SHOP_DOMAIN;
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
+const SHOP_DOMAIN = process.env.SHOP_DOMAIN || "";
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const API_VERSION = "2025-07";
 
-if (!SHOP_DOMAIN || !ADMIN_TOKEN) {
-  throw new Error("Missing SHOP_DOMAIN or ADMIN_TOKEN env vars.");
+function requireEnv() {
+  if (!SHOP_DOMAIN || !ADMIN_TOKEN) {
+    throw new Error("Server misconfigured: missing SHOP_DOMAIN or ADMIN_TOKEN");
+  }
 }
 
 async function shopify(path: string, init?: RequestInit) {
-  const res = await fetch(
-    `https://${SHOP_DOMAIN}/admin/api/${API_VERSION}${path}`,
-    {
-      ...init,
-      headers: {
-        "X-Shopify-Access-Token": ADMIN_TOKEN!,
-        "Content-Type": "application/json",
-        ...(init?.headers || {}),
-      },
-      cache: "no-store",
-    }
-  );
+  requireEnv();
+  const res = await fetch(`https://${SHOP_DOMAIN}/admin/api/${API_VERSION}${path}`, {
+    ...init,
+    headers: {
+      "X-Shopify-Access-Token": ADMIN_TOKEN,
+      "Content-Type": "application/json",
+      ...(init?.headers || {}),
+    },
+    cache: "no-store",
+  });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(
-      `Shopify ${init?.method || "GET"} ${path} -> ${res.status}: ${text}`
-    );
+    throw new Error(`Shopify ${init?.method || "GET"} ${path} -> ${res.status}: ${text}`);
   }
   return res.json();
 }
 
-async function resolveCustomer({
-  id,
-  email,
-}: {
-  id?: string | number | null;
-  email?: string | null;
-}) {
+async function resolveCustomer({ id, email }: { id?: string | number | null; email?: string | null; }) {
   if (id) {
     const data = await shopify(`/customers/${id}.json`);
     return data.customer;
@@ -58,12 +50,9 @@ export async function GET(req: NextRequest) {
     const email = searchParams.get("email");
 
     const customer = await resolveCustomer({ id, email });
-
-    const metafieldsRes = await shopify(
-      `/customers/${customer.id}/metafields.json?namespace=mf`
-    );
-    const list: any[] = metafieldsRes.metafields || [];
-    const byKey = Object.fromEntries(list.map((m) => [m.key, m]));
+    const m = await shopify(`/customers/${customer.id}/metafields.json?namespace=mf`);
+    const list: any[] = m.metafields || [];
+    const byKey = Object.fromEntries(list.map((x) => [x.key, x]));
 
     return NextResponse.json({
       ok: true,
@@ -85,71 +74,62 @@ export async function POST(req: NextRequest) {
     const { shopifyCustomerId, email, bio, avatar_url, expertise_url } = body;
 
     const customer = await resolveCustomer({ id: shopifyCustomerId, email });
+    const current = await shopify(`/customers/${customer.id}/metafields.json?namespace=mf`);
+    const existing = new Map<string, any>((current.metafields || []).map((m: any) => [m.key, m]));
 
-    // Load existing metafields in namespace mf
-    const mfListRes = await shopify(
-      `/customers/${customer.id}/metafields.json?namespace=mf`
-    );
-    const existing = new Map<string, any>(
-      (mfListRes.metafields || []).map((m: any) => [m.key, m])
-    );
-
-    async function upsert(
-      key: "bio" | "avatar_url" | "expertise_url",
-      value: any,
-      createType: string
-    ) {
-      if (typeof value === "undefined") return null; // skip if not provided
+    async function upsert(key: "bio" | "avatar_url" | "expertise_url", value: any, type: string) {
+      if (typeof value === "undefined") return null; // skip
       if (existing.has(key)) {
         const m = existing.get(key);
-        const updated = await shopify(`/metafields/${m.id}.json`, {
+        const res = await shopify(`/metafields/${m.id}.json`, {
           method: "PUT",
           body: JSON.stringify({ metafield: { id: m.id, value } }),
         });
-        return updated.metafield;
+        return res.metafield;
       } else {
-        const created = await shopify(
-          `/customers/${customer.id}/metafields.json`,
-          {
-            method: "POST",
-            body: JSON.stringify({
-              metafield: {
-                namespace: "mf",
-                key,
-                type: createType,
-                value,
-              },
-            }),
-          }
-        );
-        return created.metafield;
+        const res = await shopify(`/customers/${customer.id}/metafields.json`, {
+          method: "POST",
+          body: JSON.stringify({
+            metafield: { namespace: "mf", key, type, value },
+          }),
+        });
+        return res.metafield;
       }
     }
 
-    const results: Record<string, any> = {};
-    const tasks = [
+    const out: Record<string, string> = {};
+    const ops = [
       ["bio", bio, "multi_line_text_field"],
       ["avatar_url", avatar_url, "url"],
       ["expertise_url", expertise_url, "url"],
     ] as const;
 
-    for (const [key, value, type] of tasks) {
-      const r = await upsert(key, value, type);
-      if (r) results[key] = r.value;
+    for (const [k, v, t] of ops) {
+      const r = await upsert(k, v, t);
+      if (r) out[k] = r.value;
     }
 
     return NextResponse.json({
       ok: true,
       customerId: customer.id,
       profile: {
-        bio: results.bio ?? existing.get("bio")?.value ?? "",
-        avatar_url:
-          results.avatar_url ?? existing.get("avatar_url")?.value ?? "",
-        expertise_url:
-          results.expertise_url ?? existing.get("expertise_url")?.value ?? "",
+        bio: (out.bio ?? existing.get("bio")?.value) || "",
+        avatar_url: (out.avatar_url ?? existing.get("avatar_url")?.value) || "",
+        expertise_url: (out.expertise_url ?? existing.get("expertise_url")?.value) || "",
       },
     });
   } catch (e: any) {
     return NextResponse.json({ ok: false, error: e.message }, { status: 400 });
   }
+}
+
+// (facultatif) CORS préflight minimum si besoin
+export function OPTIONS() {
+  return new NextResponse(null, {
+    status: 204,
+    headers: {
+      "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    },
+  });
 }
