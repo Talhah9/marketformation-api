@@ -2,9 +2,12 @@ import { jsonWithCors, handleOptions } from "@/app/api/_lib/cors";
 import { NextResponse } from "next/server";
 
 /** ====== ENV ====== */
-const SHOP_DOMAIN = process.env.SHOP_DOMAIN;             // ex: tqiccz-96.myshopify.com
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN;             // Admin API access token
+const SHOP_DOMAIN =
+  process.env.SHOP_DOMAIN || process.env.SHOPIFY_STORE_DOMAIN;
+const ADMIN_TOKEN =
+  process.env.ADMIN_TOKEN || process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-10";
+
 
 // Garde-fous PCD (Protected Customer Data)
 const ALLOW_EMAIL_LOOKUP   = (process.env.ALLOW_EMAIL_LOOKUP || "false").toLowerCase() === "true";
