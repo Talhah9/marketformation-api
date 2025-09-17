@@ -1,7 +1,9 @@
 import { jsonWithCors, handleOptions } from "@/app/api/_lib/cors";
 
-const SHOP_DOMAIN = process.env.SHOP_DOMAIN;
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
+const SHOP_DOMAIN =
+  process.env.SHOP_DOMAIN || process.env.SHOPIFY_STORE_DOMAIN;
+const ADMIN_TOKEN =
+  process.env.ADMIN_TOKEN || process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-10";
 
 export async function OPTIONS(req: Request) {
