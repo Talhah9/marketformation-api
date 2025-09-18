@@ -1,71 +1,68 @@
 // app/api/upload/pdf/route.ts
-import { jsonWithCors, handleOptions } from "@/app/api/_lib/cors";
-import { put } from "@vercel/blob";
+import { NextResponse } from 'next/server';
+import { put } from '@vercel/blob';
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic"; // jamais de cache pour les uploads
+const ALLOWED_ORIGIN = process.env.CORS_ORIGIN || 'https://tqiccz-96.myshopify.com';
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+  'Access-Control-Allow-Credentials': 'true',
+  'Access-Control-Allow-Methods': 'POST,OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
+};
 
-const MAX_MB = Number(process.env.UPLOAD_MAX_MB || 25);
-const MAX_BYTES = MAX_MB * 1024 * 1024;
-
-export async function OPTIONS(req: Request) {
-  return handleOptions(req);
+function cors(json: any, status = 200) {
+  const res = NextResponse.json(json, { status });
+  Object.entries(CORS_HEADERS).forEach(([k, v]) => res.headers.set(k, v as string));
+  return res;
 }
 
-export async function GET(req: Request) {
-  // ping de santé (utile pour vérifier les en-têtes CORS)
-  return jsonWithCors(req, { ok: true, endpoint: "upload/pdf", method: "GET" });
+export async function OPTIONS() {
+  // Preflight
+  return new NextResponse(null, {
+    status: 204,
+    headers: {
+      ...CORS_HEADERS,
+      'Vary': 'Origin',
+    },
+  });
 }
+
+export const runtime = 'nodejs'; // important pour @vercel/blob
 
 export async function POST(req: Request) {
   try {
+    const origin = req.headers.get('origin') || '';
+    if (origin !== ALLOWED_ORIGIN) {
+      return cors({ error: 'Origin not allowed' }, 403);
+    }
+
     const form = await req.formData();
-    const file = form.get("pdf");
+    const file = form.get('pdf');
 
-    if (!file || typeof file === "string") {
-      return jsonWithCors(req, { ok: false, error: "Missing field 'pdf'." }, { status: 400 });
+    if (!file || !(file instanceof File)) {
+      return cors({ error: 'Missing file field "pdf"' }, 400);
     }
 
-    // @ts-ignore – Next File implémente arrayBuffer()/stream()
-    const f: File = file;
-
-    // validation type/poids
-    const ct = (f.type || "").toLowerCase();
-    if (!ct.includes("pdf")) {
-      return jsonWithCors(req, { ok: false, error: "Only application/pdf accepted." }, { status: 415 });
-    }
-    if ((f.size || 0) > MAX_BYTES) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: `File too large (> ${MAX_MB}MB).` },
-        { status: 413 },
-      );
+    // (Optionnel) vérifier le type
+    const type = file.type || 'application/pdf';
+    if (!type.includes('pdf')) {
+      return cors({ error: 'Only PDF is allowed' }, 415);
     }
 
-    // upload Vercel Blob (public)
-    const token = process.env.BLOB_READ_WRITE_TOKEN;
-    if (!token) {
-      return jsonWithCors(req, { ok: false, error: "Missing BLOB_READ_WRITE_TOKEN" }, { status: 500 });
-    }
+    // Nom de fichier propre
+    const safeName = (file.name || 'upload.pdf')
+      .replace(/\s+/g, '-')
+      .replace(/[^a-zA-Z0-9.\-_]/g, '');
 
-    const name = (f.name || "file.pdf").replace(/[^\w.\-]+/g, "_");
-    const key = `mf/uploads/pdf/${Date.now()}-${name}`;
-
-    // put accepte un Blob/File directement
-    const { url } = await put(key, f, {
-      access: "public",
-      contentType: "application/pdf",
-      token,
-      addRandomSuffix: false,
+    // Upload vers Vercel Blob
+    const blob = await put(`mf/uploads/${Date.now()}-${safeName}`, file, {
+      access: 'public', // ou 'private' selon ton besoin
+      contentType: type,
     });
 
-    return jsonWithCors(req, { ok: true, url });
-  } catch (e: any) {
-    // IMPORTANT : on répond via jsonWithCors pour conserver les en-têtes CORS
-    return jsonWithCors(
-      req,
-      { ok: false, error: e?.message || "upload_pdf_failed" },
-      { status: 500 },
-    );
+    return cors({ url: blob.url }, 200);
+  } catch (err: any) {
+    console.error('PDF upload error:', err);
+    return cors({ error: 'Upload failed', detail: String(err?.message || err) }, 500);
   }
 }
