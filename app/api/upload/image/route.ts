@@ -1,68 +1,62 @@
-// app/api/upload/image/route.ts
-import { jsonWithCors, handleOptions } from "@/app/api/_lib/cors";
-import { put } from "@vercel/blob";
+import { NextResponse } from 'next/server';
+import { put } from '@vercel/blob';
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-const MAX_MB = Number(process.env.UPLOAD_MAX_MB || 10);
-const MAX_BYTES = MAX_MB * 1024 * 1024;
+const ALLOWED_ORIGIN = process.env.CORS_ORIGIN || 'https://tqiccz-96.myshopify.com';
 
-export async function OPTIONS(req: Request) {
-  return handleOptions(req);
+function withCORS(req: Request, res: NextResponse) {
+  const origin = req.headers.get('origin') || '';
+  if (origin === ALLOWED_ORIGIN) {
+    res.headers.set('Access-Control-Allow-Origin', origin);
+    res.headers.set('Vary', 'Origin');
+    res.headers.set('Access-Control-Allow-Credentials', 'true'); // ← nécessaire si le front envoie credentials:'include'
+    res.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  } else {
+    // si tu veux permettre plusieurs origines, gère une liste, sinon renvoie quand même CORS sur GET/OPTIONS
+    res.headers.set('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+    res.headers.set('Vary', 'Origin');
+    res.headers.set('Access-Control-Allow-Credentials', 'true');
+    res.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  }
+  return res;
+}
+function json(req: Request, data: any, status = 200) {
+  return withCORS(req, NextResponse.json(data, { status }));
 }
 
 export async function GET(req: Request) {
-  return jsonWithCors(req, { ok: true, endpoint: "upload/image", method: "GET" });
+  return json(req, { ok: true, route: 'upload/image' }, 200);
+}
+
+export async function OPTIONS(req: Request) {
+  return withCORS(req, new NextResponse(null, { status: 204 }));
 }
 
 export async function POST(req: Request) {
   try {
     const form = await req.formData();
-    const file = form.get("image");
-
-    if (!file || typeof file === "string") {
-      return jsonWithCors(req, { ok: false, error: "Missing field 'image'." }, { status: 400 });
+    const file = form.get('image');
+    if (!file || !(file instanceof File)) {
+      return json(req, { error: 'Missing file field "image"' }, 400);
+    }
+    const type = file.type || 'application/octet-stream';
+    if (!/^image\//.test(type)) {
+      return json(req, { error: 'Only image/* allowed' }, 415);
     }
 
-    // @ts-ignore
-    const f: File = file;
-
-    const ct = (f.type || "").toLowerCase();
-    const okType = /(png|jpe?g|webp)/.test(ct);
-    if (!okType) {
-      return jsonWithCors(req, { ok: false, error: "Only PNG/JPG/WEBP accepted." }, { status: 415 });
-    }
-    if ((f.size || 0) > MAX_BYTES) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: `File too large (> ${MAX_MB}MB).` },
-        { status: 413 },
-      );
-    }
-
-    const token = process.env.BLOB_READ_WRITE_TOKEN;
-    if (!token) {
-      return jsonWithCors(req, { ok: false, error: "Missing BLOB_READ_WRITE_TOKEN" }, { status: 500 });
-    }
-
-    const name = (f.name || "image").replace(/[^\w.\-]+/g, "_");
-    const ext = ct.includes("png") ? "png" : ct.includes("webp") ? "webp" : "jpg";
-    const key = `mf/uploads/img/${Date.now()}-${name}.${ext}`;
-
-    const { url } = await put(key, f, {
-      access: "public",
-      contentType: ct || `image/${ext}`,
-      token,
-      addRandomSuffix: false,
+    const safeName = (file.name || 'upload').replace(/\s+/g,'-').replace(/[^a-zA-Z0-9.\-_]/g,'');
+    const blob = await put(`mf/uploads/${Date.now()}-${safeName}`, file, {
+      access: 'public',
+      contentType: type,
     });
 
-    return jsonWithCors(req, { ok: true, url });
+    return json(req, { url: blob.url }, 200);
   } catch (e: any) {
-    return jsonWithCors(
-      req,
-      { ok: false, error: e?.message || "upload_image_failed" },
-      { status: 500 },
-    );
+    console.error('Image upload error:', e);
+    return json(req, { error: 'Upload failed', detail: String(e?.message || e) }, 500);
   }
 }
