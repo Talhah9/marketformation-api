@@ -1,27 +1,24 @@
+// app/api/stripe/checkout/route.ts
 import Stripe from "stripe";
 import { handleOptions, jsonWithCors } from "@/app/api/_lib/cors";
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY_LIVE as string, {
-  apiVersion: "2024-06-20",
-});
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-export async function OPTIONS(req: Request) {
-  return handleOptions(req);
-}
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY_LIVE as string, { apiVersion: "2024-06-20" });
+
+export async function OPTIONS(req: Request) { return handleOptions(req); }
 
 export async function POST(req: Request) {
   try {
     const { priceId, email, returnUrl } = await req.json();
-
     if (!priceId || !email) {
-      return jsonWithCors(req, { error: "Missing priceId or email" }, 400);
+      return jsonWithCors(req, { error: "Missing priceId or email" }, { status: 400 });
     }
 
-    // retrouver/créer le customer
     const existing = await stripe.customers.list({ email, limit: 1 });
-    const customer = existing.data[0] || (await stripe.customers.create({ email }));
+    const customer = existing.data[0] || await stripe.customers.create({ email });
 
-    // session checkout en mode SUBSCRIPTION
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       customer: customer.id,
@@ -33,7 +30,6 @@ export async function POST(req: Request) {
 
     return jsonWithCors(req, { url: session.url });
   } catch (e: any) {
-    console.error("checkout error", e);
-    return jsonWithCors(req, { error: e?.message || "checkout_failed" }, 500);
+    return jsonWithCors(req, { error: e?.message || "checkout_failed" }, { status: 200 });
   }
 }
