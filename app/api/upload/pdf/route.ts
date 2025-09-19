@@ -1,5 +1,6 @@
+// app/api/upload/pdf/route.ts
 import { NextResponse } from 'next/server';
-import { put } from '@vercel/blob';
+import { put } from '@vercel/blob'; // ✅ PAS de generateUploadURL ici
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -30,15 +31,17 @@ export async function POST(req: Request) {
     if (!file || !(file instanceof File)) {
       return withCORS(req, NextResponse.json({ error: 'Missing file field "pdf"' }, { status: 400 }));
     }
+
     const type = (file as File).type || 'application/octet-stream';
     if (type !== 'application/pdf') {
       return withCORS(req, NextResponse.json({ error: 'Only application/pdf allowed' }, { status: 415 }));
     }
 
     const safe = ((file as File).name || 'upload.pdf')
-      .replace(/\s+/g,'-')
-      .replace(/[^a-zA-Z0-9.\-_]/g,'');
+      .replace(/\s+/g, '-')                 // espaces → tirets
+      .replace(/[^a-zA-Z0-9.\-_]/g, '');    // nettoie le nom
 
+    // ✅ ICI : backticks + interpolation
     const key = `mf/uploads/pdf/${Date.now()}-${safe}`;
 
     const blob = await put(key, file as File, {
