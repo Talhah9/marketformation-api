@@ -1,41 +1,65 @@
-
 // app/api/upload/pdf/start/route.ts
 import { NextResponse } from 'next/server';
-import { createUploadUrl } from '@vercel/blob'; // si erreur d'import, essaye generateUploadURL
+import { handleUpload, type HandleUploadBody } from '@vercel/blob/client';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const ALLOWED_ORIGIN = process.env.CORS_ORIGIN || 'https://tqiccz-96.myshopify.com';
+const ALLOWED_ORIGIN =
+  process.env.CORS_ORIGIN || 'https://tqiccz-96.myshopify.com';
 
-function withCORS(req: Request, res: NextResponse) {
-  const origin = req.headers.get('origin') || '';
-  res.headers.set('Access-Control-Allow-Origin', origin || ALLOWED_ORIGIN);
+function withCORS(req: Request, res: NextResponse, methods = 'POST,OPTIONS') {
+  const origin = req.headers.get('origin') || ALLOWED_ORIGIN;
+  res.headers.set('Access-Control-Allow-Origin', origin);
   res.headers.set('Vary', 'Origin');
-  // pas besoin de credentials pour cette route, donc pas d’include côté front
-  res.headers.set('Access-Control-Allow-Methods', 'POST,OPTIONS');
+  res.headers.set('Access-Control-Allow-Methods', methods);
   res.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
   return res;
-}
-function json(req: Request, data: any, status = 200) {
-  return withCORS(req, NextResponse.json(data, { status }));
 }
 
 export async function OPTIONS(req: Request) {
   return withCORS(req, new NextResponse(null, { status: 204 }));
 }
 
-export async function POST(req: Request) {
+export async function POST(request: Request) {
+  // Le body doit être JSON envoyé par le client uploader
+  const body = (await request.json()) as HandleUploadBody;
+
   try {
-    // Limites et type autorisé (adapte la taille si besoin)
-    const { url } = await createUploadUrl({
-      allowedContentTypes: ['application/pdf'],
-      maximumSize: 50 * 1024 * 1024, // 50 MB
-      tokenPayload: { scope: 'mf/pdf' },
+    const jsonResponse = await handleUpload({
+      request,
+      body,
+      // 1) Génère un token d’upload pour le navigateur
+      onBeforeGenerateToken: async (
+        pathname,
+        /* clientPayload */
+      ) => {
+        return {
+          allowedContentTypes: ['application/pdf'],
+          addRandomSuffix: true,
+          access: 'public', // URL publique
+          tokenPayload: JSON.stringify({ scope: 'mf/pdf' }), // optionnel
+          // callbackUrl: 'https://mf-api-gold.vercel.app/api/upload/pdf/start', // optionnel
+        };
+      },
+      // 2) Callback quand l’upload direct est terminé (Vercel appelle ton endpoint)
+      onUploadCompleted: async ({ blob /*, tokenPayload */ }) => {
+        // Tu peux persister blob.url en BDD ici si tu veux
+        console.log('Blob uploaded:', blob.url);
+      },
     });
-    return json(req, { ok: true, uploadUrl: url }, 200);
-  } catch (e: any) {
-    // Si ton package est ancien, createUploadUrl peut ne pas exister → utiliser generateUploadURL
-    return json(req, { ok: false, error: e?.message || 'createUploadUrl failed' }, 500);
+
+    return withCORS(
+      request,
+      NextResponse.json(jsonResponse, { status: 200 })
+    );
+  } catch (error: any) {
+    return withCORS(
+      request,
+      NextResponse.json(
+        { error: error?.message || 'handleUpload failed' },
+        { status: 400 }
+      )
+    );
   }
 }
