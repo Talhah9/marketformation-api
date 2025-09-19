@@ -5,60 +5,68 @@ import { put } from '@vercel/blob';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const ALLOWED_ORIGIN = process.env.CORS_ORIGIN || 'https://tqiccz-96.myshopify.com';
+// Autoriser une ou plusieurs origines (séparées par des virgules)
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN_LIST || process.env.CORS_ORIGIN || 'https://tqiccz-96.myshopify.com')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
-function withCORS(res: NextResponse) {
-  res.headers.set('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
-  res.headers.set('Access-Control-Allow-Credentials', 'true');
-  res.headers.set('Access-Control-Allow-Methods', 'POST,OPTIONS,GET');
-  res.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+function pickOrigin(req: Request) {
+  const o = req.headers.get('origin') || '';
+  return ALLOWED_ORIGINS.includes(o) ? o : (ALLOWED_ORIGINS[0] || '*');
+}
+
+function withCORS(req: Request, res: NextResponse) {
+  const origin = pickOrigin(req);
+  res.headers.set('Access-Control-Allow-Origin', origin);
   res.headers.set('Vary', 'Origin');
+  // Pas besoin d'Allow-Credentials ici si le front n'envoie pas credentials:'include'
+  res.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
   return res;
 }
 
-function json(data: any, status = 200) {
-  return withCORS(NextResponse.json(data, { status }));
+function json(req: Request, data: any, status = 200) {
+  return withCORS(req, NextResponse.json(data, { status }));
 }
 
-// GET: smoke test (doit répondre avec CORS)
-export async function GET() {
-  return json({ ok: true, route: 'upload/pdf' }, 200);
+export async function OPTIONS(req: Request) {
+  return withCORS(req, new NextResponse(null, { status: 204 }));
 }
 
-// OPTIONS: preflight
-export async function OPTIONS() {
-  return withCORS(new NextResponse(null, { status: 204 }));
+export async function GET(req: Request) {
+  return json(req, { ok: true, route: 'upload/pdf' }, 200);
 }
 
 export async function POST(req: Request) {
   try {
-    const origin = req.headers.get('origin') || '';
-    if (origin !== ALLOWED_ORIGIN) {
-      return json({ error: 'Origin not allowed', origin }, 403);
-    }
-
-    const form = await req.formData().catch((e) => { throw new Error('Invalid FormData: ' + e?.message); });
+    const form = await req.formData();
     const file = form.get('pdf');
 
     if (!file || !(file instanceof File)) {
-      return json({ error: 'Missing file field "pdf"' }, 400);
+      return json(req, { error: 'Missing file field "pdf"' }, 400);
+    }
+    const type = file.type || 'application/octet-stream';
+    if (type !== 'application/pdf') {
+      return json(req, { error: 'Only application/pdf allowed' }, 415);
     }
 
-    const type = file.type || 'application/pdf';
-    if (!type.includes('pdf')) {
-      return json({ error: 'Only PDF is allowed' }, 415);
-    }
+    const safeName = (file.name || 'upload.pdf')
+      .replace(/\s+/g, '-')
+      .replace(/[^a-zA-Z0-9.\-_]/g, '');
 
-    const safeName = (file.name || 'upload.pdf').replace(/\s+/g, '-').replace(/[^a-zA-Z0-9.\-_]/g, '');
-    const blob = await put(`mf/uploads/${Date.now()}-${safeName}`, file, {
+    // Chemin logique de stockage
+    const key = `mf/uploads/pdf/${Date.now()}-${safeName}`;
+
+    const blob = await put(key, file, {
       access: 'public',
       contentType: type,
+      addRandomSuffix: false,
     });
 
-    return json({ url: blob.url }, 200);
-  } catch (err: any) {
-    console.error('PDF upload error:', err);
-    // Toujours renvoyer CORS même en erreur
-    return json({ error: 'Upload failed', detail: String(err?.message || err) }, 500);
+    return json(req, { url: blob.url }, 200);
+  } catch (e: any) {
+    console.error('PDF upload error:', e);
+    return json(req, { error: 'Upload failed', detail: String(e?.message || e) }, 500);
   }
 }
