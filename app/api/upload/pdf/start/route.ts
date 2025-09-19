@@ -1,14 +1,10 @@
-// app/api/upload/pdf/start/route.ts
 import { NextResponse } from 'next/server';
-import { generateUploadURL } from '@vercel/blob';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const ALLOWED_ORIGIN = process.env.CORS_ORIGIN || 'https://tqiccz-96.myshopify.com';
-
 function withCORS(req: Request, res: NextResponse, methods = 'POST,OPTIONS') {
-  const origin = req.headers.get('origin') || ALLOWED_ORIGIN;
+  const origin = req.headers.get('origin') || process.env.CORS_ORIGIN || 'https://tqiccz-96.myshopify.com';
   res.headers.set('Access-Control-Allow-Origin', origin);
   res.headers.set('Vary', 'Origin');
   res.headers.set('Access-Control-Allow-Methods', methods);
@@ -20,12 +16,11 @@ export async function OPTIONS(req: Request) {
   return withCORS(req, new NextResponse(null, { status: 204 }));
 }
 
+// On ne génère plus d’URL d’upload côté client : on renvoie 410 pour indiquer que l’endpoint est obsolète.
 export async function POST(req: Request) {
-  const { url } = await generateUploadURL({
-    allowedContentTypes: ['application/pdf'],
-    maximumSize: 100 * 1024 * 1024,
-    addRandomSuffix: true,
-    tokenPayload: { scope: 'mf/pdf' },
-  });
-  return withCORS(req, NextResponse.json({ ok: true, uploadUrl: url }, { status: 200 }));
+  return withCORS(req, NextResponse.json({ error: 'client-upload disabled; use /api/upload/pdf' }, { status: 410 }));
+}
+
+export async function GET(req: Request) {
+  return withCORS(req, NextResponse.json({ ok: true, route: 'upload/pdf/start (disabled)' }, { status: 200 }));
 }
