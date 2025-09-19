@@ -1,31 +1,20 @@
-// app/api/upload/pdf/route.ts
+// app/api/upload/pdf/start/route.ts
 import { NextResponse } from 'next/server';
-import { put } from '@vercel/blob';
+import { generateUploadURL } from '@vercel/blob'; // ✅ au lieu de createUploadUrl
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-// Autoriser une ou plusieurs origines (séparées par des virgules)
-const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN_LIST || process.env.CORS_ORIGIN || 'https://tqiccz-96.myshopify.com')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
-function pickOrigin(req: Request) {
-  const o = req.headers.get('origin') || '';
-  return ALLOWED_ORIGINS.includes(o) ? o : (ALLOWED_ORIGINS[0] || '*');
-}
+const ALLOWED_ORIGIN = process.env.CORS_ORIGIN || 'https://tqiccz-96.myshopify.com';
 
 function withCORS(req: Request, res: NextResponse) {
-  const origin = pickOrigin(req);
+  const origin = req.headers.get('origin') || ALLOWED_ORIGIN;
   res.headers.set('Access-Control-Allow-Origin', origin);
   res.headers.set('Vary', 'Origin');
-  // Pas besoin d'Allow-Credentials ici si le front n'envoie pas credentials:'include'
-  res.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.headers.set('Access-Control-Allow-Methods', 'POST,OPTIONS');
   res.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
   return res;
 }
-
 function json(req: Request, data: any, status = 200) {
   return withCORS(req, NextResponse.json(data, { status }));
 }
@@ -34,39 +23,16 @@ export async function OPTIONS(req: Request) {
   return withCORS(req, new NextResponse(null, { status: 204 }));
 }
 
-export async function GET(req: Request) {
-  return json(req, { ok: true, route: 'upload/pdf' }, 200);
-}
-
 export async function POST(req: Request) {
   try {
-    const form = await req.formData();
-    const file = form.get('pdf');
-
-    if (!file || !(file instanceof File)) {
-      return json(req, { error: 'Missing file field "pdf"' }, 400);
-    }
-    const type = file.type || 'application/octet-stream';
-    if (type !== 'application/pdf') {
-      return json(req, { error: 'Only application/pdf allowed' }, 415);
-    }
-
-    const safeName = (file.name || 'upload.pdf')
-      .replace(/\s+/g, '-')
-      .replace(/[^a-zA-Z0-9.\-_]/g, '');
-
-    // Chemin logique de stockage
-    const key = `mf/uploads/pdf/${Date.now()}-${safeName}`;
-
-    const blob = await put(key, file, {
-      access: 'public',
-      contentType: type,
-      addRandomSuffix: false,
+    const { url } = await generateUploadURL({
+      allowedContentTypes: ['application/pdf'],
+      maximumSize: 100 * 1024 * 1024, // ex. 100 Mo
+      tokenPayload: { scope: 'mf/pdf' },
     });
-
-    return json(req, { url: blob.url }, 200);
+    return json(req, { ok: true, uploadUrl: url }, 200);
   } catch (e: any) {
-    console.error('PDF upload error:', e);
-    return json(req, { error: 'Upload failed', detail: String(e?.message || e) }, 500);
+    console.error('generateUploadURL error:', e);
+    return json(req, { ok: false, error: e?.message || 'generateUploadURL failed' }, 500);
   }
 }
