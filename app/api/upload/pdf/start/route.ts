@@ -32,7 +32,6 @@ export async function GET(req: Request) {
 
 export async function POST(req: Request) {
   try {
-    // CORS strict (optionnel)
     const origin = req.headers.get('origin') || '';
     if (ALLOWED_ORIGIN && origin && origin !== ALLOWED_ORIGIN) {
       return withCORS(
@@ -52,17 +51,14 @@ export async function POST(req: Request) {
       );
     }
 
-    // === Import DYNAMIQUE pour être compatible v0.x et v1.x ===
-    // (évite l’erreur de build “Attempted import error”)
+    // ⬇️ IMPORT DYNAMIQUE — aucune import line de @vercel/blob en haut du fichier
     const blobMod: any = await import('@vercel/blob').catch(() => ({}));
-    // Essaye toutes les variantes “connues”
     const gen =
       blobMod.generateUploadURL ||
       blobMod.createUploadURL ||
       blobMod.getUploadURL ||
       null;
 
-    // Pour debug, on tente de récupérer la version réelle
     let blobVersion = 'unknown';
     try {
       const pkg: any = await import('@vercel/blob/package.json');
@@ -71,7 +67,7 @@ export async function POST(req: Request) {
 
     if (typeof gen !== 'function') {
       console.error(
-        '[upload/pdf/start] No generate/create upload URL function found in @vercel/blob',
+        '[upload/pdf/start] No upload URL function in @vercel/blob',
         { blobVersion, keys: Object.keys(blobMod || {}) }
       );
       return withCORS(
@@ -80,7 +76,7 @@ export async function POST(req: Request) {
           {
             ok: false,
             error:
-              'This @vercel/blob version does not expose a “generateUploadURL/createUploadURL/getUploadURL” function',
+              'This @vercel/blob version has no generateUploadURL/createUploadURL/getUploadURL',
             blobVersion,
           },
           { status: 500 }
@@ -88,25 +84,21 @@ export async function POST(req: Request) {
       );
     }
 
-    // Appel de la fonction détectée
-    // (La signature la plus courante accepte un objet d’options)
     const opts = {
       allowedContentTypes: ['application/pdf'],
-      maximumSize: 100 * 1024 * 1024, // 100 Mo
+      maximumSize: 100 * 1024 * 1024,
       addRandomSuffix: true,
       tokenPayload: { scope: 'mf/pdf' },
     };
 
     const out = await gen(opts);
-    // Certaines versions renvoient { url }, d’autres { uploadUrl } — on normalise
     const uploadUrl = out?.url || out?.uploadUrl;
 
     if (!uploadUrl) {
-      console.error('[upload/pdf/start] No uploadUrl in response', { out, blobVersion });
       return withCORS(
         req,
         NextResponse.json(
-          { ok: false, error: 'No uploadUrl returned by blob SDK', blobVersion },
+          { ok: false, error: 'No uploadUrl from blob SDK', blobVersion },
           { status: 500 }
         )
       );
