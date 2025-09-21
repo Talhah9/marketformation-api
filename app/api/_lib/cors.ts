@@ -1,43 +1,16 @@
-// app/api/_lib/cors.ts
-import { NextResponse } from "next/server";
+import { NextResponse } from 'next/server';
 
-// Autorisations via ENV (optionnel) — exemple: CORS_ORIGINS="https://tqiccz-96.myshopify.com,https://xxx.myshopify.com"
-const RAW = (process.env.CORS_ORIGINS || process.env.CORS_ORIGIN || "").trim();
-const ALLOWED = RAW ? RAW.split(",").map(s => s.trim()).filter(Boolean) : [];
+const ALLOWED_ORIGIN = process.env.CORS_ORIGIN || 'https://tqiccz-96.myshopify.com';
 
-function allowOrigin(req: Request) {
-  const origin = req.headers.get("origin");
-  if (!origin) return ALLOWED[0] || "*";
-  if (ALLOWED.includes(origin)) return origin;
-  try {
-    const { hostname } = new URL(origin);
-    if (hostname.endsWith(".myshopify.com")) return origin; // fallback utile en dev/preview
-  } catch {}
-  return ALLOWED[0] || "*";
-}
-
-function allowHeaders(req: Request) {
-  return req.headers.get("access-control-request-headers") || "Content-Type, Accept";
-}
-
-export function handleOptions(req: Request) {
-  const res = new NextResponse(null, { status: 204 });
-  res.headers.set("Access-Control-Allow-Origin", allowOrigin(req));
-  res.headers.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.headers.set("Access-Control-Allow-Headers", allowHeaders(req));
-  res.headers.set("Access-Control-Max-Age", "86400");
-  res.headers.set("Vary", "Origin, Access-Control-Request-Headers");
-  res.headers.set("Cache-Control", "no-store");
+export function withCORS(req: Request, res: NextResponse, methods = 'GET,POST,OPTIONS') {
+  const origin = req.headers.get('origin') || ALLOWED_ORIGIN;
+  res.headers.set('Access-Control-Allow-Origin', origin);
+  res.headers.set('Vary', 'Origin');
+  res.headers.set('Access-Control-Allow-Methods', methods);
+  res.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
   return res;
 }
 
-export function jsonWithCors(req: Request, data: any, init?: ResponseInit) {
-  const res = NextResponse.json(data, { status: init?.status ?? 200, headers: init?.headers });
-  res.headers.set("Access-Control-Allow-Origin", allowOrigin(req));
-  res.headers.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.headers.set("Access-Control-Allow-Headers", allowHeaders(req));
-  res.headers.set("Access-Control-Max-Age", "86400");
-  res.headers.set("Vary", "Origin, Access-Control-Request-Headers");
-  res.headers.set("Cache-Control", "no-store");
-  return res;
+export function corsOptions(req: Request) {
+  return withCORS(req, new NextResponse(null, { status: 204 }), 'GET,POST,OPTIONS');
 }
