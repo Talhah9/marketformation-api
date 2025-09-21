@@ -21,15 +21,27 @@ export async function OPTIONS(req: Request) {
 
 export async function POST(req: Request) {
   try {
+    // Sécurité: refuse si pas d’origin autorisé (optionnel)
+    const origin = req.headers.get('origin') || '';
+    if (ALLOWED_ORIGIN && origin && origin !== ALLOWED_ORIGIN) {
+      return withCORS(req, NextResponse.json({ ok:false, error:'Origin not allowed' }, { status: 403 }));
+    }
+
+    if (!process.env.BLOB_READ_WRITE_TOKEN) {
+      console.error('[upload/pdf/start] Missing BLOB_READ_WRITE_TOKEN');
+      return withCORS(req, NextResponse.json({ ok:false, error:'Server misconfigured: missing blob token' }, { status: 500 }));
+    }
+
     const { url } = await generateUploadURL({
       allowedContentTypes: ['application/pdf'],
-      maximumSize: 100 * 1024 * 1024,  // 100 Mo
+      maximumSize: 100 * 1024 * 1024, // 100 Mo
       addRandomSuffix: true,
       tokenPayload: { scope: 'mf/pdf' },
     });
-    return withCORS(req, NextResponse.json({ ok: true, uploadUrl: url }, { status: 200 }));
+
+    return withCORS(req, NextResponse.json({ ok:true, uploadUrl: url }, { status: 200 }));
   } catch (e:any) {
-    console.error('generateUploadURL error:', e);
-    return withCORS(req, NextResponse.json({ ok: false, error: 'generateUploadURL failed' }, { status: 500 }));
+    console.error('[upload/pdf/start] generateUploadURL error:', e);
+    return withCORS(req, NextResponse.json({ ok:false, error: String(e?.message || e) }, { status: 500 }));
   }
 }
