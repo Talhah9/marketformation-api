@@ -1,82 +1,54 @@
-// app/api/profile/route.ts
 import { NextResponse } from 'next/server';
+import { put } from '@vercel/blob';
+import { withCORS, corsOptions } from '@/app/lib/cors';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN_LIST || process.env.CORS_ORIGIN || 'https://tqiccz-96.myshopify.com')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+function keyOf(idOrMail:string) { return `mf/profiles/${encodeURIComponent(idOrMail)}.json`; }
 
-function pickOrigin(req: Request) {
-  const o = req.headers.get('origin') || '';
-  return ALLOWED_ORIGINS.includes(o) ? o : null;
-}
+export async function OPTIONS(req: Request) { return corsOptions(req); }
 
-function withCORS(req: Request, res: NextResponse) {
-  const origin = pickOrigin(req);
-  if (origin) {
-    res.headers.set('Access-Control-Allow-Origin', origin);
-    res.headers.set('Vary', 'Origin');
-    // ⚠️ nécessaire quand credentials:'include'
-    res.headers.set('Access-Control-Allow-Credentials', 'true');
-    res.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-    res.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-  }
-  return res;
-}
-
-function json(req: Request, data: any, status = 200) {
-  return withCORS(req, NextResponse.json(data, { status }));
-}
-
-export async function OPTIONS(req: Request) {
-  return withCORS(
-    req,
-    new NextResponse(null, { status: 204 })
-  );
-}
-
-// Exemple d’implémentation GET (adapte à ton stockage)
+// GET ?shopifyCustomerId=... OR ?email=...
 export async function GET(req: Request) {
   try {
-    const url = new URL(req.url);
-    const shopifyCustomerId = url.searchParams.get('shopifyCustomerId');
-    const email = url.searchParams.get('email');
-
-    // TODO: fetch profil en BDD/metafields selon tes clés
-    const profile = {
-      bio: '',
-      avatar_url: '',
-      expertise_url: '',
-      shopifyCustomerId,
-      email,
-    };
-
-    return json(req, { ok: true, profile }, 200);
-  } catch (e: any) {
-    return json(req, { ok: false, error: e?.message || 'Profile GET failed' }, 500);
+    const u = new URL(req.url);
+    const id = u.searchParams.get('shopifyCustomerId') || '';
+    const email = u.searchParams.get('email') || '';
+    const k = keyOf(id || email);
+    const url = `https://${process.env.BLOB_PUBLIC_HOST || 'blob.vercel-storage.com'}/${k}`; // si tu as configuré un hostname public
+    // on tente de lire
+    const r = await fetch(url);
+    if (!r.ok) return withCORS(req, NextResponse.json({ ok:true, profile:{} }, { status:200 }));
+    const profile = await r.json().catch(()=> ({}));
+    return withCORS(req, NextResponse.json({ ok:true, profile }, { status:200 }));
+  } catch (e:any) {
+    console.error('profile GET', e);
+    return withCORS(req, NextResponse.json({ ok:false, error:e.message||'error' }, { status:500 }));
   }
 }
 
-// Exemple POST (sauvegarde)
+// POST body: { shopifyCustomerId/email, bio, avatar_url, expertise_url }
 export async function POST(req: Request) {
   try {
-    const body = await req.json();
-
-    // TODO: persister body.bio, body.avatar_url, body.expertise_url …
+    const b = await req.json();
+    const id = b.shopifyCustomerId || b.email;
+    if (!id) return withCORS(req, NextResponse.json({ ok:false, error:'Missing id/email' }, { status:400 }));
 
     const profile = {
-      bio: body.bio || '',
-      avatar_url: body.avatar_url || body.avatarUrl || '',
-      expertise_url: body.expertise_url || body.expertiseUrl || '',
-      email: body.email,
-      shopifyCustomerId: body.shopifyCustomerId,
+      bio: b.bio || '',
+      avatar_url: b.avatar_url || b.avatarUrl || '',
+      expertise_url: b.expertise_url || b.expertiseUrl || ''
     };
-
-    return json(req, { ok: true, profile }, 200);
-  } catch (e: any) {
-    return json(req, { ok: false, error: e?.message || 'Profile POST failed' }, 500);
+    const k = keyOf(String(id));
+    const blob = await put(k, new Blob([JSON.stringify(profile)], { type:'application/json' }), {
+      access: 'public',
+      addRandomSuffix: false,
+      contentType: 'application/json'
+    });
+    return withCORS(req, NextResponse.json({ ok:true, profile, url: blob.url }, { status:200 }));
+  } catch (e:any) {
+    console.error('profile POST', e);
+    return withCORS(req, NextResponse.json({ ok:false, error:e.message||'error' }, { status:500 }));
   }
 }
