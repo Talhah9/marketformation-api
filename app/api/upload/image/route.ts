@@ -1,5 +1,5 @@
 // app/api/upload/image/route.ts
-import { optionsResponse, withCorsJSON } from '../../../lib/cors';
+import { optionsResponse, withCorsJSON } from '@/lib/cors';
 import { put } from "@vercel/blob";
 
 export const runtime = "nodejs";
