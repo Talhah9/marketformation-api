@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import Stripe from 'stripe';
-import { optionsResponse, withCorsJSON } from '../../../../lib/cors';
+import { optionsResponse, withCorsJSON } from '@/lib/cors';
 
 
 export const runtime = 'nodejs';
