@@ -1,29 +1,27 @@
-﻿// Upload image â†’ Shopify Files CDN (REST)
-// PrÃ©requis env: SHOPIFY_STORE_DOMAIN, SHOPIFY_ADMIN_API_ACCESS_TOKEN
-import { put } from '@vercel/blob';
-export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
+import { optionsResponse, withCorsJSON } from "@/lib/cors";
+import { put } from "@vercel/blob";
+
+export const runtime = "nodejs";
+
+export async function OPTIONS() {
+  return optionsResponse();
+}
 
 export async function POST(req: Request) {
   try {
+    const ct = req.headers.get("content-type") || "";
+    if (!ct.includes("multipart/form-data")) {
+      return withCorsJSON({ ok: false, error: "Expected multipart/form-data" }, { status: 400 });
+    }
     const form = await req.formData();
-    const file = form.get('image') as File | null;
-    if (!file) return new Response(JSON.stringify({ error: 'no_image' }), { status: 400 });
-
-    const ext = (file.name?.split('.').pop() || 'png').toLowerCase();
-    const key = `courses/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
-
-    const blob = await put(key, Buffer.from(await file.arrayBuffer()), {
-      access: 'public',
-      contentType: file.type || 'image/png',
-    });
-
-    return new Response(JSON.stringify({ url: blob.url }), {
-      status: 200, headers: { 'Content-Type': 'application/json' }
-    });
+    const file = form.get("image");
+    if (!(file instanceof File)) {
+      return withCorsJSON({ ok: false, error: "Missing 'image' file" }, { status: 400 });
+    }
+    const filename = file.name || `image_${Date.now()}`;
+    const blob = await put(filename, file, { access: "public" });
+    return withCorsJSON({ ok: true, url: blob.url, pathname: blob.pathname }, { status: 200 });
   } catch (e: any) {
-    return new Response(JSON.stringify({ error: e?.message || 'upload_image_failed' }), { status: 500 });
+    return withCorsJSON({ ok: false, error: e?.message || "Upload failed" }, { status: 500 });
   }
 }
-
-

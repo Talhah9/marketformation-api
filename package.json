@@ -1,34 +1,26 @@
 {
   "name": "marketformation-api",
-  "private": true,
   "version": "1.0.0",
-  "type": "module",
+  "private": true,
   "scripts": {
-    "clean": "rimraf .next dist",
     "dev": "next dev",
-    "build": "npm run clean && next build",
+    "build": "next build",
     "start": "next start",
     "lint": "next lint"
   },
   "dependencies": {
-    "@stripe/stripe-js": "2.4.0",
     "@vercel/blob": "0.23.4",
     "next": "14.2.5",
-    "react": "18.2.0",
-    "react-dom": "18.2.0",
-    "stripe": "^16.0.0",
-    "zod": "3.23.8"
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "stripe": "16.12.0"
   },
   "devDependencies": {
-    "@types/node": "20.12.12",
-    "@types/react": "18.2.66",
-    "@types/react-dom": "18.2.19",
+    "@types/node": "20.14.9",
+    "@types/react": "18.3.3",
+    "@types/react-dom": "18.3.0",
+    "typescript": "5.5.3",
     "eslint": "8.57.0",
-    "eslint-config-next": "14.2.5",
-    "rimraf": "^5.0.0",
-    "typescript": "5.5.4"
-  },
-  "engines": {
-    "node": "20.x"
+    "eslint-config-next": "14.2.5"
   }
 }

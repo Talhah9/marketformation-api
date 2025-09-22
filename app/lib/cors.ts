@@ -5,6 +5,7 @@ export const corsHeaders: Record<string, string> = {
     "Content-Type, Authorization, X-Shopify-Hmac-Sha256, X-Shopify-Shop-Domain",
   "Access-Control-Allow-Credentials": "true",
 };
+
 export function withCorsJSON(body: unknown, init: ResponseInit = {}): Response {
   const headers = new Headers({
     "Content-Type": "application/json",
@@ -13,6 +14,7 @@ export function withCorsJSON(body: unknown, init: ResponseInit = {}): Response {
   });
   return new Response(JSON.stringify(body), { ...init, headers });
 }
+
 export function optionsResponse(): Response {
   return new Response(null, { status: 204, headers: corsHeaders });
 }

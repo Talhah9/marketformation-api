@@ -1,26 +1,20 @@
-﻿import { NextResponse } from "next/server";
+import { optionsResponse, withCorsJSON } from "@/lib/cors";
+import { generateUploadURL } from "@vercel/blob";
 
 export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
 
-function withCORS(req: Request, res: NextResponse, methods = "POST,OPTIONS") {
-  const origin = req.headers.get("origin") || process.env.CORS_ORIGIN || "https://tqiccz-96.myshopify.com";
-  res.headers.set("Access-Control-Allow-Origin", origin);
-  res.headers.set("Vary", "Origin");
-  res.headers.set("Access-Control-Allow-Methods", methods);
-  res.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
-  return res;
-}
-
-export async function OPTIONS(req: Request) {
-  return withCORS(req, new NextResponse(null, { status: 204 }));
+export async function OPTIONS() {
+  return optionsResponse();
 }
 
 export async function POST(req: Request) {
-  return withCORS(req, NextResponse.json({ error: "client-upload disabled; use /api/upload/pdf" }, { status: 410 }));
-}
+  try {
+    const { filename = `file_${Date.now()}.pdf`, contentType = "application/pdf" } =
+      await req.json().catch(() => ({}));
 
-export async function GET(req: Request) {
-  return withCORS(req, NextResponse.json({ ok: true, route: "upload/pdf/start (disabled)" }, { status: 200 }));
+    const { url, id, token } = await generateUploadURL({ contentType });
+    return withCorsJSON({ ok: true, uploadURL: url, id, token, filename }, { status: 200 });
+  } catch (e: any) {
+    return withCorsJSON({ ok: false, error: e?.message || "Failed to create upload URL" }, { status: 500 });
+  }
 }
-

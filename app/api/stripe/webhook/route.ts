@@ -1,42 +1,48 @@
-﻿import { NextRequest, NextResponse } from "next/server";
-import stripe from '@/lib/stripe';
+import Stripe from "stripe";
 
-export const runtime = "nodejs"; // nÃ©cessaire pour Buffer
+export const runtime = "nodejs";
 
-function tryConstructEvent(buf: Buffer, sig: string, secret?: string) {
-  if (!secret) throw new Error("no secret");
-  return stripe.webhooks.constructEvent(buf, sig, secret);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: "2024-06-20" });
+const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET!;
+
+export async function OPTIONS() {
+  // Pas vraiment utile pour un webhook, mais OK de renvoyer 204
+  return new Response(null, { status: 204 });
 }
 
-export async function POST(req: NextRequest) {
-  const sig = req.headers.get("stripe-signature")!;
-  const buf = Buffer.from(await req.arrayBuffer());
-
-  let event: any;
+export async function POST(req: Request) {
   try {
-    event = tryConstructEvent(buf, sig, process.env.STRIPE_WEBHOOK_SECRET_PLATFORM);
-  } catch {
+    const sig = req.headers.get("stripe-signature") || "";
+    const rawBody = await req.text(); // important: texte brut
+
+    let event: Stripe.Event;
     try {
-      event = tryConstructEvent(buf, sig, process.env.STRIPE_WEBHOOK_SECRET_CONNECT);
+      event = stripe.webhooks.constructEvent(rawBody, sig, WEBHOOK_SECRET);
     } catch (err: any) {
-      return NextResponse.json({ error: "Webhook signature failed: " + err.message }, { status: 400 });
+      return new Response(`Webhook Error: ${err.message}`, { status: 400 });
     }
-  }
 
-  switch (event.type) {
-    case "checkout.session.completed":
-      // TODO: marquer l'utilisateur PRO si besoin (Shopify metafield)
-      break;
-    case "customer.subscription.updated":
-    case "invoice.paid":
-      // TODO: synchroniser le statut d'abonnement
-      break;
-    case "account.updated":
-      // TODO: mettre Ã  jour charges_enabled pour le formateur
-      break;
-    default:
-      break;
+    // Traite quelques events courants
+    switch (event.type) {
+      case "checkout.session.completed":
+      case "customer.subscription.created":
+      case "customer.subscription.updated":
+      case "customer.subscription.deleted":
+        // TODO: ta logique (maj BDD, etc.)
+        break;
+      default:
+        // no-op
+        break;
+    }
+
+    return new Response(JSON.stringify({ received: true }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (e: any) {
+    return new Response(JSON.stringify({ ok: false, error: e?.message || "Webhook error" }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
   }
-  return NextResponse.json({ received: true });
 }
-
