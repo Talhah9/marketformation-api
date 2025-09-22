@@ -10,14 +10,15 @@
 
     "baseUrl": ".",
     "paths": {
-      "@/*": ["app/*"]
-      "@/app/*": ["app/*"]   // tolère les vieux imports "@/app/..."
+      "@/*": ["app/*"],
+      "@/app/*": ["app/*"]   // tolère les anciens imports '@/app/...'
     },
 
     "types": ["node"],
     "skipLibCheck": true,
-    "resolveJsonModule": true
+    "resolveJsonModule": true,
+    "isolatedModules": true
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx"],
-  "exclude": ["node_modules"]
+  "exclude": ["node_modules", ".next"]
 }
