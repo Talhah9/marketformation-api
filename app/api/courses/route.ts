@@ -1,4 +1,4 @@
-// Crée un produit Course et liste les courses d'un formateur via tag trainer:<email>
+﻿// CrÃ©e un produit Course et liste les courses d'un formateur via tag trainer:<email>
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
@@ -36,12 +36,12 @@ export async function POST(req: Request) {
       return new Response(JSON.stringify({ error: 'title_and_cover_required' }), { status: 400 });
     }
 
-    // 1) Crée le produit (image par URL => Shopify l’importe & l’affiche)
+    // 1) CrÃ©e le produit (image par URL => Shopify lâ€™importe & lâ€™affiche)
     const productPayload = {
       product: {
         title,
-        body_html: `${description || ''}${pdfUrl ? `<p><a href="${pdfUrl}" target="_blank">Télécharger le programme (PDF)</a></p>` : ''}`,
-        status: 'active', // 'draft' si tu préfères
+        body_html: `${description || ''}${pdfUrl ? `<p><a href="${pdfUrl}" target="_blank">TÃ©lÃ©charger le programme (PDF)</a></p>` : ''}`,
+        status: 'active', // 'draft' si tu prÃ©fÃ¨res
         product_type: 'Formation',
         tags: ['mf_trainer', customerEmail || ''].filter(Boolean).join(', '),
         images: coverUrl ? [{ src: coverUrl }] : []
@@ -68,10 +68,10 @@ export async function POST(req: Request) {
           value: pdfUrl
         }
       });
-      // Pas bloquant si ça échoue, on continue
+      // Pas bloquant si Ã§a Ã©choue, on continue
     }
 
-    // 3) Ajouter à la collection (par handle)
+    // 3) Ajouter Ã  la collection (par handle)
     if (collectionHandle) {
       // Essaye custom collections
       let colId: number | null = null;
@@ -101,3 +101,4 @@ export async function POST(req: Request) {
     return new Response(JSON.stringify({ error: e?.message || 'create_course_failed' }), { status: 500 });
   }
 }
+

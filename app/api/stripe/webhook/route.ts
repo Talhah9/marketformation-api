@@ -1,7 +1,7 @@
-import { NextRequest, NextResponse } from "next/server";
+﻿import { NextRequest, NextResponse } from "next/server";
 import stripe from '@/lib/stripe';
 
-export const runtime = "nodejs"; // nécessaire pour Buffer
+export const runtime = "nodejs"; // nÃ©cessaire pour Buffer
 
 function tryConstructEvent(buf: Buffer, sig: string, secret?: string) {
   if (!secret) throw new Error("no secret");
@@ -32,10 +32,11 @@ export async function POST(req: NextRequest) {
       // TODO: synchroniser le statut d'abonnement
       break;
     case "account.updated":
-      // TODO: mettre à jour charges_enabled pour le formateur
+      // TODO: mettre Ã  jour charges_enabled pour le formateur
       break;
     default:
       break;
   }
   return NextResponse.json({ received: true });
 }
+

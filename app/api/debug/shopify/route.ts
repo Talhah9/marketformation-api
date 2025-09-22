@@ -1,4 +1,4 @@
-// GET /api/debug/shopify  → vérifie les credentials + scope write_files
+﻿// GET /api/debug/shopify  â†’ vÃ©rifie les credentials + scope write_files
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
@@ -54,3 +54,4 @@ export async function GET() {
   out.ok = true;
   return new Response(JSON.stringify(out, null, 2), { status: 200, headers: { 'Content-Type': 'application/json' } });
 }
+

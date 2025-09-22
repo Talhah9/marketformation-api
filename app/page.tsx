@@ -1,3 +1,4 @@
-export default function Page() {
-  return <pre>Marketformation API – OK</pre>;
+﻿export default function Page() {
+  return <pre>Marketformation API â€“ OK</pre>;
 }
+

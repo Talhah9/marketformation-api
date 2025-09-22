@@ -1,4 +1,4 @@
-export const metadata = { title: "MF API" };
+﻿export const metadata = { title: "MF API" };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
@@ -7,3 +7,4 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     </html>
   );
 }
+

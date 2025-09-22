@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+﻿import { NextResponse } from "next/server";
 import stripe from '@/lib/stripe';
 
 export async function POST() {
@@ -17,3 +17,4 @@ export async function POST() {
   });
   return NextResponse.json({ url: session.url });
 }
+

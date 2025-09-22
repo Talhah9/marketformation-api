@@ -1,4 +1,4 @@
-// app/api/ping/route.ts
+﻿// app/api/ping/route.ts
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
@@ -19,3 +19,4 @@ export async function GET() {
     headers: { 'Content-Type': 'application/json', ...CORS },
   });
 }
+

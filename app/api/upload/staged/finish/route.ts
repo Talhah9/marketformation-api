@@ -1,4 +1,4 @@
-// Finalise l'upload: crée le fichier dans Shopify Files et renvoie l'URL finale.
+﻿// Finalise l'upload: crÃ©e le fichier dans Shopify Files et renvoie l'URL finale.
 // Appel: POST /api/upload/staged/finish  body: { resourceUrl, kind: "image"|"pdf", alt? }
 // app/api/upload/staged/finish/route.ts
 export const runtime = 'nodejs';
@@ -141,7 +141,7 @@ export async function POST(req: Request) {
       restAttachment = { ok: false, status: 0, body: { error: e?.message || 'attachment_b64_failed' } };
     }
 
-    // rien n'a marché → on renvoie TOUT le diagnostic
+    // rien n'a marchÃ© â†’ on renvoie TOUT le diagnostic
     const debug = {
       gqlUserErrors,
       restSource,
@@ -159,3 +159,4 @@ export async function POST(req: Request) {
     });
   }
 }
+

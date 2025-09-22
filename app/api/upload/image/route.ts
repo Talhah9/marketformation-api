@@ -1,5 +1,5 @@
-// Upload image → Shopify Files CDN (REST)
-// Prérequis env: SHOPIFY_STORE_DOMAIN, SHOPIFY_ADMIN_API_ACCESS_TOKEN
+﻿// Upload image â†’ Shopify Files CDN (REST)
+// PrÃ©requis env: SHOPIFY_STORE_DOMAIN, SHOPIFY_ADMIN_API_ACCESS_TOKEN
 import { put } from '@vercel/blob';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -25,4 +25,5 @@ export async function POST(req: Request) {
     return new Response(JSON.stringify({ error: e?.message || 'upload_image_failed' }), { status: 500 });
   }
 }
+
 

@@ -1,4 +1,4 @@
-// Démarre un upload "staged" Shopify et renvoie l'URL S3 + paramètres POST.
+﻿// DÃ©marre un upload "staged" Shopify et renvoie l'URL S3 + paramÃ¨tres POST.
 // Appel: POST /api/upload/staged/start?kind=image|pdf  body: { filename, mimeType }
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -70,3 +70,4 @@ export async function POST(req: Request){
     });
   }
 }
+
