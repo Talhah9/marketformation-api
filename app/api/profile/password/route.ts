@@ -1,12 +1,20 @@
-import { NextResponse } from 'next/server';
-import { optionsResponse, withCorsJSON } from '@/lib/cors';
+import { optionsResponse, withCorsJSON } from "@/lib/cors";
 
+export const runtime = "nodejs";
 
-export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
+export async function OPTIONS() {
+  return optionsResponse();
+}
 
-export async function OPTIONS(req: Request) { return corsOptions(req); }
 export async function POST(req: Request) {
-  // ici tu plugs ton système (Shopify customer invite ou email provider)
-  return withCORS(req, NextResponse.json({ ok:true }, { status:200 }));
+  try {
+    const { oldPassword, newPassword } = await req.json();
+    if (!newPassword) {
+      return withCorsJSON({ ok: false, error: "Missing newPassword" }, { status: 400 });
+    }
+    // TODO: logique de changement de mot de passe (si géré côté Shopify/App)
+    return withCorsJSON({ ok: true }, { status: 200 });
+  } catch (e: any) {
+    return withCorsJSON({ ok: false, error: e?.message || "Password change failed" }, { status: 500 });
+  }
 }
