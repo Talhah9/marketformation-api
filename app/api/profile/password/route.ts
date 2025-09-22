@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
-import { withCORS, corsOptions } from '@/app/lib/cors';
+import { optionsResponse, withCorsJSON } from '../../../../lib/cors';
+
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
