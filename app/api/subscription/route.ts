@@ -1,38 +1,44 @@
-import { NextResponse } from 'next/server';
-import Stripe from 'stripe';
-import { withCORS, corsOptions } from '@/app/lib/cors';
+// app/api/subscription/route.ts
+import { optionsResponse, withCorsJSON } from "@/lib/cors";
 
-export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
+// (Facultatif) Si tu utilises Stripe ici, importe et lis le statut réel.
+// import Stripe from "stripe";
+// const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: "2024-06-20" });
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2024-06-20' });
+export const runtime = "nodejs";
 
-export async function OPTIONS(req: Request) { return corsOptions(req); }
+export async function OPTIONS() {
+  return optionsResponse();
+}
 
+/**
+ * GET: renvoie un statut d'abonnement "démo".
+ * Si tu as les infos client (via cookie, header, etc.), remplace par une vraie lecture Stripe.
+ */
+export async function GET(_req: Request) {
+  // Exemple minimal (à remplacer par ta logique réelle)
+  const demo = {
+    ok: true,
+    plan: "Starter", // "Starter" | "Pro" | "Business"
+    renews_at: null, // "2025-10-01T00:00:00.000Z" par ex.
+  };
+  return withCorsJSON(demo, { status: 200 });
+}
+
+/**
+ * POST: même chose, mais souvent ton front fait un POST (selon ton implémentation actuelle).
+ * Garde GET/POST pour compat.
+ */
 export async function POST(req: Request) {
-  try {
-    const { email } = await req.json();
-    if (!email) return withCORS(req, NextResponse.json({ ok:false, error:'Missing email' }, { status:400 }));
+  // Exemple: si tu reçois un customerId dans le body → lis Stripe en vrai.
+  // const { customerId } = await req.json();
+  // const subs = await stripe.subscriptions.list({ customer: customerId, status: "active", limit: 1 });
+  // ...
 
-    const list = await stripe.customers.list({ email, limit: 1 });
-    const customer = list.data[0];
-    if (!customer) return withCORS(req, NextResponse.json({ ok:true, planKey:null, status:null }), {});
-
-    const subs = await stripe.subscriptions.list({ customer: customer.id, status: 'all', limit: 1 });
-    const sub = subs.data[0];
-    if (!sub) return withCORS(req, NextResponse.json({ ok:true, planKey:null, status:null }), {});
-
-    const priceId = (sub.items.data[0]?.price?.id) || '';
-    const planKey = /starter/i.test(priceId) ? 'starter' : /business/i.test(priceId) ? 'business' : 'pro';
-
-    return withCORS(req, NextResponse.json({
-      ok:true,
-      planKey,
-      status: sub.status,
-      currentPeriodEnd: sub.current_period_end
-    }, { status:200 }));
-  } catch (e:any) {
-    console.error('subscription error', e);
-    return withCORS(req, NextResponse.json({ ok:false, error: e.message || 'Stripe error' }, { status:500 }));
-  }
+  const demo = {
+    ok: true,
+    plan: "Starter",
+    renews_at: null,
+  };
+  return withCorsJSON(demo, { status: 200 });
 }
