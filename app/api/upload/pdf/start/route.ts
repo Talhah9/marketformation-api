@@ -1,25 +1,31 @@
-import { optionsResponse, withCorsJSON } from "@/lib/cors";
-import { generateUploadURL } from "@vercel/blob";
+// app/api/upload/pdf/start/route.ts
+import { NextResponse } from 'next/server';
+import { generateUploadURL } from '@vercel/blob';
 
-export const runtime = "nodejs";
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-export async function OPTIONS() {
-  return optionsResponse();
+const ALLOWED_ORIGIN = process.env.CORS_ORIGIN || 'https://tqiccz-96.myshopify.com';
+
+function withCORS(req: Request, res: NextResponse, methods = 'POST,OPTIONS') {
+  const origin = req.headers.get('origin') || ALLOWED_ORIGIN;
+  res.headers.set('Access-Control-Allow-Origin', origin);
+  res.headers.set('Vary', 'Origin');
+  res.headers.set('Access-Control-Allow-Methods', methods);
+  res.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  return res;
+}
+
+export async function OPTIONS(req: Request) {
+  return withCORS(req, new NextResponse(null, { status: 204 }));
 }
 
 export async function POST(req: Request) {
-  try {
-    const { filename = `file_${Date.now()}.pdf`, contentType = "application/pdf" } =
-      await req.json().catch(() => ({}));
-
-    const { url, id, token } = await generateUploadURL({
-      contentType,
-      // allowedContentTypes: ["application/pdf"],
-      // maximumSizeInBytes: 10 * 1024 * 1024,
-    });
-
-    return withCorsJSON({ ok: true, uploadURL: url, id, token, filename }, { status: 200 });
-  } catch (e: any) {
-    return withCorsJSON({ ok: false, error: e?.message || "Failed to create upload URL" }, { status: 500 });
-  }
+  const { url } = await generateUploadURL({
+    allowedContentTypes: ['application/pdf'],
+    maximumSize: 100 * 1024 * 1024,
+    addRandomSuffix: true,
+    tokenPayload: { scope: 'mf/pdf' },
+  });
+  return withCORS(req, NextResponse.json({ ok: true, uploadUrl: url }, { status: 200 }));
 }

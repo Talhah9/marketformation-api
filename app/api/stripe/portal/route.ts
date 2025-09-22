@@ -1,32 +1,29 @@
+// app/api/stripe/portal/route.ts
 import Stripe from "stripe";
-import { optionsResponse, withCorsJSON } from '@/lib/cors';
+import { handleOptions, jsonWithCors } from "@/app/api/_lib/cors";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: "2024-06-20" });
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY_LIVE as string, { apiVersion: "2024-06-20" });
 
-export async function OPTIONS() {
-  return optionsResponse();
-}
+export async function OPTIONS(req: Request) { return handleOptions(req); }
 
 export async function POST(req: Request) {
   try {
-    const { customerId, returnUrl } = await req.json();
-    if (!customerId) {
-      return withCorsJSON({ ok: false, error: "Missing customerId" }, { status: 400 });
-    }
+    const { email, returnUrl } = await req.json();
+    if (!email) return jsonWithCors(req, { error: "Missing email" }, { status: 400 });
+
+    const existing = await stripe.customers.list({ email, limit: 1 });
+    const customer = existing.data[0];
+    if (!customer) return jsonWithCors(req, { error: "Customer not found" }, { status: 404 });
 
     const session = await stripe.billingPortal.sessions.create({
-      customer: customerId,
-      return_url:
-        returnUrl ||
-        "https://tqiccz-96.myshopify.com/pages/mon-compte-formateur",
+      customer: customer.id, return_url: returnUrl
     });
 
-    return withCorsJSON({ ok: true, url: session.url }, { status: 200 });
-  } catch (e: any) {
-    console.error("portal error", e);
-    return withCorsJSON({ ok: false, error: e?.message || "Stripe error" }, { status: 500 });
+    return jsonWithCors(req, { url: session.url });
+  } catch (e:any) {
+    return jsonWithCors(req, { error: e?.message || "portal_failed" }, { status: 200 });
   }
 }
