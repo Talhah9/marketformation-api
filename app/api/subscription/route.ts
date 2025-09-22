@@ -1,5 +1,5 @@
 // app/api/subscription/route.ts
-import { optionsResponse, withCorsJSON } from "@/lib/cors";
+import { optionsResponse, withCorsJSON } from '../../../lib/cors';
 
 // (Facultatif) Si tu utilises Stripe ici, importe et lis le statut réel.
 // import Stripe from "stripe";
