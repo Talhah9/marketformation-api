@@ -1,5 +1,5 @@
 // app/api/upload/pdf/start/route.ts
-import { optionsResponse, withCorsJSON } from '../../../lib/cors';
+import { optionsResponse, withCorsJSON } from '@/lib/cors';
 import { generateUploadURL } from "@vercel/blob";
 
 export const runtime = "nodejs";
