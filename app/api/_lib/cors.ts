@@ -1,16 +1,18 @@
-import { NextResponse } from 'next/server';
+// lib/cors.ts
+export const corsHeaders = {
+  "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "",
+  "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Shopify-Hmac-Sha256, X-Shopify-Shop-Domain",
+  "Access-Control-Allow-Credentials": "true",
+};
 
-const ALLOWED_ORIGIN = process.env.CORS_ORIGIN || 'https://tqiccz-96.myshopify.com';
-
-export function withCORS(req: Request, res: NextResponse, methods = 'GET,POST,OPTIONS') {
-  const origin = req.headers.get('origin') || ALLOWED_ORIGIN;
-  res.headers.set('Access-Control-Allow-Origin', origin);
-  res.headers.set('Vary', 'Origin');
-  res.headers.set('Access-Control-Allow-Methods', methods);
-  res.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-  return res;
+export function withCors(json: any, init: ResponseInit = {}) {
+  return new Response(JSON.stringify(json), {
+    ...init,
+    headers: { "Content-Type": "application/json", ...corsHeaders, ...(init.headers || {}) },
+  });
 }
 
-export function corsOptions(req: Request) {
-  return withCORS(req, new NextResponse(null, { status: 204 }), 'GET,POST,OPTIONS');
+export function optionsResponse() {
+  return new Response(null, { status: 204, headers: corsHeaders });
 }
