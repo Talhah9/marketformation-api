@@ -1,5 +1,5 @@
 // app/api/courses/route.ts
-import { optionsResponse, withCorsJSON } from '../../../lib/cors';
+import { optionsResponse, withCorsJSON } from '@/lib/cors';
 
 export const runtime = "nodejs";
 
