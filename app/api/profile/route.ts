@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { put } from '@vercel/blob';
-import { optionsResponse, withCorsJSON } from '../../../lib/cors';
+import { optionsResponse, withCorsJSON } from '@/lib/cors';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
