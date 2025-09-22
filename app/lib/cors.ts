@@ -7,10 +7,7 @@ export const corsHeaders: Record<string, string> = {
   "Access-Control-Allow-Credentials": "true",
 };
 
-export function withCorsJSON(
-  body: unknown,
-  init: ResponseInit = {}
-): Response {
+export function withCorsJSON(body: unknown, init: ResponseInit = {}): Response {
   const headers = new Headers({
     "Content-Type": "application/json",
     ...corsHeaders,
@@ -19,10 +16,7 @@ export function withCorsJSON(
   return new Response(JSON.stringify(body), { ...init, headers });
 }
 
-export function withCorsResponse(
-  body: BodyInit | null,
-  init: ResponseInit = {}
-): Response {
+export function withCorsResponse(body: BodyInit | null, init: ResponseInit = {}): Response {
   const headers = new Headers({
     ...corsHeaders,
     ...(init.headers || {}),
