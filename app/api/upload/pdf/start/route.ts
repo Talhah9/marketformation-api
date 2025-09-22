@@ -1,33 +1,30 @@
 // app/api/upload/pdf/start/route.ts
-import { NextResponse } from 'next/server';
+import { optionsResponse, withCorsJSON } from "@/lib/cors";
+import { generateUploadURL } from "@vercel/blob";
 
-export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
+export const runtime = "nodejs";
 
-const ALLOWED_ORIGIN = process.env.CORS_ORIGIN || 'https://tqiccz-96.myshopify.com';
-
-function withCORS(req: Request, res: NextResponse, methods = 'OPTIONS,GET,POST') {
-  const origin = req.headers.get('origin') || ALLOWED_ORIGIN;
-  res.headers.set('Access-Control-Allow-Origin', origin);
-  res.headers.set('Vary', 'Origin');
-  res.headers.set('Access-Control-Allow-Methods', methods);
-  res.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-  return res;
+export async function OPTIONS() {
+  return optionsResponse();
 }
 
-export async function OPTIONS(req: Request) {
-  return withCORS(req, new NextResponse(null, { status: 204 }));
-}
-
-// Ping de debug
-export async function GET(req: Request) {
-  return withCORS(req, NextResponse.json({ ok: true, route: 'upload/pdf/start (disabled)' }, { status: 200 }));
-}
-
-// On désactive POST pour éviter l’appel à generateUploadURL en prod
 export async function POST(req: Request) {
-  return withCORS(
-    req,
-    NextResponse.json({ ok: false, error: 'Direct-upload disabled. Use /api/upload/pdf.' }, { status: 410 })
-  );
+  try {
+    // Tu peux valider l'origine Shopify ici si besoin:
+    // const origin = req.headers.get("origin");
+    // if (origin !== process.env.CORS_ORIGIN) return withCorsJSON({ ok: false, error: "Origin not allowed" }, { status: 403 });
+
+    const { filename = `file_${Date.now()}.pdf`, contentType = "application/pdf" } = await req.json().catch(() => ({}));
+
+    const { url, id, token } = await generateUploadURL({
+      contentType,
+      // Pour limiter par type/taille:
+      // allowedContentTypes: ["application/pdf"],
+      // maximumSizeInBytes: 10 * 1024 * 1024,
+    });
+
+    return withCorsJSON({ ok: true, uploadURL: url, id, token, filename }, { status: 200 });
+  } catch (err: any) {
+    return withCorsJSON({ ok: false, error: err?.message || "Failed to create upload URL" }, { status: 500 });
+  }
 }
