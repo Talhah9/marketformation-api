@@ -11,6 +11,7 @@
     "baseUrl": ".",
     "paths": {
       "@/*": ["app/*"]
+      "@/app/*": ["app/*"]   // tolère les vieux imports "@/app/..."
     },
 
     "types": ["node"],
