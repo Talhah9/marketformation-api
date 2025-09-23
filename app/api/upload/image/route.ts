@@ -1,10 +1,9 @@
-// app/api/upload/pdf/route.ts
+// app/api/upload/image/route.ts
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 const ALLOWLIST = new Set<string>([
   process.env.ALLOW_ORIGIN || 'https://tqiccz-96.myshopify.com',
-  // ajoute d'autres origines si besoin
 ]);
 
 function corsHeaders(origin?: string) {
@@ -16,7 +15,6 @@ function corsHeaders(origin?: string) {
   };
   if (origin && ALLOWLIST.has(origin)) {
     h['Access-Control-Allow-Origin'] = origin;
-    // Si tu utilises des cookies/sessions côté API, dé-commente :
     // h['Access-Control-Allow-Credentials'] = 'true';
   }
   return h;
@@ -33,16 +31,15 @@ export async function POST(req: Request) {
 
   try {
     const form = await req.formData();
-    const file = form.get('pdf') as File | null;
+    const file = form.get('image') as File | null;
     if (!file) {
-      return new Response(JSON.stringify({ error: 'missing pdf' }), {
+      return new Response(JSON.stringify({ error: 'missing image' }), {
         status: 400, headers: { ...headers, 'Content-Type': 'application/json' },
       });
     }
 
-    // TODO: upload réel (S3/R2/Cloudinary/etc.). Exemple mock :
-    // const url = await uploadToStorage(file);
-    const url = 'https://cdn.example.com/your-uploaded.pdf';
+    // TODO: upload réel (S3/R2/Cloudinary/etc.)
+    const url = 'https://cdn.example.com/your-uploaded.webp';
 
     return new Response(JSON.stringify({ url }), {
       status: 200, headers: { ...headers, 'Content-Type': 'application/json' },
