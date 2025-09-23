@@ -1,10 +1,9 @@
-// app/api/upload/pdf/route.ts
+// app/api/upload/pdf/route.ts (sur mf-api-gold)
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 const ALLOWLIST = new Set<string>([
   process.env.ALLOW_ORIGIN || 'https://tqiccz-96.myshopify.com',
-  // ajoute d'autres origines si besoin
 ]);
 
 function corsHeaders(origin?: string) {
@@ -16,7 +15,7 @@ function corsHeaders(origin?: string) {
   };
   if (origin && ALLOWLIST.has(origin)) {
     h['Access-Control-Allow-Origin'] = origin;
-    // Si tu utilises des cookies/sessions côté API, dé-commente :
+    // Si tu utilises des cookies/sessions:
     // h['Access-Control-Allow-Credentials'] = 'true';
   }
   return h;
@@ -30,7 +29,6 @@ export async function OPTIONS(req: Request) {
 export async function POST(req: Request) {
   const origin = req.headers.get('origin') || undefined;
   const headers = corsHeaders(origin);
-
   try {
     const form = await req.formData();
     const file = form.get('pdf') as File | null;
@@ -39,11 +37,8 @@ export async function POST(req: Request) {
         status: 400, headers: { ...headers, 'Content-Type': 'application/json' },
       });
     }
-
-    // TODO: upload réel (S3/R2/Cloudinary/etc.). Exemple mock :
-    // const url = await uploadToStorage(file);
+    // TODO: upload réel du PDF et retourne l'URL finale
     const url = 'https://cdn.example.com/your-uploaded.pdf';
-
     return new Response(JSON.stringify({ url }), {
       status: 200, headers: { ...headers, 'Content-Type': 'application/json' },
     });
