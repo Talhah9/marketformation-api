@@ -1,6 +1,9 @@
 // app/api/ping/route.ts
 import { NextResponse } from 'next/server';
 
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
 export async function GET() {
   const flags = {
     // Shopify
@@ -13,7 +16,7 @@ export async function GET() {
 
     // Stripe
     STRIPE_SECRET_KEY: !!process.env.STRIPE_SECRET_KEY,
-    STRIPE_WEBHOOK_SECRET: !!process.env.STRIPE_WEBHOOK_SECRET,
+    STRIPE_WEBHOOK_SECRET: !!(process.env.STRIPE_WEBHOOK_SECRET || process.env.STRIPE_WEBHOOK_SECRET_PLATFORM),
     NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: !!process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY,
     STRIPE_PRODUCT_ID: !!process.env.STRIPE_PRODUCT_ID,
     STRIPE_PRICE_STARTER: !!process.env.STRIPE_PRICE_STARTER,
@@ -21,7 +24,4 @@ export async function GET() {
     STRIPE_PRICE_BUSINESS: !!process.env.STRIPE_PRICE_BUSINESS,
 
     // Blob
-    BLOB_READ_WRITE_TOKEN: !!process.env.BLOB_READ_WRITE_TOKEN,
-  };
-  return NextResponse.json({ ok: true, flags, ts: Date.now() });
-}
+    BLOB_READ_WRITE_TOKEN: !!
