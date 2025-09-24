@@ -13,7 +13,7 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 /* ===== ENV requis =====
-  SHOPIFY_STORE_DOMAIN             ex: tqiccz-96.myshopify.com
+  SHOP_DOMAIN             ex: tqiccz-96.myshopify.com
   SHOPIFY_ADMIN_API_ACCESS_TOKEN   shpat_***
   SHOPIFY_API_VERSION              ex: 2025-07 (défaut)
   STRIPE_SECRET_KEY (ou STRIPE_SECRET_KEY_LIVE / STRIPE_LIVE_SECRET)
@@ -23,7 +23,7 @@ export const dynamic = 'force-dynamic';
   STRIPE_PRICE_BUSINESS
 */
 
-const STORE = process.env.SHOPIFY_STORE_DOMAIN!;
+const STORE = process.env.SHOP_DOMAIN!;
 const TOKEN = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN!;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-07';
 
