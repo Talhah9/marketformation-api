@@ -89,12 +89,12 @@ export async function POST(req: Request) {
       },
     });
   } catch (e: any) {
-    return new Response(JSON.stringify({ ok: false, error: e?.message || "upload_failed" }), {
-      status: 500,
-      headers: {
-        "Content-Type": "application/json",
-        ...(corsHeaders as any)(undefined),
-      },
-    });
-  }
+     return new Response(JSON.stringify({ ok: false, error: e?.message || "upload_failed" }), {
+       status: 500,
+       headers: {
+         "Content-Type": "application/json",
+         ...corsHeaders(req),
+       },
+     });
+   }
 }
