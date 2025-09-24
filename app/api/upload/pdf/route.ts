@@ -1,94 +1,116 @@
 // app/api/upload/pdf/route.ts
-import { NextResponse } from 'next/server'
-import { put } from '@vercel/blob' // si tu utilises vercel blob côté serveur
+import { put } from '@vercel/blob'
 
-const ALLOW_ORIGIN = 'https://tqiccz-96.myshopify.com'
-const ALLOW_HEADERS = 'Origin, Accept, Content-Type, Authorization'
-const ALLOW_METHODS = 'POST, OPTIONS'
+// --- CORS config pilotée par ENV ---
+// CORS_ORIGINS: liste de origins séparés par des virgules (ex: "https://topaz.myshopify.com,https://autre.myshopify.com")
+// SHOP_DOMAIN  : fallback (ex: "topaz.myshopify.com")
+const DEFAULT_SHOP_ORIGIN =
+  process.env.SHOP_DOMAIN ? `https://${process.env.SHOP_DOMAIN}` : 'https://tqiccz-96.myshopify.com';
 
-function withCORS(res: Response, origin?: string) {
-  const o = origin && origin.trim() ? origin : ALLOW_ORIGIN
-  const r = new Response(res.body, res)
-  r.headers.set('Access-Control-Allow-Origin', o)
-  r.headers.set('Access-Control-Allow-Methods', ALLOW_METHODS)
-  r.headers.set('Access-Control-Allow-Headers', ALLOW_HEADERS)
-  r.headers.set('Access-Control-Allow-Credentials', 'false')
-  r.headers.set('Vary', 'Origin')
-  return r
+const ALLOW_ORIGINS: string[] =
+  (process.env.CORS_ORIGINS ?? '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+
+if (!ALLOW_ORIGINS.length && DEFAULT_SHOP_ORIGIN) {
+  ALLOW_ORIGINS.push(DEFAULT_SHOP_ORIGIN);
+}
+
+const ALLOW_METHODS = 'POST, OPTIONS';
+const ALLOW_HEADERS = 'Origin, Accept, Content-Type, Authorization';
+
+function pickOrigin(reqOrigin?: string | null): string {
+  const o = (reqOrigin || '').trim();
+  if (o && ALLOW_ORIGINS.includes(o)) return o;
+  return ALLOW_ORIGINS[0] || DEFAULT_SHOP_ORIGIN;
+}
+
+function withCORS(res: Response, originHeader?: string | null) {
+  const origin = pickOrigin(originHeader);
+  const r = new Response(res.body, res);
+  r.headers.set('Access-Control-Allow-Origin', origin);
+  r.headers.set('Access-Control-Allow-Methods', ALLOW_METHODS);
+  r.headers.set('Access-Control-Allow-Headers', ALLOW_HEADERS);
+  r.headers.set('Vary', 'Origin');
+  return r;
 }
 
 export async function OPTIONS(req: Request) {
-  return withCORS(new Response(null, { status: 204 }), req.headers.get('origin') || undefined)
+  return withCORS(new Response(null, { status: 204 }), req.headers.get('origin'));
 }
 
-export const runtime = 'nodejs' // facultatif, mais utile si Edge posait souci
+export const runtime = 'nodejs';
 
 export async function POST(req: Request) {
-  const origin = req.headers.get('origin') || undefined
+  const originHdr = req.headers.get('origin');
 
   try {
     // 1) content-type doit être multipart/form-data
-    const ctype = req.headers.get('content-type') || ''
+    const ctype = req.headers.get('content-type') || '';
     if (!ctype.includes('multipart/form-data')) {
       return withCORS(
         new Response(JSON.stringify({ ok: false, error: 'multipart/form-data required' }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json' }
+          status: 400, headers: { 'Content-Type': 'application/json' }
         }),
-        origin
-      )
+        originHdr
+      );
     }
 
     // 2) récupérer le fichier
-    const form = await req.formData()
-    const file = form.get('pdf')
+    const form = await req.formData();
+    const file = form.get('pdf');
     if (!(file instanceof File)) {
       return withCORS(
         new Response(JSON.stringify({ ok: false, error: 'pdf field missing' }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json' }
+          status: 400, headers: { 'Content-Type': 'application/json' }
         }),
-        origin
-      )
+        originHdr
+      );
     }
 
-    // 3) (optionnel) vérifier le type + taille
-    if (file.type && file.type !== 'application/pdf') {
-      // certains navigateurs ne mettent pas toujours file.type : on reste souple
-      // ici on ne bloque que si le type est renseigné et ≠ pdf
+    // 3) (optionnel) vérifier le type
+    if ((file as any).type && (file as any).type !== 'application/pdf') {
       return withCORS(
         new Response(JSON.stringify({ ok: false, error: 'Only application/pdf allowed' }), {
-          status: 415,
-          headers: { 'Content-Type': 'application/json' }
+          status: 415, headers: { 'Content-Type': 'application/json' }
         }),
-        origin
-      )
+        originHdr
+      );
     }
 
-    // 4) upload — vercel/blob
-    //    nécessite BLOB_READ_WRITE_TOKEN en prod (Vercel Project → Env)
-    const filename = `mf/pdf/${Date.now()}-${(file as any).name || 'file.pdf'}`
+    // (optionnel) limite de taille alignée sur image (15MB)
+    const size = (file as any).size || 0;
+    const MAX_SIZE_BYTES = 15 * 1024 * 1024;
+    if (size && size > MAX_SIZE_BYTES) {
+      return withCORS(
+        new Response(JSON.stringify({ ok: false, error: 'File too large' }), {
+          status: 413, headers: { 'Content-Type': 'application/json' }
+        }),
+        originHdr
+      );
+    }
+
+    // 4) upload — vercel/blob (BLOB_READ_WRITE_TOKEN requis en prod)
+    const safeName = ((file as any).name || 'file.pdf').replace(/[^\w.\-]/g, '_');
+    const filename = `mf/pdf/${Date.now()}-${safeName}`;
     const putRes = await put(filename, file, {
-      access: 'public', // ou 'private' si tu gères les tokens
+      access: 'public',   // passe en 'private' si tu gères des liens signés
       addRandomSuffix: true,
-    })
+    });
 
     // 5) réponse OK + CORS
     return withCORS(
       new Response(JSON.stringify({ ok: true, url: putRes.url }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' }
+        status: 200, headers: { 'Content-Type': 'application/json' }
       }),
-      origin
-    )
+      originHdr
+    );
   } catch (e: any) {
-    // 6) TOUTES LES ERREURS PASSENT ICI → on POSE CORS
     return withCORS(
       new Response(JSON.stringify({ ok: false, error: e?.message || 'upload_failed' }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' }
-      }),
-      origin
-    )
+        status: 500, headers: { 'Content-Type': 'application/json' }
+      })
+    );
   }
 }
