@@ -14,7 +14,7 @@ export async function POST(req: Request) {
     const event = stripe.webhooks.constructEvent(body, sig, secret);
 
     // … ta logique d’events (customer.subscription.*, checkout.session.completed, etc.)
-    // Exemple update d’un metafield côté Shopify :
+    // Exemple: besoin du domaine boutique ?
     const shop = process.env.SHOP_DOMAIN;
     void shop;
 
