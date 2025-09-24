@@ -1,38 +1,84 @@
 // app/api/profile/route.ts
-import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
+import { NextResponse } from 'next/server';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-async function shopifyAdmin(path: string, init?: RequestInit & { json?: any }) {
-  const base = `https://${process.env.SHOP_DOMAIN}/admin/api/2024-07`;
-  const headers: Record<string, string> = {
-    'X-Shopify-Access-Token': process.env.SHOP_ADMIN_TOKEN || process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN || process.env.ADMIN_TOKEN || '',
-    'Content-Type': 'application/json',
-    'Accept': 'application/json',
-  };
-  const res = await fetch(base + path, {
-    method: init?.method || (init?.json ? 'POST' : 'GET'),
-    headers,
-    body: init?.json ? JSON.stringify(init.json) : undefined,
-    cache: 'no-store',
-  });
-  const text = await res.text();
-  let json: any = {};
-  try { json = text ? JSON.parse(text) : {}; } catch {}
-  return { ok: res.ok, status: res.status, json, text };
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || process.env.CORS_ORIGINS || 'https://tqiccz-96.myshopify.com')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+function pickOrigin(req: Request) {
+  const o = req.headers.get('origin') || '';
+  return ALLOWED_ORIGINS.includes(o) ? o : null;
+}
+
+function withCORS(req: Request, res: NextResponse) {
+  const origin = pickOrigin(req);
+  if (origin) {
+    res.headers.set('Access-Control-Allow-Origin', origin);
+    res.headers.set('Vary', 'Origin');
+    // ⚠️ nécessaire quand credentials:'include'
+    res.headers.set('Access-Control-Allow-Credentials', 'true');
+    res.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  }
+  return res;
+}
+
+function json(req: Request, data: any, status = 200) {
+  return withCORS(req, new NextResponse(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json' }
+  }));
 }
 
 export async function OPTIONS(req: Request) {
-  return handleOptions(req);
+  return withCORS(
+    req,
+    new NextResponse(null, { status: 204 })
+  );
 }
 
+// Exemple d’implémentation GET (adapte à ton stockage)
 export async function GET(req: Request) {
-  // … récupère le profil public (metafields), garde ta logique existante
-  return jsonWithCors(req, { ok: true, profile: {} });
+  try {
+    const url = new URL(req.url);
+    const shopifyCustomerId = url.searchParams.get('shopifyCustomerId');
+    const email = url.searchParams.get('email');
+
+    // TODO: fetch profil existant (BDD/metafield)
+    const profile = {
+      bio: '',
+      avatar_url: '',
+      expertise_url: '',
+      email,
+      shopifyCustomerId,
+    };
+
+    return json(req, { ok: true, profile }, 200);
+  } catch (e: any) {
+    return json(req, { ok: false, error: e?.message || 'Profile GET failed' }, 500);
+  }
 }
 
+// Exemple POST (sauvegarde)
 export async function POST(req: Request) {
-  // … enregistre le profil public (bio, avatar_url, expertise_url)
-  return jsonWithCors(req, { ok: true, profile: {} });
+  try {
+    const body = await req.json();
+
+    // TODO: persister body.bio, body.avatar_url, body.expertise_url…
+    const profile = {
+      bio: body.bio || '',
+      avatar_url: body.avatar_url || body.avatarUrl || '',
+      expertise_url: body.expertise_url || body.expertiseUrl || '',
+      email: body.email,
+      shopifyCustomerId: body.shopifyCustomerId,
+    };
+
+    return json(req, { ok: true, profile }, 200);
+  } catch (e: any) {
+    return json(req, { ok: false, error: e?.message || 'Profile POST failed' }, 500);
+  }
 }
