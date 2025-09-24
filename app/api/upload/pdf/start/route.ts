@@ -6,70 +6,88 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const ALLOW_ORIGIN = (process.env.CORS_ORIGINS || '').split(',')[0] || 'https://tqiccz-96.myshopify.com';
-function withCORS(res: Response, origin?: string) {
-  const r = new Response(res.body, res);
-  r.headers.set('Access-Control-Allow-Origin', origin || ALLOW_ORIGIN);
-  r.headers.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  r.headers.set('Access-Control-Allow-Headers', 'Origin, Accept, Content-Type, Authorization');
-  r.headers.set('Vary', 'Origin');
-  return r;
-}
+// ----- CORS -----
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || 'https://tqiccz-96.myshopify.com')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
+function pickOrigin(req: Request) {
+  const o = req.headers.get('origin') || '';
+  return ALLOWED_ORIGINS.includes(o) ? o : ALLOWED_ORIGINS[0] || '*';
+}
+function withCORS(req: Request, res: NextResponse) {
+  const origin = pickOrigin(req);
+  res.headers.set('Access-Control-Allow-Origin', origin);
+  res.headers.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.headers.set('Access-Control-Allow-Headers', 'Origin, Accept, Content-Type, Authorization');
+  res.headers.set('Vary', 'Origin');
+  return res;
+}
 export async function OPTIONS(req: Request) {
-  return withCORS(new Response(null, { status: 204 }), req.headers.get('origin') || undefined);
+  return withCORS(req, new NextResponse(null, { status: 204 }));
 }
 
-function safe(name: string) { return name.replace(/[^\w.\-]/g, '_'); }
+// ----- ENV S3 -----
+const S3_REGION = process.env.S3_REGION!;
+const S3_BUCKET = process.env.S3_BUCKET!;
+const S3_PUBLIC_BASE = (process.env.S3_PUBLIC_BASE || '').replace(/\/+$/, ''); // sans trailing slash
+if (!S3_REGION || !S3_BUCKET || !S3_PUBLIC_BASE) {
+  // Laisse remonter au runtime pour voir le flag rouge via /api/diag/env
+}
+
+//  (facultatif) limite de taille en MB qu’on autorise à presigner
+const MAX_PDF_MB = Number(process.env.PDF_MAX_SIZE_MB || 100); // ex: 100MB
+
+// ----- Client S3 -----
+const s3 = new S3Client({
+  region: S3_REGION,
+  credentials: process.env.S3_ACCESS_KEY_ID && process.env.S3_SECRET_ACCESS_KEY
+    ? { accessKeyId: process.env.S3_ACCESS_KEY_ID, secretAccessKey: process.env.S3_SECRET_ACCESS_KEY }
+    : undefined,
+});
 
 export async function POST(req: Request) {
-  const origin = req.headers.get('origin') || undefined;
   try {
-    const { filename, contentType } = await req.json().catch(() => ({}));
+    const { filename, contentType, size } = await req.json().catch(() => ({} as any));
     if (!filename) {
-      return withCORS(new Response(JSON.stringify({ ok:false, error:'filename required' }), {
-        status:400, headers:{'Content-Type':'application/json'}
-      }), origin);
+      return withCORS(req, NextResponse.json({ ok: false, error: 'filename required' }, { status: 400 }));
+    }
+    // (optionnel) soft check
+    if (contentType && contentType !== 'application/pdf') {
+      return withCORS(req, NextResponse.json({ ok: false, error: 'Only application/pdf allowed' }, { status: 415 }));
+    }
+    if (size && MAX_PDF_MB > 0 && size > MAX_PDF_MB * 1024 * 1024) {
+      return withCORS(req, NextResponse.json({ ok: false, error: 'File too large' }, { status: 413 }));
     }
 
-    const region = process.env.S3_REGION!;
-    const bucket = process.env.S3_BUCKET!;
-    const publicBase = (process.env.S3_PUBLIC_BASE || '').replace(/\/+$/,''); // ex: https://cdn.mondomaine.com
-    if (!region || !bucket || !publicBase) {
-      return withCORS(new Response(JSON.stringify({ ok:false, error:'S3 env missing' }), {
-        status:500, headers:{'Content-Type':'application/json'}
-      }), origin);
-    }
+    const safeName = String(filename).replace(/[^\w.\-]/g, '_');
+    const key = `mf/pdf/${Date.now()}-${safeName}`;
 
-    const key = `mf/pdf/${Date.now()}-${safe(filename)}`;
-    const s3 = new S3Client({
-      region,
-      credentials: {
-        accessKeyId: process.env.S3_ACCESS_KEY_ID!,
-        secretAccessKey: process.env.S3_SECRET_ACCESS_KEY!,
-      },
-    });
-
-    const cmd = new PutObjectCommand({
-      Bucket: bucket,
+    // On presigne un PUT
+    const putCmd = new PutObjectCommand({
+      Bucket: S3_BUCKET,
       Key: key,
       ContentType: contentType || 'application/pdf',
-      ACL: 'public-read', // si ton bucket est configuré pour, sinon retire et sers via CloudFront + policy
+      // ACL: 'public-read', // seulement si ta policy l’autorise et si tu en as besoin
     });
+    const uploadUrl = await getSignedUrl(s3, putCmd, { expiresIn: 60 * 5 }); // 5 minutes
 
-    const uploadUrl = await getSignedUrl(s3, cmd, { expiresIn: 600 }); // 10 min
-    const publicUrl = `${publicBase}/${key}`;
+    // URL publique (serving)
+    const publicUrl = `${S3_PUBLIC_BASE}/${key}`;
 
-    return withCORS(new Response(JSON.stringify({
-      ok: true,
-      method: 'PUT',
-      headers: { 'Content-Type': contentType || 'application/pdf' },
-      uploadUrl,
-      publicUrl,
-    }), { status:200, headers:{'Content-Type':'application/json'} }), origin);
-  } catch (e:any) {
-    return withCORS(new Response(JSON.stringify({ ok:false, error:e?.message || 'start_failed' }), {
-      status:500, headers:{'Content-Type':'application/json'}
-    }), origin);
+    return withCORS(
+      req,
+      NextResponse.json({
+        ok: true,
+        method: 'PUT',
+        uploadUrl,
+        publicUrl,
+        headers: { 'Content-Type': contentType || 'application/pdf' },
+      })
+    );
+  } catch (e: any) {
+    const msg = e?.message || 'start_failed';
+    return withCORS(req, NextResponse.json({ ok: false, error: msg }, { status: 500 }));
   }
 }
