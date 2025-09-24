@@ -1,100 +1,97 @@
 // app/api/upload/image/route.ts
-import { put } from "@vercel/blob";
+import { NextResponse } from 'next/server'
+import { put } from '@vercel/blob'
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+const ALLOW_ORIGIN = 'https://tqiccz-96.myshopify.com'
+const ALLOW_HEADERS = 'Origin, Accept, Content-Type, Authorization'
+const ALLOW_METHODS = 'POST, OPTIONS'
+const ACCEPTED_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp'])
+const MAX_SIZE_BYTES = 15 * 1024 * 1024 // 15 MB (ajuste si besoin)
 
-const ALLOWED_ORIGINS = [
-  "https://tqiccz-96.myshopify.com",
-  "https://marketformation.fr", // ton domaine si besoin
-];
-
-const MAX_SIZE = 8 * 1024 * 1024; // 8 MB max
-
-function pickAllowedOrigin(req: Request) {
-  const origin = req.headers.get("origin") || "";
-  return ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
-}
-
-function corsHeaders(req: Request) {
-  return {
-    "Access-Control-Allow-Origin": pickAllowedOrigin(req),
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    "Access-Control-Max-Age": "86400",
-  };
-}
-
-function json(resBody: unknown, init: ResponseInit = {}, req?: Request) {
-  return new Response(JSON.stringify(resBody), {
-    status: init.status ?? 200,
-    headers: {
-      "Content-Type": "application/json",
-      ...(req ? corsHeaders(req) : {}),
-      ...(init.headers || {}),
-    },
-  });
+function withCORS(res: Response, origin?: string) {
+  const o = origin && origin.trim() ? origin : ALLOW_ORIGIN
+  const r = new Response(res.body, res)
+  r.headers.set('Access-Control-Allow-Origin', o)
+  r.headers.set('Access-Control-Allow-Methods', ALLOW_METHODS)
+  r.headers.set('Access-Control-Allow-Headers', ALLOW_HEADERS)
+  // r.headers.set('Access-Control-Allow-Credentials', 'true') // si cookies cross-site un jour
+  r.headers.set('Vary', 'Origin')
+  return r
 }
 
 export async function OPTIONS(req: Request) {
-  return new Response(null, { status: 204, headers: corsHeaders(req) });
+  return withCORS(new Response(null, { status: 204 }), req.headers.get('origin') || undefined)
 }
 
+// Edge marche aussi, mais garde nodejs si tu veux être aligné avec pdf
+export const runtime = 'nodejs'
+
 export async function POST(req: Request) {
+  const origin = req.headers.get('origin') || undefined
+
   try {
-    // --- CORS ---
-    const headers = corsHeaders(req);
-
-    // --- Multipart ---
-    const form = await req.formData().catch(() => null);
-    if (!form) return json({ ok: false, error: "Invalid multipart body" }, { status: 400 }, req);
-
-    const file = form.get("image") as File | null;
-    if (!file) return json({ ok: false, error: "Missing file 'image'" }, { status: 400 }, req);
-
-    // --- Validation basique ---
-    if (file.size <= 0) return json({ ok: false, error: "Empty file" }, { status: 400 }, req);
-    if (file.size > MAX_SIZE) return json({ ok: false, error: `File too large (> ${Math.round(MAX_SIZE/1024/1024)}MB)` }, { status: 413 }, req);
-
-    // Types d’image autorisés (peux élargir: image/webp, etc.)
-    const allowed = new Set(["image/jpeg", "image/png", "image/webp"]);
-    const ctype = (file.type || "").toLowerCase();
-    if (!allowed.has(ctype)) {
-      return json({ ok: false, error: `Unsupported content-type '${ctype}'` }, { status: 415 }, req);
+    // 1) multipart requis
+    const ctype = req.headers.get('content-type') || ''
+    if (!ctype.includes('multipart/form-data')) {
+      return withCORS(
+        new Response(JSON.stringify({ ok: false, error: 'multipart/form-data required' }), {
+          status: 400, headers: { 'Content-Type': 'application/json' }
+        }),
+        origin
+      )
     }
 
-    // --- Nom de fichier propre ---
-    const orig = (file.name || "image").replace(/[^\w.\-]+/g, "_").slice(0, 80);
-    const ext =
-      ctype === "image/png" ? ".png" :
-      ctype === "image/webp" ? ".webp" : ".jpg";
-    const key = `uploads/images/${Date.now()}-${orig.replace(/\.[^.]+$/, "")}${ext}`;
+    // 2) récupérer le fichier
+    const form = await req.formData()
+    const file = form.get('image')
+    if (!(file instanceof File)) {
+      return withCORS(
+        new Response(JSON.stringify({ ok: false, error: 'image field missing' }), {
+          status: 400, headers: { 'Content-Type': 'application/json' }
+        }),
+        origin
+      )
+    }
 
-    // --- Upload vers Vercel Blob ---
-    // Nécessite BLOB_READ_WRITE_TOKEN en env
-    const arrayBuf = await file.arrayBuffer();
-    const blob = await put(key, new Uint8Array(arrayBuf), {
-      access: "public",
-      contentType: ctype,
-      addRandomSuffix: false,
-      token: process.env.BLOB_READ_WRITE_TOKEN, // sécurité: jamais côté front
-    });
+    // 3) validations simples
+    const mime = (file as any).type || ''
+    const size = (file as any).size || 0
+    if (mime && !ACCEPTED_TYPES.has(mime)) {
+      return withCORS(
+        new Response(JSON.stringify({ ok: false, error: 'Only PNG, JPG or WEBP allowed' }), {
+          status: 415, headers: { 'Content-Type': 'application/json' }
+        }),
+        origin
+      )
+    }
+    if (size && size > MAX_SIZE_BYTES) {
+      return withCORS(
+        new Response(JSON.stringify({ ok: false, error: 'File too large' }), {
+          status: 413, headers: { 'Content-Type': 'application/json' }
+        }),
+        origin
+      )
+    }
 
-    // blob.url est public
-    return new Response(JSON.stringify({ ok: true, url: blob.url }), {
-      status: 200,
-      headers: {
-        "Content-Type": "application/json",
-        ...headers,
-      },
-    });
+    // 4) upload vers vercel/blob (nécessite BLOB_READ_WRITE_TOKEN en prod)
+    const safeName = ((file as any).name || 'image').replace(/[^\w.\-]/g, '_')
+    const filename = `mf/images/${Date.now()}-${safeName}`
+    const putRes = await put(filename, file, { access: 'public', addRandomSuffix: true })
+
+    // 5) réponse OK + CORS
+    return withCORS(
+      new Response(JSON.stringify({ ok: true, url: putRes.url }), {
+        status: 200, headers: { 'Content-Type': 'application/json' }
+      }),
+      origin
+    )
   } catch (e: any) {
-     return new Response(JSON.stringify({ ok: false, error: e?.message || "upload_failed" }), {
-       status: 500,
-       headers: {
-         "Content-Type": "application/json",
-         ...corsHeaders(req),
-       },
-     });
-   }
+    // 6) toutes les erreurs → CORS présent
+    return withCORS(
+      new Response(JSON.stringify({ ok: false, error: e?.message || 'upload_failed' }), {
+        status: 500, headers: { 'Content-Type': 'application/json' }
+      }),
+      origin
+    )
+  }
 }
