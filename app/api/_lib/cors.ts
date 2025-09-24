@@ -2,7 +2,7 @@
 import { NextResponse } from "next/server";
 
 // Autorisations via ENV (optionnel) — exemple: CORS_ORIGINS="https://tqiccz-96.myshopify.com,https://xxx.myshopify.com"
-const RAW = (process.env.CORS_ORIGINS || process.env.CORS_ORIGIN || "").trim();
+const RAW = (process.env.CORS_ORIGINS || "").trim();
 const ALLOWED = RAW ? RAW.split(",").map(s => s.trim()).filter(Boolean) : [];
 
 function allowOrigin(req: Request) {
@@ -17,7 +17,8 @@ function allowOrigin(req: Request) {
 }
 
 function allowHeaders(req: Request) {
-  return req.headers.get("access-control-request-headers") || "Content-Type, Accept";
+  const reqHdrs = req.headers.get("access-control-request-headers");
+  return reqHdrs || "Origin, Accept, Content-Type, Authorization";
 }
 
 export function handleOptions(req: Request) {
