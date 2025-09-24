@@ -1,10 +1,14 @@
 // app/api/ping/route.ts
-import { NextResponse } from 'next/server';
+import { jsonWithCors, handleOptions } from '@/app/api/_lib/cors';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-export async function GET() {
+export async function OPTIONS(req: Request) {
+  return handleOptions(req);
+}
+
+export async function GET(req: Request) {
   const flags = {
     // Shopify
     SHOP_DOMAIN: !!process.env.SHOP_DOMAIN || !!process.env.SHOPIFY_STORE_DOMAIN,
@@ -34,5 +38,5 @@ export async function GET() {
     BLOB_READ_WRITE_TOKEN: !!process.env.BLOB_READ_WRITE_TOKEN,
   };
 
-  return NextResponse.json({ ok: true, flags, ts: Date.now() });
+  return jsonWithCors(req, { ok: true, flags, ts: Date.now() });
 }
