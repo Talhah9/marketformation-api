@@ -1,7 +1,7 @@
 // app/api/courses/route.ts
 // Crée un produit "Course" (vendor = email) + liste les courses.
 // Quota Starter (3 / mois) basé sur le métachamp mfapp.published_YYYYMM.
-// Métachamps: mf.owner_email / mf.owner_id / mf.pdf_url (url).
+// Métachamps: mkt.owner_email / mkt.owner_id / mkt.pdf_url (url).
 // Ajout à une collection par ID OU par handle (résolution → ID).
 // Réponses via jsonWithCors (CORS util maison).
 
@@ -51,9 +51,7 @@ async function shopifyFetch(
 
   const text = await res.text()
   let json: any = {}
-  try {
-    json = text ? JSON.parse(text) : {}
-  } catch {}
+  try { json = text ? JSON.parse(text) : {} } catch {}
   return { ok: res.ok, status: res.status, json, text }
 }
 
@@ -70,7 +68,7 @@ async function upsertProductMetafield(
       metafield: {
         namespace,
         key,
-        type,                  // ex: 'url' | 'single_line_text_field'
+        type, // ex: 'url' | 'single_line_text_field'
         value,
         owner_resource: 'product',
         owner_id: productId,
@@ -107,14 +105,14 @@ async function resolveCollectionId(
   // Sinon, on tente par handle (custom puis smart)
   const handle = String(collectionHandleOrId).trim()
 
-  // try custom collections
+  // custom collections
   const cc = await shopifyFetch(
     `/custom_collections.json?handle=${encodeURIComponent(handle)}&limit=1`
   )
   const ccId = cc.json?.custom_collections?.[0]?.id
   if (cc.ok && ccId) return Number(ccId)
 
-  // try smart collections
+  // smart collections
   const sc = await shopifyFetch(
     `/smart_collections.json?handle=${encodeURIComponent(handle)}&limit=1`
   )
@@ -145,10 +143,9 @@ async function getPlanFromInternalSubscription(req: Request, email: string): Pro
   }
 }
 
-/** Compte les cours publiés ce mois-ci pour un vendor en se basant sur mfapp.published_YYYYMM. */
+/** Compte les cours publiés ce mois-ci via mfapp.published_YYYYMM. */
 async function countPublishedThisMonthByMetafield(email: string): Promise<number> {
   const vendor = encodeURIComponent(email || 'unknown@vendor')
-  // On récupère jusqu'à 250 produits du vendor (filtrage côté app)
   const r = await shopifyFetch(`/products.json?vendor=${vendor}&limit=250`)
   if (!r.ok) return 0
   const products: any[] = r.json?.products || []
@@ -176,11 +173,7 @@ export async function OPTIONS(req: Request) {
 export async function GET(req: Request) {
   try {
     if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' },
-        { status: 500 }
-      )
+      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' }, { status: 500 })
     }
 
     const url = new URL(req.url)
@@ -188,15 +181,9 @@ export async function GET(req: Request) {
     const vendor = email || 'unknown@vendor'
 
     // Liste de produits par vendor
-    const r = await shopifyFetch(
-      `/products.json?vendor=${encodeURIComponent(vendor)}&limit=50`
-    )
+    const r = await shopifyFetch(`/products.json?vendor=${encodeURIComponent(vendor)}&limit=50`)
     if (!r.ok) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: `Shopify ${r.status}`, detail: r.text },
-        { status: r.status }
-      )
+      return jsonWithCors(req, { ok: false, error: `Shopify ${r.status}`, detail: r.text }, { status: r.status })
     }
 
     const products = r.json?.products || []
@@ -211,22 +198,14 @@ export async function GET(req: Request) {
 
     return jsonWithCors(req, { ok: true, items })
   } catch (e: any) {
-    return jsonWithCors(
-      req,
-      { ok: false, error: e?.message || 'list_failed' },
-      { status: 500 }
-    )
+    return jsonWithCors(req, { ok: false, error: e?.message || 'list_failed' }, { status: 500 })
   }
 }
 
 export async function POST(req: Request) {
   try {
     if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' },
-        { status: 500 }
-      )
+      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' }, { status: 500 })
     }
 
     const url = new URL(req.url)
@@ -241,27 +220,19 @@ export async function POST(req: Request) {
       imageUrl,
       pdfUrl: pdfUrlRaw,
       pdf_url, // alias accepté
-      collectionHandle, // ancien param (handle)
-      collectionId, // id direct
-      collectionHandleOrId, // flexible (handle ou id)
-      status = 'active', // 'active' = publié ; 'draft' = brouillon
+      collectionHandle,        // ancien param (handle)
+      collectionId,            // id direct
+      collectionHandleOrId,    // flexible (handle ou id)
+      status = 'active',       // 'active' = publié ; 'draft' = brouillon
     } = body || {}
 
     const pdfUrl = String(pdfUrlRaw || pdf_url || '').trim()
 
     if (!email || !title || !imageUrl || !pdfUrl) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'missing fields' },
-        { status: 400 }
-      )
+      return jsonWithCors(req, { ok: false, error: 'missing fields' }, { status: 400 })
     }
     if (!/^https?:\/\//i.test(pdfUrl)) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'pdfUrl must be a public https URL' },
-        { status: 400 }
-      )
+      return jsonWithCors(req, { ok: false, error: 'pdfUrl must be a public https URL' }, { status: 400 })
     }
 
     // ====== Vérif quota via métachamp mfapp.published_YYYYMM ======
@@ -277,47 +248,44 @@ export async function POST(req: Request) {
       }
     }
 
-    // ====== Création produit SANS métachamps 'mf' (évite 422) ======
+    // ====== Création produit SANS métachamps (évite 422) ======
     const productPayload = {
       product: {
         title,
         body_html: description ? `<p>${description}</p>` : '',
         vendor: email, // ✅ vendor = email
         images: imageUrl ? [{ src: imageUrl }] : [],
-        tags: ['mf-course'],
+        tags: ['mkt-course'],
         status, // 'active' ou 'draft'
       },
     }
 
     const createRes = await shopifyFetch(`/products.json`, { json: productPayload })
     if (!createRes.ok) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: `Shopify ${createRes.status}`, detail: createRes.text },
-        { status: createRes.status }
-      )
+      return jsonWithCors(req, { ok: false, error: `Shopify ${createRes.status}`, detail: createRes.text }, { status: createRes.status })
     }
     const created = createRes.json?.product
     if (!created?.id) {
       return jsonWithCors(req, { ok: false, error: 'create_failed_no_id' }, { status: 500 })
     }
 
-    // ====== Upsert métachamps 'mf' ======
+    // ====== Upsert métachamps 'mkt' ======
     const mfResults: Array<{ key: string; ok: boolean; status: number }> = []
+
     {
-      const r = await upsertProductMetafield(created.id, 'mf', 'owner_email', 'single_line_text_field', String(email))
+      const r = await upsertProductMetafield(created.id, 'mkt', 'owner_email', 'single_line_text_field', String(email))
       mfResults.push({ key: 'owner_email', ok: r.ok, status: r.status })
     }
     if (shopifyCustomerId) {
-      const r = await upsertProductMetafield(created.id, 'mf', 'owner_id', 'single_line_text_field', String(shopifyCustomerId))
+      const r = await upsertProductMetafield(created.id, 'mkt', 'owner_id', 'single_line_text_field', String(shopifyCustomerId))
       mfResults.push({ key: 'owner_id', ok: r.ok, status: r.status })
     }
     {
-      const r = await upsertProductMetafield(created.id, 'mf', 'pdf_url', 'url', pdfUrl)
+      const r = await upsertProductMetafield(created.id, 'mkt', 'pdf_url', 'url', pdfUrl)
       mfResults.push({ key: 'pdf_url', ok: r.ok, status: r.status })
     }
 
-    // ====== Si publié (status === 'active'), marquer mfapp.published_YYYYMM ======
+    // ====== Si publié, marquer mfapp.published_YYYYMM ======
     let publishedMarkOk = false
     if (status === 'active') {
       const bucket = ym()
@@ -339,7 +307,7 @@ export async function POST(req: Request) {
     }
 
     const warnings = [
-      ...mfResults.filter(m => !m.ok).map(m => `mf.${m.key}`),
+      ...mfResults.filter(m => !m.ok).map(m => `mkt.${m.key}`),
       ...(status === 'active' && !publishedMarkOk ? ['mfapp.published_YYYYMM'] : []),
     ]
 
@@ -354,10 +322,6 @@ export async function POST(req: Request) {
       warnings: warnings.length ? warnings : undefined,
     })
   } catch (e: any) {
-    return jsonWithCors(
-      req,
-      { ok: false, error: e?.message || 'create_failed' },
-      { status: 500 }
-    )
+    return jsonWithCors(req, { ok: false, error: e?.message || 'create_failed' }, { status: 500 })
   }
 }
