@@ -122,8 +122,11 @@ async function resolveCollectionId(
   return null
 }
 
-/** Récupère le plan via l'API interne (fallback Starter). */
-async function getPlanFromInternalSubscription(req: Request, email: string): Promise<'Starter' | 'Pro' | 'Business'> {
+/** Récupère le plan via l'API interne. Unknown si non déterminé. */
+async function getPlanFromInternalSubscription(
+  req: Request,
+  email: string
+): Promise<'Starter'|'Pro'|'Business'|'Unknown'> {
   try {
     const url = new URL(req.url)
     const base = `${url.protocol}//${url.host}`
@@ -134,12 +137,13 @@ async function getPlanFromInternalSubscription(req: Request, email: string): Pro
       cache: 'no-store',
     })
     const data = await r.json().catch(() => ({}))
-    const plan: string = (data?.plan || data?.tier || 'Starter').toString()
-    if (/business/i.test(plan)) return 'Business'
-    if (/pro/i.test(plan)) return 'Pro'
-    return 'Starter'
+    const raw = (data?.planKey || data?.plan || data?.tier || '').toString()
+    if (/business/i.test(raw)) return 'Business'
+    if (/pro/i.test(raw)) return 'Pro'
+    if (/starter/i.test(raw)) return 'Starter'
+    return 'Unknown'
   } catch {
-    return 'Starter'
+    return 'Unknown'
   }
 }
 
@@ -219,7 +223,7 @@ export async function POST(req: Request) {
       description,
       imageUrl,
       pdfUrl: pdfUrlRaw,
-      pdf_url, // alias accepté
+      pdf_url,                 // alias accepté
       collectionHandle,        // ancien param (handle)
       collectionId,            // id direct
       collectionHandleOrId,    // flexible (handle ou id)
@@ -235,7 +239,7 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: 'pdfUrl must be a public https URL' }, { status: 400 })
     }
 
-    // ====== Vérif quota via métachamp mfapp.published_YYYYMM ======
+    // ====== Vérif quota : UNIQUEMENT si Starter confirmé ======
     const plan = await getPlanFromInternalSubscription(req, email)
     if (!bypassQuota && plan === 'Starter') {
       const count = await countPublishedThisMonthByMetafield(email)
