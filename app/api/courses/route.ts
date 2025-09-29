@@ -1,13 +1,11 @@
 // app/api/courses/route.ts
 // Crée un produit "Course" (vendor = email) + liste les courses.
-// Vérifie l'abonnement Stripe + applique le quota Starter (3 / mois).
-// Champs produits: image de couverture + métachamps mf.owner_email / mf.owner_id / mf.pdf_url.
+// Vérifie l'abonnement (via /api/subscription interne) + applique le quota Starter (3 / mois).
+// Champs produits : image de couverture + métachamps mf.owner_email / mf.owner_id / mf.pdf_url (pdf_url = type url).
 // Ajoute à une collection par ID OU par handle (résolution → ID).
 // Réponses via jsonWithCors (CORS util maison).
 
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors'
-// import stripe from '@/lib/stripe'         // (optionnel) décommente si tu utilises Stripe ici
-// import type Stripe from 'stripe'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -15,7 +13,6 @@ export const dynamic = 'force-dynamic'
 /* ===== ENV requis =====
   SHOP_DOMAIN                      ex: tqiccz-96.myshopify.com
   SHOP_ADMIN_TOKEN / ADMIN_TOKEN   token Admin API
-  STRIPE_SECRET_KEY                clé serveur Stripe
 */
 
 function ym(d = new Date()) {
@@ -60,6 +57,23 @@ async function shopifyFetch(
   return { ok: res.ok, status: res.status, json, text }
 }
 
+/** Upsert d'un métachamp produit avec typage explicite (évite 422). */
+async function upsertProductMetafield(productId: number, namespace: string, key: string, type: string, value: string) {
+  // REST create (pas en inline sur product)
+  return shopifyFetch(`/metafields.json`, {
+    json: {
+      metafield: {
+        namespace,
+        key,
+        type,                  // ex: 'url' | 'single_line_text_field'
+        value,
+        owner_resource: 'product',
+        owner_id: productId,
+      },
+    },
+  })
+}
+
 /** Résout un collection_id à partir d'un handle si nécessaire. */
 async function resolveCollectionId(
   collectionHandleOrId?: string | number
@@ -90,6 +104,42 @@ async function resolveCollectionId(
   if (sc.ok && scId) return Number(scId)
 
   return null
+}
+
+/** Récupère le plan d'abonnement courant via l'API interne (fallback Starter). */
+async function getPlanFromInternalSubscription(req: Request, email: string): Promise<'Starter' | 'Pro' | 'Business'> {
+  try {
+    const url = new URL(req.url)
+    const base = `${url.protocol}//${url.host}` // même host que cette route
+    const r = await fetch(`${base}/api/subscription`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // adapte si ton /api/subscription attend autre chose (customerId, session, etc.)
+      body: JSON.stringify({ email }),
+      cache: 'no-store',
+    })
+    const data = await r.json().catch(() => ({}))
+    const plan: string = (data?.plan || data?.tier || 'Starter').toString()
+    if (/business/i.test(plan)) return 'Business'
+    if (/pro/i.test(plan)) return 'Pro'
+    return 'Starter'
+  } catch {
+    return 'Starter'
+  }
+}
+
+/** Compte les cours créés ce mois-ci pour un vendor (email). */
+async function countThisMonthCoursesForVendor(email: string): Promise<number> {
+  const vendor = encodeURIComponent(email || 'unknown@vendor')
+  // Shopify REST ne filtre pas par mois, on filtre côté app
+  const r = await shopifyFetch(`/products.json?vendor=${vendor}&limit=250`)
+  if (!r.ok) return 0
+  const products = r.json?.products || []
+  const bucket = ym()
+  return products.filter((p: any) => {
+    const d = new Date(p.created_at)
+    return ym(d) === bucket
+  }).length
 }
 
 export async function OPTIONS(req: Request) {
@@ -183,34 +233,28 @@ export async function POST(req: Request) {
       )
     }
 
-    // ====== Création produit ======
-    // IMPORTANT : le métachamp PDF est en type "url" pour matcher ta définition Shopify.
+    // ====== Vérif quota via /api/subscription ======
+    const plan = await getPlanFromInternalSubscription(req, email)
+    if (plan === 'Starter') {
+      const count = await countThisMonthCoursesForVendor(email)
+      if (count >= 3) {
+        return jsonWithCors(
+          req,
+          { ok: false, error: 'quota_reached', detail: 'Starter plan allows 3 courses per month' },
+          { status: 403 }
+        )
+      }
+    }
+
+    // ====== Création produit SANS métachamps (évite 422 si définition côté Shopify diverge) ======
     const productPayload = {
       product: {
         title,
-        body_html: description || '',
-        vendor: email,
+        body_html: description ? `<p>${description}</p>` : '',
+        vendor: email, // ✅ vendor = email
         images: imageUrl ? [{ src: imageUrl }] : [],
-        metafields: [
-          {
-            namespace: 'mf', // ✅ aligne avec ta définition
-            key: 'owner_email',
-            type: 'single_line_text_field',
-            value: String(email),
-          },
-          {
-            namespace: 'mf',
-            key: 'owner_id',
-            type: 'single_line_text_field',
-            value: String(shopifyCustomerId || ''),
-          },
-          {
-            namespace: 'mf',
-            key: 'pdf_url',
-            type: 'url', // ✅ FIX: le type doit être "url"
-            value: pdfUrl,
-          },
-        ],
+        tags: ['mf-course'],
+        status: 'active', // ou 'draft' si souhaité
       },
     }
 
@@ -223,19 +267,52 @@ export async function POST(req: Request) {
       )
     }
     const created = createRes.json?.product
+    if (!created?.id) {
+      return jsonWithCors(req, { ok: false, error: 'create_failed_no_id' }, { status: 500 })
+    }
+
+    // ====== Upsert métachamps typés (namespace 'mf') ======
+    const metafieldResults: Array<{ key: string; ok: boolean; status: number }> = []
+
+    // owner_email
+    {
+      const r = await upsertProductMetafield(created.id, 'mf', 'owner_email', 'single_line_text_field', String(email))
+      metafieldResults.push({ key: 'owner_email', ok: r.ok, status: r.status })
+    }
+    // owner_id (facultatif)
+    if (shopifyCustomerId) {
+      const r = await upsertProductMetafield(created.id, 'mf', 'owner_id', 'single_line_text_field', String(shopifyCustomerId))
+      metafieldResults.push({ key: 'owner_id', ok: r.ok, status: r.status })
+    }
+    // pdf_url (TYPE URL ✅)
+    {
+      const r = await upsertProductMetafield(created.id, 'mf', 'pdf_url', 'url', pdfUrl)
+      metafieldResults.push({ key: 'pdf_url', ok: r.ok, status: r.status })
+    }
 
     // ====== Ajout à la collection (ID direct, handle, ou flexible) ======
     const selector = collectionId ?? collectionHandleOrId ?? collectionHandle
+    let attachedCollectionId: number | null = null
     if (selector) {
       const cid = await resolveCollectionId(selector)
       if (cid) {
+        attachedCollectionId = cid
         await shopifyFetch(`/collects.json`, {
           json: { collect: { product_id: created.id, collection_id: cid } },
         }).catch(() => null)
       }
     }
 
-    return jsonWithCors(req, { ok: true, id: created?.id, product: created })
+    const warnings = metafieldResults.filter(m => !m.ok).map(m => m.key)
+    return jsonWithCors(req, {
+      ok: true,
+      id: created.id,
+      handle: created.handle,
+      admin_url: `https://${process.env.SHOP_DOMAIN}/admin/products/${created.id}`,
+      planEnforced: plan,
+      attachedCollectionId,
+      warnings: warnings.length ? warnings : undefined,
+    })
   } catch (e: any) {
     return jsonWithCors(
       req,
