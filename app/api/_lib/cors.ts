@@ -1,44 +1,55 @@
 // app/api/_lib/cors.ts
-import { NextResponse } from "next/server";
+const DEFAULT_METHODS = 'GET,POST,OPTIONS';
+const DEFAULT_HEADERS = 'Origin, Accept, Content-Type, Authorization';
 
-// Autorisations via ENV (optionnel) — exemple: CORS_ORIGINS="https://tqiccz-96.myshopify.com,https://xxx.myshopify.com"
-const RAW = (process.env.CORS_ORIGINS || "").trim();
-const ALLOWED = RAW ? RAW.split(",").map(s => s.trim()).filter(Boolean) : [];
+function pickAllowedOrigin(reqOrigin: string | null): string | undefined {
+  const raw = process.env.CORS_ORIGINS || '';
+  if (!raw) return undefined;
+  const list = raw
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
 
-function allowOrigin(req: Request) {
-  const origin = req.headers.get("origin");
-  if (!origin) return ALLOWED[0] || "*";
-  if (ALLOWED.includes(origin)) return origin;
-  try {
-    const { hostname } = new URL(origin);
-    if (hostname.endsWith(".myshopify.com")) return origin; // fallback utile en dev/preview
-  } catch {}
-  return ALLOWED[0] || "*";
+  if (!reqOrigin) return list[0]; // fallback sur le 1er
+  // match exact (sans slash final)
+  const clean = (s: string) => s.replace(/\/+$/, '');
+  const found = list.find(o => clean(o) === clean(reqOrigin));
+  return found || list[0];
 }
 
-function allowHeaders(req: Request) {
-  const reqHdrs = req.headers.get("access-control-request-headers");
-  return reqHdrs || "Origin, Accept, Content-Type, Authorization";
+export function withCORS(req: Request, res: Response, origin?: string) {
+  const allowed = origin || pickAllowedOrigin(req.headers.get('origin'));
+  const r = new Response(res.body, res);
+  if (allowed) {
+    r.headers.set('Access-Control-Allow-Origin', allowed);
+    r.headers.set('Vary', 'Origin');
+  }
+  r.headers.set('Access-Control-Allow-Methods', DEFAULT_METHODS);
+  r.headers.set('Access-Control-Allow-Headers', DEFAULT_HEADERS);
+  return r;
+}
+
+export function jsonWithCors<T>(
+  req: Request,
+  data: T,
+  init?: ResponseInit
+) {
+  const body = JSON.stringify(data);
+  const res = new Response(body, {
+    status: init?.status || 200,
+    headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
+  });
+  return withCORS(req, res);
 }
 
 export function handleOptions(req: Request) {
-  const res = new NextResponse(null, { status: 204 });
-  res.headers.set("Access-Control-Allow-Origin", allowOrigin(req));
-  res.headers.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.headers.set("Access-Control-Allow-Headers", allowHeaders(req));
-  res.headers.set("Access-Control-Max-Age", "86400");
-  res.headers.set("Vary", "Origin, Access-Control-Request-Headers");
-  res.headers.set("Cache-Control", "no-store");
-  return res;
-}
-
-export function jsonWithCors(req: Request, data: any, init?: ResponseInit) {
-  const res = NextResponse.json(data, { status: init?.status ?? 200, headers: init?.headers });
-  res.headers.set("Access-Control-Allow-Origin", allowOrigin(req));
-  res.headers.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.headers.set("Access-Control-Allow-Headers", allowHeaders(req));
-  res.headers.set("Access-Control-Max-Age", "86400");
-  res.headers.set("Vary", "Origin, Access-Control-Request-Headers");
-  res.headers.set("Cache-Control", "no-store");
-  return res;
+  return withCORS(
+    req,
+    new Response(null, {
+      status: 204,
+      headers: {
+        'Access-Control-Max-Age': '86400',
+      },
+    })
+  );
 }
