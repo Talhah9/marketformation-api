@@ -33,7 +33,7 @@ export function withCORS(req: Request, res: Response, origin?: string) {
     r.headers.set('Vary', 'Origin');
   }
 
-  // *** ⚠️ Obligatoire pour credentials: 'include' ***
+  // *** Obligatoire pour credentials: 'include' ***
   r.headers.set('Access-Control-Allow-Credentials', 'true');
 
   r.headers.set('Access-Control-Allow-Methods', DEFAULT_METHODS);
