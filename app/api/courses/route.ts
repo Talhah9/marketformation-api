@@ -174,10 +174,18 @@ export async function OPTIONS(req: Request) {
   return handleOptions(req)
 }
 
+/**
+ * GET /api/courses
+ * Liste les produits "courses" pour un vendor (email) + expose le quota Starter.
+ */
 export async function GET(req: Request) {
   try {
     if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' }, { status: 500 })
+      return jsonWithCors(
+        req,
+        { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' },
+        { status: 500 }
+      )
     }
 
     const url = new URL(req.url)
@@ -185,9 +193,15 @@ export async function GET(req: Request) {
     const vendor = email || 'unknown@vendor'
 
     // Liste de produits par vendor
-    const r = await shopifyFetch(`/products.json?vendor=${encodeURIComponent(vendor)}&limit=50`)
+    const r = await shopifyFetch(
+      `/products.json?vendor=${encodeURIComponent(vendor)}&limit=50`
+    )
     if (!r.ok) {
-      return jsonWithCors(req, { ok: false, error: `Shopify ${r.status}`, detail: r.text }, { status: r.status })
+      return jsonWithCors(
+        req,
+        { ok: false, error: `Shopify ${r.status}`, detail: r.text },
+        { status: r.status }
+      )
     }
 
     const products = r.json?.products || []
@@ -200,20 +214,51 @@ export async function GET(req: Request) {
       image_url: p.image?.src || '',
     }))
 
-    return jsonWithCors(req, { ok: true, items })
+    // ====== Quota Starter : combien il reste ce mois-ci ? ======
+    let plan: 'Starter'|'Pro'|'Business'|'Unknown' = 'Unknown'
+    let usedThisMonth: number | null = null
+    let remainingThisMonth: number | null = null
+
+    if (email) {
+      plan = await getPlanFromInternalSubscription(req, email)
+      if (plan === 'Starter') {
+        const max = 3
+        const count = await countPublishedThisMonthByMetafield(email)
+        usedThisMonth = count
+        remainingThisMonth = Math.max(0, max - count)
+      }
+    }
+
+    return jsonWithCors(req, {
+      ok: true,
+      items,
+      plan,
+      usedThisMonth,
+      remainingThisMonth,
+    })
   } catch (e: any) {
-    return jsonWithCors(req, { ok: false, error: e?.message || 'list_failed' }, { status: 500 })
+    return jsonWithCors(
+      req,
+      { ok: false, error: e?.message || 'list_failed' },
+      { status: 500 }
+    )
   }
 }
 
 export async function POST(req: Request) {
   try {
     if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' }, { status: 500 })
+      return jsonWithCors(
+        req,
+        { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' },
+        { status: 500 }
+      )
     }
 
     const url = new URL(req.url)
-    const bypassQuota = url.searchParams.get('bypassQuota') === '1' || url.searchParams.get('force') === '1'
+    const bypassQuota =
+      url.searchParams.get('bypassQuota') === '1' ||
+      url.searchParams.get('force') === '1'
 
     const body = await req.json().catch(() => ({}))
     const {
@@ -233,10 +278,18 @@ export async function POST(req: Request) {
     const pdfUrl = String(pdfUrlRaw || pdf_url || '').trim()
 
     if (!email || !title || !imageUrl || !pdfUrl) {
-      return jsonWithCors(req, { ok: false, error: 'missing fields' }, { status: 400 })
+      return jsonWithCors(
+        req,
+        { ok: false, error: 'missing fields' },
+        { status: 400 }
+      )
     }
     if (!/^https?:\/\//i.test(pdfUrl)) {
-      return jsonWithCors(req, { ok: false, error: 'pdfUrl must be a public https URL' }, { status: 400 })
+      return jsonWithCors(
+        req,
+        { ok: false, error: 'pdfUrl must be a public https URL' },
+        { status: 400 }
+      )
     }
 
     // ====== Vérif quota : UNIQUEMENT si Starter confirmé ======
@@ -246,7 +299,11 @@ export async function POST(req: Request) {
       if (count >= 3) {
         return jsonWithCors(
           req,
-          { ok: false, error: 'quota_reached', detail: 'Starter plan allows 3 published courses per month' },
+          {
+            ok: false,
+            error: 'quota_reached',
+            detail: 'Starter plan allows 3 published courses per month',
+          },
           { status: 403 }
         )
       }
@@ -266,26 +323,56 @@ export async function POST(req: Request) {
 
     const createRes = await shopifyFetch(`/products.json`, { json: productPayload })
     if (!createRes.ok) {
-      return jsonWithCors(req, { ok: false, error: `Shopify ${createRes.status}`, detail: createRes.text }, { status: createRes.status })
+      return jsonWithCors(
+        req,
+        {
+          ok: false,
+          error: `Shopify ${createRes.status}`,
+          detail: createRes.text,
+        },
+        { status: createRes.status }
+      )
     }
     const created = createRes.json?.product
     if (!created?.id) {
-      return jsonWithCors(req, { ok: false, error: 'create_failed_no_id' }, { status: 500 })
+      return jsonWithCors(
+        req,
+        { ok: false, error: 'create_failed_no_id' },
+        { status: 500 }
+      )
     }
 
     // ====== Upsert métachamps 'mkt' ======
     const mfResults: Array<{ key: string; ok: boolean; status: number }> = []
 
     {
-      const r = await upsertProductMetafield(created.id, 'mkt', 'owner_email', 'single_line_text_field', String(email))
+      const r = await upsertProductMetafield(
+        created.id,
+        'mkt',
+        'owner_email',
+        'single_line_text_field',
+        String(email)
+      )
       mfResults.push({ key: 'owner_email', ok: r.ok, status: r.status })
     }
     if (shopifyCustomerId) {
-      const r = await upsertProductMetafield(created.id, 'mkt', 'owner_id', 'single_line_text_field', String(shopifyCustomerId))
+      const r = await upsertProductMetafield(
+        created.id,
+        'mkt',
+        'owner_id',
+        'single_line_text_field',
+        String(shopifyCustomerId)
+      )
       mfResults.push({ key: 'owner_id', ok: r.ok, status: r.status })
     }
     {
-      const r = await upsertProductMetafield(created.id, 'mkt', 'pdf_url', 'url', pdfUrl)
+      const r = await upsertProductMetafield(
+        created.id,
+        'mkt',
+        'pdf_url',
+        'url',
+        pdfUrl
+      )
       mfResults.push({ key: 'pdf_url', ok: r.ok, status: r.status })
     }
 
@@ -293,7 +380,13 @@ export async function POST(req: Request) {
     let publishedMarkOk = false
     if (status === 'active') {
       const bucket = ym()
-      const m = await upsertProductMetafield(created.id, 'mfapp', 'published_YYYYMM', 'single_line_text_field', bucket)
+      const m = await upsertProductMetafield(
+        created.id,
+        'mfapp',
+        'published_YYYYMM',
+        'single_line_text_field',
+        bucket
+      )
       publishedMarkOk = m.ok
     }
 
@@ -312,7 +405,9 @@ export async function POST(req: Request) {
 
     const warnings = [
       ...mfResults.filter(m => !m.ok).map(m => `mkt.${m.key}`),
-      ...(status === 'active' && !publishedMarkOk ? ['mfapp.published_YYYYMM'] : []),
+      ...(status === 'active' && !publishedMarkOk
+        ? ['mfapp.published_YYYYMM']
+        : []),
     ]
 
     return jsonWithCors(req, {
@@ -326,6 +421,10 @@ export async function POST(req: Request) {
       warnings: warnings.length ? warnings : undefined,
     })
   } catch (e: any) {
-    return jsonWithCors(req, { ok: false, error: e?.message || 'create_failed' }, { status: 500 })
+    return jsonWithCors(
+      req,
+      { ok: false, error: e?.message || 'create_failed' },
+      { status: 500 }
+    )
   }
 }
