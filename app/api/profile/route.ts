@@ -82,43 +82,18 @@ if (!g.__MF_PROFILES) {
 }
 const MEMORY: Record<string, Profile> = g.__MF_PROFILES;
 
-function makeKey(email: string, shopifyCustomerId: string) {
-  // priorité au customerId si dispo, sinon email
-  return shopifyCustomerId || email || 'anonymous';
-}
-
 // ===== GET profil public / privé =====
+// ATTENTION : on lit UNIQUEMENT par email (c’est la clé principale)
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
-    const shopifyCustomerId = (url.searchParams.get('shopifyCustomerId') || '').toString();
-    const email = (url.searchParams.get('email') || '').toString();
+    const email = (url.searchParams.get('email') || '').toString().trim();
 
-    const key = makeKey(email, shopifyCustomerId);
-
-    // 1) clé "normale"
-    let stored: Profile | undefined = MEMORY[key];
-
-    // 2) clé email directe
-    if (!stored && email) {
-      stored = MEMORY[email];
+    if (!email) {
+      return json(req, { ok: false, error: 'email_required' }, 400);
     }
 
-    // 3) clé customerId directe
-    if (!stored && shopifyCustomerId) {
-      stored = MEMORY[shopifyCustomerId];
-    }
-
-    // 4) fallback : on parcourt tout MEMORY pour matcher l'email
-    if (!stored && email) {
-      for (const k of Object.keys(MEMORY)) {
-        const p = MEMORY[k];
-        if (p && p.email === email) {
-          stored = p;
-          break;
-        }
-      }
-    }
+    const stored = MEMORY[email];
 
     const profile: Profile =
       stored || {
@@ -126,7 +101,7 @@ export async function GET(req: Request) {
         avatar_url: '',
         expertise_url: '',
         email,
-        shopifyCustomerId,
+        shopifyCustomerId: '',
         first_name: '',
         last_name: '',
         phone: '',
@@ -142,14 +117,18 @@ export async function GET(req: Request) {
 }
 
 // ===== POST profil (sauvegarde) =====
+// Le front DOIT envoyer "email" dans le body
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({} as any));
 
-    const email = (body.email || body.contact_email || '').toString();
-    const shopifyCustomerId = (body.shopifyCustomerId || body.customerId || '').toString();
+    const email = (body.email || body.contact_email || '').toString().trim();
+    const shopifyCustomerId = (body.shopifyCustomerId || body.customerId || '').toString().trim();
 
-    const key = makeKey(email, shopifyCustomerId);
+    if (!email) {
+      // Sans email, on ne sauvegarde rien → ça explique "profil vide" sur le public
+      return json(req, { ok: false, error: 'email_required' }, 400);
+    }
 
     const profile: Profile = {
       bio: (body.bio || body.description || body.about || '').toString(),
@@ -165,13 +144,10 @@ export async function POST(req: Request) {
       website: (body.website || body.site || body.website_url || (body.socials && body.socials.website) || '').toString(),
     };
 
-    // PERSISTE EN MÉMOIRE (par instance)
-    MEMORY[key] = profile;
+    // 1 email = 1 profil
+    MEMORY[email] = profile;
 
-    // on persiste aussi sous les clés simples pour les lookups
-    if (email) {
-      MEMORY[email] = profile;
-    }
+    // on peut garder aussi une entrée "customerId" pour usage interne si tu veux
     if (shopifyCustomerId) {
       MEMORY[shopifyCustomerId] = profile;
     }
