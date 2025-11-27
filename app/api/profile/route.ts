@@ -4,7 +4,7 @@ import { NextResponse } from 'next/server';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-// -------- CORS partagé (comme avant) --------
+// -------- CORS partagé --------
 const DEFAULT_SHOP_ORIGIN =
   process.env.SHOP_DOMAIN ? `https://${process.env.SHOP_DOMAIN}` : 'https://tqiccz-96.myshopify.com';
 
@@ -90,11 +90,16 @@ function makeKey(email: string, shopifyCustomerId: string) {
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
-    const shopifyCustomerId = url.searchParams.get('shopifyCustomerId') || '';
-    const email = url.searchParams.get('email') || '';
+    const shopifyCustomerId = (url.searchParams.get('shopifyCustomerId') || '').toString();
+    const email = (url.searchParams.get('email') || '').toString();
 
     const key = makeKey(email, shopifyCustomerId);
-    const stored = MEMORY[key];
+
+    // 🔧 FIX : on essaie d'abord la clé "normale", puis la clé email seule
+    let stored = MEMORY[key];
+    if (!stored && email) {
+      stored = MEMORY[email];
+    }
 
     const profile: Profile =
       stored || {
@@ -143,6 +148,11 @@ export async function POST(req: Request) {
 
     // PERSISTE EN MÉMOIRE (par instance)
     MEMORY[key] = profile;
+
+    // 🔧 FIX : on persiste aussi sous la clé email pour que /api/profile?email=... retrouve le profil
+    if (email) {
+      MEMORY[email] = profile;
+    }
 
     return json(req, { ok: true, profile }, 200);
   } catch (e: any) {
