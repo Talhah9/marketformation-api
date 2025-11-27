@@ -1,416 +1,316 @@
-// app/api/courses/route.ts
-// Crée un produit "Course" (vendor = email) + liste les courses.
-// Quota Starter (3 / mois) basé sur le métachamp mfapp.published_YYYYMM.
-// Retourne aussi { plan, quota: { limit, used, remaining } } pour l'abonnement.
+// app/api/profile/route.ts
+import { NextResponse } from 'next/server';
 
-import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors'
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-export const runtime = 'nodejs'
-export const dynamic = 'force-dynamic'
+/* ============================================================
+   CORS de base (identique à avant)
+============================================================ */
+const DEFAULT_SHOP_ORIGIN =
+  process.env.SHOP_DOMAIN ? `https://${process.env.SHOP_DOMAIN}` : 'https://tqiccz-96.myshopify.com';
 
-/* ===== ENV requis ===== */
-function ym(d = new Date()) {
-  return String(d.getFullYear()) + String(d.getMonth() + 1).padStart(2, '0')
+const ALLOW_ORIGINS: string[] =
+  (process.env.CORS_ORIGINS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+if (!ALLOW_ORIGINS.length && DEFAULT_SHOP_ORIGIN) {
+  ALLOW_ORIGINS.push(DEFAULT_SHOP_ORIGIN);
 }
 
+const ALLOW_METHODS = 'GET, POST, OPTIONS';
+const ALLOW_HEADERS = 'Content-Type, Authorization, X-Requested-With';
+
+function pickOrigin(req: Request) {
+  const o = (req.headers.get('origin') || '').trim();
+  return o && ALLOW_ORIGINS.includes(o) ? o : ALLOW_ORIGINS[0] || '';
+}
+
+function withCORS(req: Request, res: NextResponse) {
+  const origin = pickOrigin(req);
+  if (origin) {
+    res.headers.set('Access-Control-Allow-Origin', origin);
+    res.headers.set('Access-Control-Allow-Methods', ALLOW_METHODS);
+    res.headers.set('Access-Control-Allow-Headers', ALLOW_HEADERS);
+    res.headers.set('Vary', 'Origin');
+  }
+  res.headers.set('Cache-Control', 'no-store');
+  return res;
+}
+
+function json(req: Request, data: any, status = 200) {
+  return withCORS(
+    req,
+    new NextResponse(JSON.stringify(data), {
+      status,
+      headers: { 'Content-Type': 'application/json' },
+    }),
+  );
+}
+
+export async function OPTIONS(req: Request) {
+  return withCORS(
+    req,
+    new NextResponse(null, {
+      status: 204,
+      headers: {
+        'Access-Control-Allow-Methods': ALLOW_METHODS,
+        'Access-Control-Allow-Headers': ALLOW_HEADERS,
+      },
+    }),
+  );
+}
+
+/* ============================================================
+   Types + fallback mémoire (en dernier recours)
+============================================================ */
+type Profile = {
+  bio: string;
+  avatar_url: string;
+  expertise_url: string;
+  email: string;
+  shopifyCustomerId: string;
+  first_name?: string;
+  last_name?: string;
+  phone?: string;
+  linkedin?: string;
+  twitter?: string;
+  website?: string;
+};
+
+const g = globalThis as any;
+if (!g.__MF_PROFILES) {
+  g.__MF_PROFILES = {};
+}
+const MEMORY: Record<string, Profile> = g.__MF_PROFILES;
+
+/* ============================================================
+   Shopify helpers
+============================================================ */
 function getAdminToken() {
   return (
     process.env.SHOP_ADMIN_TOKEN ||
     process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN ||
     process.env.ADMIN_TOKEN ||
     ''
-  )
+  );
 }
 
 async function shopifyFetch(path: string, init?: RequestInit & { json?: any }) {
-  const domain = process.env.SHOP_DOMAIN
-  if (!domain) throw new Error('Missing env SHOP_DOMAIN')
+  const domain = process.env.SHOP_DOMAIN;
+  const token = getAdminToken();
+  if (!domain || !token) {
+    throw new Error('Missing SHOP_DOMAIN or Admin token');
+  }
 
-  const base = `https://${domain}/admin/api/2024-07`
+  const base = `https://${domain}/admin/api/2024-07`;
   const headers: Record<string, string> = {
-    'X-Shopify-Access-Token': getAdminToken(),
+    'X-Shopify-Access-Token': token,
     'Content-Type': 'application/json',
     Accept: 'application/json',
-  }
+  };
 
   const res = await fetch(base + path, {
     method: init?.method || (init?.json ? 'POST' : 'GET'),
     headers,
     body: init?.json ? JSON.stringify(init.json) : undefined,
     cache: 'no-store',
-  })
+  });
 
-  const text = await res.text()
-  let json = {}
-  try { json = text ? JSON.parse(text) : {} } catch {}
+  const text = await res.text();
+  let json: any = {};
+  try { json = text ? JSON.parse(text) : {}; } catch {}
 
-  return { ok: res.ok, status: res.status, json, text }
+  return { ok: res.ok, status: res.status, json, text };
 }
 
-/* ===== Labels de thématiques (mêmes clés que sur le front) ===== */
-const THEME_LABELS: Record<string, string> = {
-  'tech-ia': 'Tech & IA',
-  'business-entrepreneuriat': 'Business & Entrepreneuriat',
-  'carriere-competences': 'Carrière & Compétences',
-  'finance-investissement': 'Finance & Investissement',
-  'creativite-design': 'Créativité & Design',
-  'developpement-personnel-bien-etre': 'Développement perso & Bien-être',
+// Résolution du customerId à partir d'un id ou d'un email
+async function resolveCustomerId(email: string, shopifyCustomerId?: string): Promise<number | null> {
+  if (shopifyCustomerId) {
+    const num = Number(shopifyCustomerId);
+    if (!Number.isNaN(num)) return num;
+  }
+  const trimmedEmail = (email || '').trim();
+  if (!trimmedEmail) return null;
+
+  const r = await shopifyFetch(`/customers/search.json?query=${encodeURIComponent(`email:${trimmedEmail}`)}&limit=1`);
+  if (!r.ok) return null;
+  const customers = r.json?.customers || [];
+  if (!customers[0]?.id) return null;
+  return Number(customers[0].id);
 }
 
-/* ===== Métachamps ===== */
-async function getProductMetafieldValue(productId: number, namespace: string, key: string) {
-  const r = await shopifyFetch(`/products/${productId}/metafields.json?limit=250`)
-  if (!r.ok) return null
-  const arr = (r.json as any)?.metafields || []
-  const mf = arr.find((m: any) => m?.namespace === namespace && m?.key === key)
-  return mf?.value ?? null
+// Lecture des métachamps du customer → Profile
+async function getProfileFromCustomer(customerId: number, fallbackEmail: string): Promise<Profile> {
+  const r = await shopifyFetch(`/customers/${customerId}/metafields.json?limit=250`);
+  const arr = (r.ok && r.json?.metafields) ? r.json.metafields : [];
+
+  const getVal = (key: string) => {
+    const mf = arr.find((m: any) => m?.namespace === 'mfapp_profile' && m?.key === key);
+    return (mf?.value ?? '').toString();
+  };
+
+  return {
+    bio: getVal('bio'),
+    avatar_url: getVal('avatar_url'),
+    expertise_url: getVal('expertise_url'),
+    email: getVal('email') || fallbackEmail,
+    shopifyCustomerId: String(customerId),
+    first_name: getVal('first_name'),
+    last_name: getVal('last_name'),
+    phone: getVal('phone'),
+    linkedin: getVal('linkedin'),
+    twitter: getVal('twitter'),
+    website: getVal('website'),
+  };
 }
 
-async function upsertProductMetafield(
-  productId: number,
-  namespace: string,
+// Upsert d'un métachamp sur customer
+async function upsertCustomerMetafield(
+  customerId: number,
   key: string,
   type: string,
-  value: string
+  value: string,
 ) {
   return shopifyFetch(`/metafields.json`, {
     json: {
       metafield: {
-        namespace,
+        namespace: 'mfapp_profile',
         key,
         type,
         value,
-        owner_resource: 'product',
-        owner_id: productId,
+        owner_resource: 'customer',
+        owner_id: customerId,
       },
     },
-  })
+  });
 }
 
-/* ===== Collection resolve ===== */
-async function resolveCollectionId(handleOrId?: string | number): Promise<number | null> {
-  if (!handleOrId) return null
+// Sauvegarde d'un Profile dans les métachamps du customer
+async function saveProfileToCustomer(customerId: number, profile: Profile) {
+  const entries: Array<[keyof Profile, string, string]> = [
+    ['email', 'single_line_text_field', profile.email || ''],
+    ['bio', 'multi_line_text_field', profile.bio || ''],
+    ['avatar_url', 'url', profile.avatar_url || ''],
+    ['expertise_url', 'url', profile.expertise_url || ''],
+    ['first_name', 'single_line_text_field', profile.first_name || ''],
+    ['last_name', 'single_line_text_field', profile.last_name || ''],
+    ['phone', 'single_line_text_field', profile.phone || ''],
+    ['linkedin', 'url', profile.linkedin || ''],
+    ['twitter', 'url', profile.twitter || ''],
+    ['website', 'url', profile.website || ''],
+  ];
 
-  const num = Number(handleOrId)
-  if (!Number.isNaN(num) && String(num) === String(handleOrId)) return num
-
-  const handle = String(handleOrId).trim()
-
-  let r = await shopifyFetch(`/custom_collections.json?handle=${encodeURIComponent(handle)}&limit=1`)
-  if (r.ok && (r.json as any)?.custom_collections?.[0]?.id)
-    return Number((r.json as any).custom_collections[0].id)
-
-  r = await shopifyFetch(`/smart_collections.json?handle=${encodeURIComponent(handle)}&limit=1`)
-  if (r.ok && (r.json as any)?.smart_collections?.[0]?.id)
-    return Number((r.json as any).smart_collections[0].id)
-
-  return null
-}
-
-/* ===== Subscription plan ===== */
-async function getPlanFromInternalSubscription(req: Request, email: string) {
-  try {
-    const u = new URL(req.url)
-    const base = `${u.protocol}//${u.host}`
-
-    const r = await fetch(`${base}/api/subscription`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email }),
-      cache: 'no-store',
-    })
-
-    const data = await r.json().catch(() => ({}))
-    const raw = (data?.planKey || data?.plan || data?.tier || '').toString()
-
-    if (/business/i.test(raw)) return 'Business'
-    if (/pro/i.test(raw)) return 'Pro'
-    if (/starter/i.test(raw)) return 'Starter'
-    return 'Unknown'
-  } catch {
-    return 'Unknown'
+  for (const [key, type, value] of entries) {
+    await upsertCustomerMetafield(customerId, key, type, value);
   }
 }
 
-/* ===== Compte des publications Starter ===== */
-async function countPublishedThisMonthByMetafield(email: string) {
-  const vendor = encodeURIComponent(email)
-  const r = await shopifyFetch(`/products.json?vendor=${vendor}&limit=250`)
-  if (!r.ok) return 0
-
-  const products = (r.json as any)?.products || []
-  const bucket = ym()
-
-  let count = 0
-  for (const p of products) {
-    const val = await getProductMetafieldValue(p.id, 'mfapp', 'published_YYYYMM')
-    if (val === bucket) count++
-  }
-  return count
-}
-
-/* ===== OPTIONS (CORS) ===== */
-export async function OPTIONS(req: Request) {
-  return handleOptions(req)
-}
-
-/* =====================================================================
-   GET /api/courses
-   → Liste les formations + renvoie le quota Starter
-===================================================================== */
+/* ============================================================
+   GET profil public / privé
+============================================================ */
 export async function GET(req: Request) {
   try {
-    if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' },
-        { status: 500 }
-      )
+    const url = new URL(req.url);
+    const shopifyCustomerId = (url.searchParams.get('shopifyCustomerId') || '').toString();
+    const email = (url.searchParams.get('email') || '').toString().trim();
+
+    if (!email && !shopifyCustomerId) {
+      return json(req, { ok: false, error: 'email_or_customerId_required' }, 400);
     }
 
-    const url = new URL(req.url)
-    const email = (url.searchParams.get('email') || '').trim()
-    const vendor = email || 'unknown@vendor'
+    let profile: Profile | null = null;
 
-    const r = await shopifyFetch(`/products.json?vendor=${encodeURIComponent(vendor)}&limit=250`)
-    if (!r.ok) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: `Shopify ${r.status}`, detail: r.text },
-        { status: r.status }
-      )
+    // 1) Tentative Shopify (persistance)
+    try {
+      const cid = await resolveCustomerId(email, shopifyCustomerId);
+      if (cid) {
+        profile = await getProfileFromCustomer(cid, email);
+      }
+    } catch (e) {
+      console.warn('[MF-profile] Shopify profile fetch failed, fallback memory', e);
     }
 
-    const products = (r.json as any)?.products || []
-
-    // 🔥 On enrichit chaque produit avec la thématique depuis le métachamp mfapp.theme
-    const items = await Promise.all(
-      products.map(async (p: any) => {
-        const themeHandleRaw = (await getProductMetafieldValue(p.id, 'mfapp', 'theme')) || ''
-        const mf_theme = String(themeHandleRaw || '').trim()
-        const theme_label = mf_theme && THEME_LABELS[mf_theme] ? THEME_LABELS[mf_theme] : ''
-
-        return {
-          id: p.id,
-          title: p.title,
-          coverUrl: p.image?.src || '',
-          image_url: p.image?.src || '',
-          published: !!p.published_at,
-          createdAt: p.created_at,
-          mf_theme,
-          theme_label,
-        }
-      })
-    )
-
-    /* ==== QUOTA pour abonnement ==== */
-    let plan: 'Starter' | 'Pro' | 'Business' | 'Unknown' = 'Unknown'
-    let quota: any = null
-
-    if (email) {
-      plan = await getPlanFromInternalSubscription(req, email)
-
-      if (plan === 'Starter') {
-        const used = await countPublishedThisMonthByMetafield(email)
-        quota = {
-          plan: 'Starter',
-          limit: 3,
-          used,
-          remaining: Math.max(0, 3 - used),
-        }
-      } else {
-        quota = {
-          plan,
-          limit: null,
-          used: null,
-          remaining: null,
-        }
+    // 2) Fallback mémoire (en cas d’erreur ou si pas de customer)
+    if (!profile) {
+      const key = shopifyCustomerId || email || 'anonymous';
+      const stored = MEMORY[key] || MEMORY[email] || null;
+      if (stored) {
+        profile = stored;
       }
     }
 
-    return jsonWithCors(req, {
-      ok: true,
-      items,
-      plan,
-      quota,
-    })
+    // 3) Profil par défaut si rien trouvé
+    if (!profile) {
+      profile = {
+        bio: '',
+        avatar_url: '',
+        expertise_url: '',
+        email,
+        shopifyCustomerId,
+        first_name: '',
+        last_name: '',
+        phone: '',
+        linkedin: '',
+        twitter: '',
+        website: '',
+      };
+    }
+
+    return json(req, { ok: true, profile }, 200);
   } catch (e: any) {
-    return jsonWithCors(
-      req,
-      { ok: false, error: e?.message || 'list_failed' },
-      { status: 500 }
-    )
+    return json(req, { ok: false, error: e?.message || 'Profile GET failed' }, 500);
   }
 }
 
-/* =====================================================================
-   POST /api/courses
-   → Création d’un produit (Course) + quota Starter
-===================================================================== */
+/* ============================================================
+   POST profil (sauvegarde)
+============================================================ */
 export async function POST(req: Request) {
   try {
-    if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' },
-        { status: 500 }
-      )
+    const body = await req.json().catch(() => ({} as any));
+
+    const email = (body.email || body.contact_email || '').toString().trim();
+    const shopifyCustomerIdRaw = (body.shopifyCustomerId || body.customerId || '').toString().trim();
+
+    if (!email && !shopifyCustomerIdRaw) {
+      return json(req, { ok: false, error: 'email_or_customerId_required' }, 400);
     }
 
-    const url = new URL(req.url)
-    const bypass = url.searchParams.get('bypassQuota') === '1'
-
-    const body = await req.json().catch(() => ({} as any))
-    const {
+    const profile: Profile = {
+      bio: (body.bio || body.description || body.about || '').toString(),
+      avatar_url: (body.avatar_url || body.avatarUrl || body.image_url || body.imageUrl || '').toString(),
+      expertise_url: (body.expertise_url || body.expertiseUrl || '').toString(),
       email,
-      shopifyCustomerId,
-      title,
-      description,
-      imageUrl,
-      pdfUrl: pdfUrlRaw,
-      pdf_url,
-      status = 'active',
-      collectionId,
-      collectionHandle,
-      collectionHandleOrId,
-      // facultatif : si jamais le front l'envoie directement
-      theme,
-      themeHandle,
-      mf_theme,
-    } = body || {}
+      shopifyCustomerId: shopifyCustomerIdRaw,
+      first_name: (body.first_name || body.firstName || '').toString(),
+      last_name: (body.last_name || body.lastName || '').toString(),
+      phone: (body.phone || body.phone_number || '').toString(),
+      linkedin: (body.linkedin || (body.socials && body.socials.linkedin) || '').toString(),
+      twitter: (body.twitter || body.x || (body.socials && (body.socials.twitter || body.socials.x)) || '').toString(),
+      website: (body.website || body.site || body.website_url || (body.socials && body.socials.website) || '').toString(),
+    };
 
-    const pdfUrl = String(pdfUrlRaw || pdf_url || '').trim()
-
-    if (!email || !title || !imageUrl || !pdfUrl) {
-      return jsonWithCors(req, { ok: false, error: 'missing fields' }, { status: 400 })
-    }
-
-    if (!/^https?:\/\//i.test(pdfUrl)) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'pdfUrl must be https URL' },
-        { status: 400 }
-      )
-    }
-
-    const plan = await getPlanFromInternalSubscription(req, email)
-
-    if (!bypass && plan === 'Starter') {
-      const used = await countPublishedThisMonthByMetafield(email)
-      if (used >= 3) {
-        return jsonWithCors(
-          req,
-          {
-            ok: false,
-            error: 'quota_reached',
-            detail: 'Starter plan allows 3 published courses per month',
-          },
-          { status: 403 }
-        )
-      }
-    }
-
-    /* Création produit */
-    const productPayload = {
-      product: {
-        title,
-        body_html: description ? `<p>${description}</p>` : '',
-        vendor: email,
-        images: imageUrl ? [{ src: imageUrl }] : [],
-        tags: ['mkt-course'],
-        status,
-      },
-    }
-
-    const createRes = await shopifyFetch(`/products.json`, { json: productPayload })
-    if (!createRes.ok) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: `Shopify ${createRes.status}`, detail: createRes.text },
-        { status: createRes.status }
-      )
-    }
-
-    const created = (createRes.json as any)?.product
-    if (!created?.id) {
-      return jsonWithCors(req, { ok: false, error: 'create_failed_no_id' }, { status: 500 })
-    }
-
-    /* Métachamps mkt */
-    await upsertProductMetafield(
-      created.id,
-      'mkt',
-      'owner_email',
-      'single_line_text_field',
-      email
-    )
-    if (shopifyCustomerId) {
-      await upsertProductMetafield(
-        created.id,
-        'mkt',
-        'owner_id',
-        'single_line_text_field',
-        String(shopifyCustomerId)
-      )
-    }
-    await upsertProductMetafield(created.id, 'mkt', 'pdf_url', 'url', pdfUrl)
-
-    /* Marquage quota */
-    if (status === 'active') {
-      const bucket = ym()
-      await upsertProductMetafield(
-        created.id,
-        'mfapp',
-        'published_YYYYMM',
-        'single_line_text_field',
-        bucket
-      )
-    }
-
-    /* Assignation collection + thématique */
-    const selector = collectionId ?? collectionHandleOrId ?? collectionHandle
-    let themeHandleFinal =
-      (mf_theme || themeHandle || theme || '').toString().trim() || ''
-
-    // Si on n'a pas de theme explicite, on récupère le handle de collection (si c'est une string non numérique)
-    if (!themeHandleFinal && selector && typeof selector === 'string') {
-      const isNumeric = /^[0-9]+$/.test(selector)
-      if (!isNumeric) {
-        themeHandleFinal = selector.trim()
-      }
-    }
-
-    if (selector) {
-      const cid = await resolveCollectionId(selector)
+    // 1) Persistance Shopify (customer metafields)
+    try {
+      const cid = await resolveCustomerId(email, shopifyCustomerIdRaw);
       if (cid) {
-        await shopifyFetch(`/collects.json`, {
-          json: { collect: { product_id: created.id, collection_id: cid } },
-        })
+        await saveProfileToCustomer(cid, profile);
+        profile.shopifyCustomerId = String(cid);
       }
+    } catch (e) {
+      console.warn('[MF-profile] Shopify profile save failed, keep memory only', e);
     }
 
-    // 🔥 On persiste aussi la thématique en métachamp pour la page publique
-    if (themeHandleFinal) {
-      await upsertProductMetafield(
-        created.id,
-        'mfapp',
-        'theme',
-        'single_line_text_field',
-        themeHandleFinal
-      )
-    }
+    // 2) On garde aussi en mémoire en fallback
+    const memKey = profile.shopifyCustomerId || email || 'anonymous';
+    MEMORY[memKey] = profile;
+    if (email) MEMORY[email] = profile;
 
-    return jsonWithCors(req, {
-      ok: true,
-      id: created.id,
-      handle: created.handle,
-      admin_url: `https://${process.env.SHOP_DOMAIN}/admin/products/${created.id}`,
-    })
+    return json(req, { ok: true, profile }, 200);
   } catch (e: any) {
-    return jsonWithCors(
-      req,
-      { ok: false, error: e?.message || 'create_failed' },
-      { status: 500 }
-    )
+    return json(req, { ok: false, error: e?.message || 'Profile POST failed' }, 500);
   }
 }
