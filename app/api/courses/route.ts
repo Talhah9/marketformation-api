@@ -8,7 +8,7 @@ import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-/* ===== Utils ===== */
+/* ===== ENV requis ===== */
 function ym(d = new Date()) {
   return String(d.getFullYear()) + String(d.getMonth() + 1).padStart(2, '0');
 }
@@ -42,29 +42,13 @@ async function shopifyFetch(path: string, init?: RequestInit & { json?: any }) {
 
   const text = await res.text();
   let json: any = {};
-  try {
-    json = text ? JSON.parse(text) : {};
-  } catch {}
+  try { json = text ? JSON.parse(text) : {}; } catch {}
 
   return { ok: res.ok, status: res.status, json, text };
 }
 
-/* ===== Labels thématiques (mêmes clés que côté front) ===== */
-const THEME_LABELS: Record<string, string> = {
-  'tech-ia': 'Tech & IA',
-  'business-entrepreneuriat': 'Business & Entrepreneuriat',
-  'carriere-competences': 'Carrière & Compétences',
-  'finance-investissement': 'Finance & Investissement',
-  'creativite-design': 'Créativité & Design',
-  'developpement-personnel-bien-etre': 'Développement perso & Bien-être',
-};
-
 /* ===== Métachamps ===== */
-async function getProductMetafieldValue(
-  productId: number,
-  namespace: string,
-  key: string,
-) {
+async function getProductMetafieldValue(productId: number, namespace: string, key: string) {
   const r = await shopifyFetch(`/products/${productId}/metafields.json?limit=250`);
   if (!r.ok) return null;
   const arr = (r.json as any)?.metafields || [];
@@ -102,15 +86,11 @@ async function resolveCollectionId(handleOrId?: string | number): Promise<number
 
   const handle = String(handleOrId).trim();
 
-  let r = await shopifyFetch(
-    `/custom_collections.json?handle=${encodeURIComponent(handle)}&limit=1`,
-  );
+  let r = await shopifyFetch(`/custom_collections.json?handle=${encodeURIComponent(handle)}&limit=1`);
   if (r.ok && (r.json as any)?.custom_collections?.[0]?.id)
     return Number((r.json as any).custom_collections[0].id);
 
-  r = await shopifyFetch(
-    `/smart_collections.json?handle=${encodeURIComponent(handle)}&limit=1`,
-  );
+  r = await shopifyFetch(`/smart_collections.json?handle=${encodeURIComponent(handle)}&limit=1`);
   if (r.ok && (r.json as any)?.smart_collections?.[0]?.id)
     return Number((r.json as any).smart_collections[0].id);
 
@@ -144,7 +124,6 @@ async function getPlanFromInternalSubscription(req: Request, email: string) {
 
 /* ===== Compte des publications Starter ===== */
 async function countPublishedThisMonthByMetafield(email: string) {
-  // ici on garde le vendor pour le quota (car on crée les produits avec vendor = email)
   const vendor = encodeURIComponent(email);
   const r = await shopifyFetch(`/products.json?vendor=${vendor}&limit=250`);
   if (!r.ok) return 0;
@@ -167,24 +146,19 @@ export async function OPTIONS(req: Request) {
 
 /* =====================================================================
    GET /api/courses
-   → Liste les formations du formateur (filtrées par mkt.owner_email)
-     + renvoie le quota Starter
+   → Liste les formations + renvoie le quota Starter
 ===================================================================== */
 export async function GET(req: Request) {
   try {
     if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' },
-        { status: 500 },
-      );
+      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' }, { status: 500 });
     }
 
     const url = new URL(req.url);
     const email = (url.searchParams.get('email') || '').trim();
+    const vendor = email || 'unknown@vendor';
 
-    // 🔥 On ne filtre plus par vendor ici, on récupère les produits et on filtre via mkt.owner_email
-    const r = await shopifyFetch(`/products.json?limit=250`);
+    const r = await shopifyFetch(`/products.json?vendor=${encodeURIComponent(vendor)}&limit=250`);
     if (!r.ok) {
       return jsonWithCors(
         req,
@@ -193,36 +167,16 @@ export async function GET(req: Request) {
       );
     }
 
-    const allProducts = (r.json as any)?.products || [];
+    const products = (r.json as any)?.products || [];
 
-    const products: any[] = [];
-    for (const p of allProducts) {
-      const ownerEmail = await getProductMetafieldValue(p.id, 'mkt', 'owner_email');
-      if (!email || (ownerEmail && ownerEmail.toString().trim() === email)) {
-        products.push(p);
-      }
-    }
-
-    const items = await Promise.all(
-      products.map(async (p: any) => {
-        // thématique mfapp.theme (handle)
-        const themeHandleRaw = (await getProductMetafieldValue(p.id, 'mfapp', 'theme')) || '';
-        const mf_theme = String(themeHandleRaw || '').trim();
-        const theme_label =
-          mf_theme && THEME_LABELS[mf_theme] ? THEME_LABELS[mf_theme] : '';
-
-        return {
-          id: p.id,
-          title: p.title,
-          coverUrl: p.image?.src || '',
-          image_url: p.image?.src || '',
-          published: !!p.published_at,
-          createdAt: p.created_at,
-          mf_theme,
-          theme_label,
-        };
-      }),
-    );
+    const items = products.map((p: any) => ({
+      id: p.id,
+      title: p.title,
+      coverUrl: p.image?.src || '',
+      image_url: p.image?.src || '',
+      published: !!p.published_at,
+      createdAt: p.created_at,
+    }));
 
     /* ==== QUOTA pour abonnement ==== */
     let plan: 'Starter' | 'Pro' | 'Business' | 'Unknown' = 'Unknown';
@@ -294,20 +248,12 @@ export async function POST(req: Request) {
       collectionId,
       collectionHandle,
       collectionHandleOrId,
-      // thématique potentiellement envoyée par le front
-      theme,
-      themeHandle,
-      mf_theme,
     } = body || {};
 
     const pdfUrl = String(pdfUrlRaw || pdf_url || '').trim();
 
     if (!email || !title || !imageUrl || !pdfUrl) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'missing fields' },
-        { status: 400 },
-      );
+      return jsonWithCors(req, { ok: false, error: 'missing fields' }, { status: 400 });
     }
 
     if (!/^https?:\/\//i.test(pdfUrl)) {
@@ -402,19 +348,8 @@ export async function POST(req: Request) {
       );
     }
 
-    /* Assignation collection + thématique */
+    /* Assignation collection */
     const selector = collectionId ?? collectionHandleOrId ?? collectionHandle;
-    let themeHandleFinal =
-      (mf_theme || themeHandle || theme || '').toString().trim() || '';
-
-    // Si on n'a pas de thématique explicite, on récupère le handle de collection si c'est une string non numérique
-    if (!themeHandleFinal && selector && typeof selector === 'string') {
-      const isNumeric = /^[0-9]+$/.test(selector);
-      if (!isNumeric) {
-        themeHandleFinal = selector.trim();
-      }
-    }
-
     if (selector) {
       const cid = await resolveCollectionId(selector);
       if (cid) {
@@ -422,17 +357,6 @@ export async function POST(req: Request) {
           json: { collect: { product_id: created.id, collection_id: cid } },
         });
       }
-    }
-
-    // 🔥 Persistance de la thématique pour la page publique
-    if (themeHandleFinal) {
-      await upsertProductMetafield(
-        created.id,
-        'mfapp',
-        'theme',
-        'single_line_text_field',
-        themeHandleFinal,
-      );
     }
 
     return jsonWithCors(req, {
