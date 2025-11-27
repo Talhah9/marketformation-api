@@ -83,6 +83,7 @@ if (!g.__MF_PROFILES) {
 const MEMORY: Record<string, Profile> = g.__MF_PROFILES;
 
 function makeKey(email: string, shopifyCustomerId: string) {
+  // priorité au customerId si dispo, sinon email
   return shopifyCustomerId || email || 'anonymous';
 }
 
@@ -95,10 +96,28 @@ export async function GET(req: Request) {
 
     const key = makeKey(email, shopifyCustomerId);
 
-    // 🔧 FIX : on essaie d'abord la clé "normale", puis la clé email seule
-    let stored = MEMORY[key];
+    // 1) clé "normale"
+    let stored: Profile | undefined = MEMORY[key];
+
+    // 2) clé email directe
     if (!stored && email) {
       stored = MEMORY[email];
+    }
+
+    // 3) clé customerId directe
+    if (!stored && shopifyCustomerId) {
+      stored = MEMORY[shopifyCustomerId];
+    }
+
+    // 4) fallback : on parcourt tout MEMORY pour matcher l'email
+    if (!stored && email) {
+      for (const k of Object.keys(MEMORY)) {
+        const p = MEMORY[k];
+        if (p && p.email === email) {
+          stored = p;
+          break;
+        }
+      }
     }
 
     const profile: Profile =
@@ -125,33 +144,36 @@ export async function GET(req: Request) {
 // ===== POST profil (sauvegarde) =====
 export async function POST(req: Request) {
   try {
-    const body = await req.json().catch(() => ({}));
+    const body = await req.json().catch(() => ({} as any));
 
-    const email = (body.email || '').toString();
-    const shopifyCustomerId = (body.shopifyCustomerId || '').toString();
+    const email = (body.email || body.contact_email || '').toString();
+    const shopifyCustomerId = (body.shopifyCustomerId || body.customerId || '').toString();
 
     const key = makeKey(email, shopifyCustomerId);
 
     const profile: Profile = {
-      bio: (body.bio || '').toString(),
-      avatar_url: (body.avatar_url || body.avatarUrl || '').toString(),
+      bio: (body.bio || body.description || body.about || '').toString(),
+      avatar_url: (body.avatar_url || body.avatarUrl || body.image_url || body.imageUrl || '').toString(),
       expertise_url: (body.expertise_url || body.expertiseUrl || '').toString(),
       email,
       shopifyCustomerId,
-      first_name: (body.first_name || '').toString(),
-      last_name: (body.last_name || '').toString(),
-      phone: (body.phone || '').toString(),
-      linkedin: (body.linkedin || '').toString(),
-      twitter: (body.twitter || '').toString(),
-      website: (body.website || '').toString(),
+      first_name: (body.first_name || body.firstName || '').toString(),
+      last_name: (body.last_name || body.lastName || '').toString(),
+      phone: (body.phone || body.phone_number || '').toString(),
+      linkedin: (body.linkedin || (body.socials && body.socials.linkedin) || '').toString(),
+      twitter: (body.twitter || body.x || (body.socials && (body.socials.twitter || body.socials.x)) || '').toString(),
+      website: (body.website || body.site || body.website_url || (body.socials && body.socials.website) || '').toString(),
     };
 
     // PERSISTE EN MÉMOIRE (par instance)
     MEMORY[key] = profile;
 
-    // 🔧 FIX : on persiste aussi sous la clé email pour que /api/profile?email=... retrouve le profil
+    // on persiste aussi sous les clés simples pour les lookups
     if (email) {
       MEMORY[email] = profile;
+    }
+    if (shopifyCustomerId) {
+      MEMORY[shopifyCustomerId] = profile;
     }
 
     return json(req, { ok: true, profile }, 200);
