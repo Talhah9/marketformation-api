@@ -4,9 +4,7 @@ import { NextResponse } from 'next/server';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-// --- CORS piloté par ENV ---
-// - CORS_ORIGINS : liste d'origins séparés par des virgules
-// - SHOP_DOMAIN  : fallback (ex: "tqiccz-96.myshopify.com") => origin = https://SHOP_DOMAIN
+// -------- CORS partagé (comme avant) --------
 const DEFAULT_SHOP_ORIGIN =
   process.env.SHOP_DOMAIN ? `https://${process.env.SHOP_DOMAIN}` : 'https://tqiccz-96.myshopify.com';
 
@@ -35,10 +33,7 @@ function withCORS(req: Request, res: NextResponse) {
     res.headers.set('Access-Control-Allow-Methods', ALLOW_METHODS);
     res.headers.set('Access-Control-Allow-Headers', ALLOW_HEADERS);
     res.headers.set('Vary', 'Origin');
-    // Si un jour tu passes par les cookies : activer aussi Allow-Credentials
-    // res.headers.set('Access-Control-Allow-Credentials', 'true');
   }
-  // On évite le cache sur les données profil
   res.headers.set('Cache-Control', 'no-store');
   return res;
 }
@@ -66,89 +61,91 @@ export async function OPTIONS(req: Request) {
   );
 }
 
-// Typage simple du profil renvoyé / attendu
-type TrainerProfile = {
-  email: string;
-  shopifyCustomerId: string;
-  first_name: string;
-  last_name: string;
+// --------- Pseudo-persistence en mémoire (par instance Vercel) ----------
+type Profile = {
   bio: string;
   avatar_url: string;
   expertise_url: string;
-  linkedin: string;
-  twitter: string;
-  instagram: string;
-  website: string;
+  email: string;
+  shopifyCustomerId: string;
+  first_name?: string;
+  last_name?: string;
+  phone?: string;
+  linkedin?: string;
+  twitter?: string;
+  website?: string;
 };
 
-/**
- * GET /api/profile?email=...&shopifyCustomerId=...
- *
- * Pour l'instant on renvoie un profil "vide" (ou toutes valeurs qu'on arrive à retrouver)
- * À brancher ensuite sur ta BDD / metafields Shopify si tu veux de la vraie persistance.
- */
+const g = globalThis as any;
+if (!g.__MF_PROFILES) {
+  g.__MF_PROFILES = {};
+}
+const MEMORY: Record<string, Profile> = g.__MF_PROFILES;
+
+function makeKey(email: string, shopifyCustomerId: string) {
+  return shopifyCustomerId || email || 'anonymous';
+}
+
+// ===== GET profil public / privé =====
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
-    const email = (url.searchParams.get('email') || '').toString();
-    const shopifyCustomerId = (url.searchParams.get('shopifyCustomerId') || '').toString();
+    const shopifyCustomerId = url.searchParams.get('shopifyCustomerId') || '';
+    const email = url.searchParams.get('email') || '';
 
-    // TODO : ici tu peux aller chercher les vraies données (Shopify metafields / DB)
-    const profile: TrainerProfile = {
-      email,
-      shopifyCustomerId,
-      first_name: '',
-      last_name: '',
-      bio: '',
-      avatar_url: '',
-      expertise_url: '',
-      linkedin: '',
-      twitter: '',
-      instagram: '',
-      website: '',
-    };
+    const key = makeKey(email, shopifyCustomerId);
+    const stored = MEMORY[key];
+
+    const profile: Profile =
+      stored || {
+        bio: '',
+        avatar_url: '',
+        expertise_url: '',
+        email,
+        shopifyCustomerId,
+        first_name: '',
+        last_name: '',
+        phone: '',
+        linkedin: '',
+        twitter: '',
+        website: '',
+      };
 
     return json(req, { ok: true, profile }, 200);
   } catch (e: any) {
-    console.error('[MF] /api/profile GET error', e);
     return json(req, { ok: false, error: e?.message || 'Profile GET failed' }, 500);
   }
 }
 
-/**
- * POST /api/profile
- *
- * Reçoit les infos envoyées depuis :
- * - l’onglet "Profil" du compte formateur
- * - plus tard éventuellement d’autres back-offices
- *
- * Pour l’instant : on se contente de renvoyer ce qu’on reçoit.
- * À brancher plus tard sur ta couche de persistance (Shopify metafields / DB).
- */
+// ===== POST profil (sauvegarde) =====
 export async function POST(req: Request) {
   try {
-    const body = (await req.json().catch(() => ({}))) || {};
+    const body = await req.json().catch(() => ({}));
 
-    const profile: TrainerProfile = {
-      email: (body.email || '').toString(),
-      shopifyCustomerId: (body.shopifyCustomerId || '').toString(),
-      first_name: (body.first_name || body.firstName || '').toString(),
-      last_name: (body.last_name || body.lastName || '').toString(),
+    const email = (body.email || '').toString();
+    const shopifyCustomerId = (body.shopifyCustomerId || '').toString();
+
+    const key = makeKey(email, shopifyCustomerId);
+
+    const profile: Profile = {
       bio: (body.bio || '').toString(),
       avatar_url: (body.avatar_url || body.avatarUrl || '').toString(),
       expertise_url: (body.expertise_url || body.expertiseUrl || '').toString(),
-      linkedin: (body.linkedin || body.social_linkedin || '').toString(),
-      twitter: (body.twitter || body.social_twitter || '').toString(),
-      instagram: (body.instagram || body.social_instagram || '').toString(),
-      website: (body.website || body.site || '').toString(),
+      email,
+      shopifyCustomerId,
+      first_name: (body.first_name || '').toString(),
+      last_name: (body.last_name || '').toString(),
+      phone: (body.phone || '').toString(),
+      linkedin: (body.linkedin || '').toString(),
+      twitter: (body.twitter || '').toString(),
+      website: (body.website || '').toString(),
     };
 
-    // TODO : persister `profile` (Shopify metafields / base externe)
-    // Ex. : await saveTrainerProfile(profile);
+    // PERSISTE EN MÉMOIRE (par instance)
+    MEMORY[key] = profile;
 
     return json(req, { ok: true, profile }, 200);
   } catch (e: any) {
-    console.error('[MF] /api/profile POST error', e);
     return json(req, { ok: false, error: e?.message || 'Profile POST failed' }, 500);
   }
 }
