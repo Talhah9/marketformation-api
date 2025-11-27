@@ -47,16 +47,32 @@ async function shopifyFetch(path: string, init?: RequestInit & { json?: any }) {
   return { ok: res.ok, status: res.status, json, text }
 }
 
+/* ===== Labels de thématiques (mêmes clés que sur le front) ===== */
+const THEME_LABELS: Record<string, string> = {
+  'tech-ia': 'Tech & IA',
+  'business-entrepreneuriat': 'Business & Entrepreneuriat',
+  'carriere-competences': 'Carrière & Compétences',
+  'finance-investissement': 'Finance & Investissement',
+  'creativite-design': 'Créativité & Design',
+  'developpement-personnel-bien-etre': 'Développement perso & Bien-être',
+}
+
 /* ===== Métachamps ===== */
 async function getProductMetafieldValue(productId: number, namespace: string, key: string) {
   const r = await shopifyFetch(`/products/${productId}/metafields.json?limit=250`)
   if (!r.ok) return null
-  const arr = r.json?.metafields || []
-  const mf = arr.find(m => m?.namespace === namespace && m?.key === key)
+  const arr = (r.json as any)?.metafields || []
+  const mf = arr.find((m: any) => m?.namespace === namespace && m?.key === key)
   return mf?.value ?? null
 }
 
-async function upsertProductMetafield(productId: number, namespace: string, key: string, type: string, value: string) {
+async function upsertProductMetafield(
+  productId: number,
+  namespace: string,
+  key: string,
+  type: string,
+  value: string
+) {
   return shopifyFetch(`/metafields.json`, {
     json: {
       metafield: {
@@ -65,9 +81,9 @@ async function upsertProductMetafield(productId: number, namespace: string, key:
         type,
         value,
         owner_resource: 'product',
-        owner_id: productId
-      }
-    }
+        owner_id: productId,
+      },
+    },
   })
 }
 
@@ -79,14 +95,14 @@ async function resolveCollectionId(handleOrId?: string | number): Promise<number
   if (!Number.isNaN(num) && String(num) === String(handleOrId)) return num
 
   const handle = String(handleOrId).trim()
-  
+
   let r = await shopifyFetch(`/custom_collections.json?handle=${encodeURIComponent(handle)}&limit=1`)
-  if (r.ok && r.json?.custom_collections?.[0]?.id) 
-    return Number(r.json.custom_collections[0].id)
+  if (r.ok && (r.json as any)?.custom_collections?.[0]?.id)
+    return Number((r.json as any).custom_collections[0].id)
 
   r = await shopifyFetch(`/smart_collections.json?handle=${encodeURIComponent(handle)}&limit=1`)
-  if (r.ok && r.json?.smart_collections?.[0]?.id)
-    return Number(r.json.smart_collections[0].id)
+  if (r.ok && (r.json as any)?.smart_collections?.[0]?.id)
+    return Number((r.json as any).smart_collections[0].id)
 
   return null
 }
@@ -101,7 +117,7 @@ async function getPlanFromInternalSubscription(req: Request, email: string) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email }),
-      cache: 'no-store'
+      cache: 'no-store',
     })
 
     const data = await r.json().catch(() => ({}))
@@ -122,7 +138,7 @@ async function countPublishedThisMonthByMetafield(email: string) {
   const r = await shopifyFetch(`/products.json?vendor=${vendor}&limit=250`)
   if (!r.ok) return 0
 
-  const products = r.json?.products || []
+  const products = (r.json as any)?.products || []
   const bucket = ym()
 
   let count = 0
@@ -145,7 +161,11 @@ export async function OPTIONS(req: Request) {
 export async function GET(req: Request) {
   try {
     if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' }, { status: 500 })
+      return jsonWithCors(
+        req,
+        { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' },
+        { status: 500 }
+      )
     }
 
     const url = new URL(req.url)
@@ -154,23 +174,38 @@ export async function GET(req: Request) {
 
     const r = await shopifyFetch(`/products.json?vendor=${encodeURIComponent(vendor)}&limit=250`)
     if (!r.ok) {
-      return jsonWithCors(req, { ok: false, error: `Shopify ${r.status}`, detail: r.text }, { status: r.status })
+      return jsonWithCors(
+        req,
+        { ok: false, error: `Shopify ${r.status}`, detail: r.text },
+        { status: r.status }
+      )
     }
 
-    const products = r.json?.products || []
+    const products = (r.json as any)?.products || []
 
-    const items = products.map(p => ({
-      id: p.id,
-      title: p.title,
-      coverUrl: p.image?.src || '',
-      image_url: p.image?.src || '',
-      published: !!p.published_at,
-      createdAt: p.created_at
-    }))
+    // 🔥 On enrichit chaque produit avec la thématique depuis le métachamp mfapp.theme
+    const items = await Promise.all(
+      products.map(async (p: any) => {
+        const themeHandleRaw = (await getProductMetafieldValue(p.id, 'mfapp', 'theme')) || ''
+        const mf_theme = String(themeHandleRaw || '').trim()
+        const theme_label = mf_theme && THEME_LABELS[mf_theme] ? THEME_LABELS[mf_theme] : ''
+
+        return {
+          id: p.id,
+          title: p.title,
+          coverUrl: p.image?.src || '',
+          image_url: p.image?.src || '',
+          published: !!p.published_at,
+          createdAt: p.created_at,
+          mf_theme,
+          theme_label,
+        }
+      })
+    )
 
     /* ==== QUOTA pour abonnement ==== */
-    let plan: 'Starter'|'Pro'|'Business'|'Unknown' = 'Unknown'
-    let quota = null
+    let plan: 'Starter' | 'Pro' | 'Business' | 'Unknown' = 'Unknown'
+    let quota: any = null
 
     if (email) {
       plan = await getPlanFromInternalSubscription(req, email)
@@ -181,14 +216,14 @@ export async function GET(req: Request) {
           plan: 'Starter',
           limit: 3,
           used,
-          remaining: Math.max(0, 3 - used)
+          remaining: Math.max(0, 3 - used),
         }
       } else {
         quota = {
           plan,
           limit: null,
           used: null,
-          remaining: null
+          remaining: null,
         }
       }
     }
@@ -197,11 +232,14 @@ export async function GET(req: Request) {
       ok: true,
       items,
       plan,
-      quota
+      quota,
     })
-
   } catch (e: any) {
-    return jsonWithCors(req, { ok: false, error: e?.message || 'list_failed' }, { status: 500 })
+    return jsonWithCors(
+      req,
+      { ok: false, error: e?.message || 'list_failed' },
+      { status: 500 }
+    )
   }
 }
 
@@ -212,13 +250,17 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
   try {
     if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' }, { status: 500 })
+      return jsonWithCors(
+        req,
+        { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' },
+        { status: 500 }
+      )
     }
 
     const url = new URL(req.url)
     const bypass = url.searchParams.get('bypassQuota') === '1'
 
-    const body = await req.json().catch(() => ({}))
+    const body = await req.json().catch(() => ({} as any))
     const {
       email,
       shopifyCustomerId,
@@ -230,27 +272,41 @@ export async function POST(req: Request) {
       status = 'active',
       collectionId,
       collectionHandle,
-      collectionHandleOrId
+      collectionHandleOrId,
+      // facultatif : si jamais le front l'envoie directement
+      theme,
+      themeHandle,
+      mf_theme,
     } = body || {}
 
     const pdfUrl = String(pdfUrlRaw || pdf_url || '').trim()
 
-    if (!email || !title || !imageUrl || !pdfUrl)
-      return jsonWithCors(req, { ok:false, error:'missing fields' }, { status:400 })
+    if (!email || !title || !imageUrl || !pdfUrl) {
+      return jsonWithCors(req, { ok: false, error: 'missing fields' }, { status: 400 })
+    }
 
-    if (!/^https?:\/\//i.test(pdfUrl))
-      return jsonWithCors(req, { ok:false, error:'pdfUrl must be https URL' }, { status:400 })
+    if (!/^https?:\/\//i.test(pdfUrl)) {
+      return jsonWithCors(
+        req,
+        { ok: false, error: 'pdfUrl must be https URL' },
+        { status: 400 }
+      )
+    }
 
     const plan = await getPlanFromInternalSubscription(req, email)
 
     if (!bypass && plan === 'Starter') {
       const used = await countPublishedThisMonthByMetafield(email)
       if (used >= 3) {
-        return jsonWithCors(req, {
-          ok: false,
-          error: 'quota_reached',
-          detail: 'Starter plan allows 3 published courses per month'
-        }, { status: 403 })
+        return jsonWithCors(
+          req,
+          {
+            ok: false,
+            error: 'quota_reached',
+            detail: 'Starter plan allows 3 published courses per month',
+          },
+          { status: 403 }
+        )
       }
     }
 
@@ -262,49 +318,99 @@ export async function POST(req: Request) {
         vendor: email,
         images: imageUrl ? [{ src: imageUrl }] : [],
         tags: ['mkt-course'],
-        status
-      }
+        status,
+      },
     }
 
     const createRes = await shopifyFetch(`/products.json`, { json: productPayload })
-    if (!createRes.ok)
-      return jsonWithCors(req, { ok:false, error:`Shopify ${createRes.status}`, detail:createRes.text }, { status:createRes.status })
+    if (!createRes.ok) {
+      return jsonWithCors(
+        req,
+        { ok: false, error: `Shopify ${createRes.status}`, detail: createRes.text },
+        { status: createRes.status }
+      )
+    }
 
-    const created = createRes.json?.product
-    if (!created?.id)
-      return jsonWithCors(req, { ok:false, error:'create_failed_no_id' }, { status:500 })
+    const created = (createRes.json as any)?.product
+    if (!created?.id) {
+      return jsonWithCors(req, { ok: false, error: 'create_failed_no_id' }, { status: 500 })
+    }
 
     /* Métachamps mkt */
-    await upsertProductMetafield(created.id,'mkt','owner_email','single_line_text_field',email)
-    if (shopifyCustomerId)
-      await upsertProductMetafield(created.id,'mkt','owner_id','single_line_text_field',String(shopifyCustomerId))
-    await upsertProductMetafield(created.id,'mkt','pdf_url','url',pdfUrl)
+    await upsertProductMetafield(
+      created.id,
+      'mkt',
+      'owner_email',
+      'single_line_text_field',
+      email
+    )
+    if (shopifyCustomerId) {
+      await upsertProductMetafield(
+        created.id,
+        'mkt',
+        'owner_id',
+        'single_line_text_field',
+        String(shopifyCustomerId)
+      )
+    }
+    await upsertProductMetafield(created.id, 'mkt', 'pdf_url', 'url', pdfUrl)
 
     /* Marquage quota */
     if (status === 'active') {
       const bucket = ym()
-      await upsertProductMetafield(created.id,'mfapp','published_YYYYMM','single_line_text_field',bucket)
+      await upsertProductMetafield(
+        created.id,
+        'mfapp',
+        'published_YYYYMM',
+        'single_line_text_field',
+        bucket
+      )
     }
 
-    /* Assignation collection */
+    /* Assignation collection + thématique */
     const selector = collectionId ?? collectionHandleOrId ?? collectionHandle
+    let themeHandleFinal =
+      (mf_theme || themeHandle || theme || '').toString().trim() || ''
+
+    // Si on n'a pas de theme explicite, on récupère le handle de collection (si c'est une string non numérique)
+    if (!themeHandleFinal && selector && typeof selector === 'string') {
+      const isNumeric = /^[0-9]+$/.test(selector)
+      if (!isNumeric) {
+        themeHandleFinal = selector.trim()
+      }
+    }
+
     if (selector) {
       const cid = await resolveCollectionId(selector)
       if (cid) {
         await shopifyFetch(`/collects.json`, {
-          json: { collect: { product_id: created.id, collection_id: cid } }
+          json: { collect: { product_id: created.id, collection_id: cid } },
         })
       }
+    }
+
+    // 🔥 On persiste aussi la thématique en métachamp pour la page publique
+    if (themeHandleFinal) {
+      await upsertProductMetafield(
+        created.id,
+        'mfapp',
+        'theme',
+        'single_line_text_field',
+        themeHandleFinal
+      )
     }
 
     return jsonWithCors(req, {
       ok: true,
       id: created.id,
       handle: created.handle,
-      admin_url: `https://${process.env.SHOP_DOMAIN}/admin/products/${created.id}`
+      admin_url: `https://${process.env.SHOP_DOMAIN}/admin/products/${created.id}`,
     })
-
   } catch (e: any) {
-    return jsonWithCors(req, { ok:false, error:e?.message||'create_failed' }, { status:500 })
+    return jsonWithCors(
+      req,
+      { ok: false, error: e?.message || 'create_failed' },
+      { status: 500 }
+    )
   }
 }
