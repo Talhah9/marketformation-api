@@ -8,7 +8,9 @@ export const dynamic = 'force-dynamic';
    CORS
 ============================================================ */
 const DEFAULT_SHOP_ORIGIN =
-  process.env.SHOP_DOMAIN ? `https://${process.env.SHOP_DOMAIN}` : 'https://tqiccz-96.myshopify.com';
+  process.env.SHOP_DOMAIN
+    ? `https://${process.env.SHOP_DOMAIN}`
+    : 'https://tqiccz-96.myshopify.com';
 
 const ALLOW_ORIGINS: string[] =
   (process.env.CORS_ORIGINS ?? '')
@@ -64,7 +66,7 @@ export async function OPTIONS(req: Request) {
 }
 
 /* ============================================================
-   Types + mémoire
+   Types
 ============================================================ */
 type Profile = {
   bio: string;
@@ -80,28 +82,143 @@ type Profile = {
   website?: string;
 };
 
-const g = globalThis as any;
-if (!g.__MF_PROFILES) {
-  g.__MF_PROFILES = {};
+/* ============================================================
+   Shopify helpers
+============================================================ */
+function getAdminToken() {
+  return (
+    process.env.SHOP_ADMIN_TOKEN ||
+    process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN ||
+    process.env.ADMIN_TOKEN ||
+    ''
+  );
 }
-const MEMORY: Record<string, Profile> = g.__MF_PROFILES;
 
-function makeKey(email: string, shopifyCustomerId: string) {
-  return shopifyCustomerId || email || 'anonymous';
-}
-
-function getFirst(obj: any, keys: string[]): string {
-  if (!obj) return '';
-  for (const k of keys) {
-    if (obj[k] != null && obj[k] !== '') {
-      return String(obj[k]);
-    }
+async function shopifyFetch(path: string, init?: RequestInit & { json?: any }) {
+  const domain = process.env.SHOP_DOMAIN;
+  const token = getAdminToken();
+  if (!domain || !token) {
+    throw new Error('Missing SHOP_DOMAIN or Admin token');
   }
-  return '';
+
+  const base = `https://${domain}/admin/api/2024-07`;
+  const headers: Record<string, string> = {
+    'X-Shopify-Access-Token': token,
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+  };
+
+  const res = await fetch(base + path, {
+    method: init?.method || (init?.json ? 'POST' : 'GET'),
+    headers,
+    body: init?.json ? JSON.stringify(init.json) : undefined,
+    cache: 'no-store',
+  });
+
+  const text = await res.text();
+  let json: any = {};
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {}
+
+  return { ok: res.ok, status: res.status, json, text };
+}
+
+async function resolveCustomerId(email: string, shopifyCustomerId?: string): Promise<number | null> {
+  if (shopifyCustomerId) {
+    const num = Number(shopifyCustomerId);
+    if (!Number.isNaN(num)) return num;
+  }
+
+  const trimmedEmail = (email || '').trim();
+  if (!trimmedEmail) return null;
+
+  const r = await shopifyFetch(
+    `/customers/search.json?query=${encodeURIComponent(`email:${trimmedEmail}`)}&limit=1`,
+  );
+  if (!r.ok) return null;
+
+  const customers = (r.json as any)?.customers || [];
+  if (!customers[0]?.id) return null;
+  return Number(customers[0].id);
+}
+
+async function getProfileFromCustomer(customerId: number, fallbackEmail: string): Promise<Profile> {
+  // 1) Customer de base (prénom / nom / email)
+  const cRes = await shopifyFetch(`/customers/${customerId}.json`);
+  const customer = (cRes.ok && (cRes.json as any)?.customer) || {};
+
+  // 2) Métachamps namespace "mkt"
+  const mRes = await shopifyFetch(`/customers/${customerId}/metafields.json?limit=250`);
+  const arr = (mRes.ok && (mRes.json as any)?.metafields)
+    ? (mRes.json as any).metafields
+    : [];
+
+  const getVal = (key: string) => {
+    const mf = arr.find((m: any) => m?.namespace === 'mkt' && m?.key === key);
+    return (mf?.value ?? '').toString();
+  };
+
+  const first_name = customer.first_name || '';
+  const last_name  = customer.last_name || '';
+  const email      = customer.email || fallbackEmail;
+
+  return {
+    bio: getVal('bio'),
+    avatar_url: getVal('avatar_url'),
+    expertise_url: getVal('expertise_url'),
+    email,
+    shopifyCustomerId: String(customerId),
+    first_name,
+    last_name,
+    phone: getVal('phone'),
+    linkedin: getVal('linkedin'),
+    twitter: getVal('twitter'),
+    website: getVal('website'),
+  };
+}
+
+async function upsertCustomerMetafield(
+  customerId: number,
+  key: string,
+  type: string,
+  value: string,
+) {
+  return shopifyFetch(`/metafields.json`, {
+    json: {
+      metafield: {
+        namespace: 'mkt',
+        key,
+        type,
+        value,
+        owner_resource: 'customer',
+        owner_id: customerId,
+      },
+    },
+  });
+}
+
+async function saveProfileToCustomer(customerId: number, profile: Profile) {
+  const displayName = `${profile.first_name || ''} ${profile.last_name || ''}`.trim();
+
+  const entries: Array<[string, string, string]> = [
+    ['display_name', 'single_line_text_field', displayName],
+    ['bio', 'multi_line_text_field', profile.bio || ''],
+    ['avatar_url', 'url', profile.avatar_url || ''],
+    ['expertise_url', 'url', profile.expertise_url || ''],
+    ['phone', 'single_line_text_field', profile.phone || ''],
+    ['linkedin', 'url', profile.linkedin || ''],
+    ['twitter', 'url', profile.twitter || ''],
+    ['website', 'url', profile.website || ''],
+  ];
+
+  for (const [key, type, value] of entries) {
+    await upsertCustomerMetafield(customerId, key, type, value);
+  }
 }
 
 /* ============================================================
-   GET profil public / privé
+   GET profil public
 ============================================================ */
 export async function GET(req: Request) {
   try {
@@ -109,24 +226,18 @@ export async function GET(req: Request) {
     const shopifyCustomerId = (url.searchParams.get('shopifyCustomerId') || '').toString();
     const email = (url.searchParams.get('email') || '').toString().trim();
 
-    const key = makeKey(email, shopifyCustomerId);
-
-    // 1) lookup direct par clé
-    let stored: Profile | undefined = MEMORY[key];
-
-    // 2) fallback clé email
-    if (!stored && email) {
-      stored = MEMORY[email];
+    if (!email && !shopifyCustomerId) {
+      return json(req, { ok: false, error: 'email_or_customerId_required' }, 400);
     }
 
-    // 3) dernier recours : on scanne tous les profils par email
-    if (!stored && email) {
-      const all = Object.values(MEMORY) as Profile[];
-      stored = all.find((p) => (p.email || '').trim() === email) as Profile | undefined;
-    }
+    let profile: Profile;
 
-    const profile: Profile =
-      stored || {
+    const cid = await resolveCustomerId(email, shopifyCustomerId);
+    if (cid) {
+      profile = await getProfileFromCustomer(cid, email);
+    } else {
+      // Pas de customer trouvé → profil minimal
+      profile = {
         bio: '',
         avatar_url: '',
         expertise_url: '',
@@ -139,6 +250,7 @@ export async function GET(req: Request) {
         twitter: '',
         website: '',
       };
+    }
 
     return json(req, { ok: true, profile }, 200);
   } catch (e: any) {
@@ -147,49 +259,39 @@ export async function GET(req: Request) {
 }
 
 /* ============================================================
-   POST profil (sauvegarde)
+   POST profil (sauvegarde dans les métachamps mkt.*)
 ============================================================ */
 export async function POST(req: Request) {
   try {
-    const rawBody = await req.json().catch(() => ({} as any));
+    const raw = await req.json().catch(() => ({} as any));
+    const body: any =
+      raw.profile && typeof raw.profile === 'object' ? raw.profile : raw;
 
-    // le payload peut être { ... } ou { profile: {...} }
-    const body: any = rawBody.profile && typeof rawBody.profile === 'object'
-      ? rawBody.profile
-      : rawBody;
+    const email = (body.email || body.contact_email || '').toString().trim();
+    const shopifyCustomerIdRaw = (body.shopifyCustomerId || body.customerId || '').toString().trim();
 
-    const email = getFirst(body, ['email', 'contact_email', 'customer_email']);
-    const shopifyCustomerId = getFirst(body, ['shopifyCustomerId', 'customerId', 'id']);
-
-    const key = makeKey(email, shopifyCustomerId);
-
-    const rawBio = getFirst(body, ['bio', 'description', 'about', 'mkt.bio']);
-
-    const profile: Profile = {
-      bio: rawBio || '',
-      avatar_url: getFirst(body, ['avatar_url', 'avatarUrl', 'image_url', 'imageUrl']),
-      expertise_url: getFirst(body, ['expertise_url', 'expertiseUrl']),
-      email,
-      shopifyCustomerId,
-      first_name: getFirst(body, ['first_name', 'firstName']),
-      last_name: getFirst(body, ['last_name', 'lastName']),
-      phone: getFirst(body, ['phone', 'phone_number']),
-      linkedin: getFirst(body, ['linkedin']),
-      twitter: getFirst(body, ['twitter', 'x']),
-      website: getFirst(body, ['website', 'site', 'website_url']),
-    };
-
-    // on ne laisse pas un email totalement vide si on peut l'avoir ailleurs
-    if (!profile.email && rawBody.email) {
-      profile.email = String(rawBody.email);
+    if (!email && !shopifyCustomerIdRaw) {
+      return json(req, { ok: false, error: 'email_or_customerId_required' }, 400);
     }
 
-    // stockage principal
-    MEMORY[key] = profile;
+    const profile: Profile = {
+      bio: (body.bio || body.description || body.about || '').toString(),
+      avatar_url: (body.avatar_url || body.avatarUrl || body.image_url || body.imageUrl || '').toString(),
+      expertise_url: (body.expertise_url || body.expertiseUrl || '').toString(),
+      email,
+      shopifyCustomerId: shopifyCustomerIdRaw,
+      first_name: (body.first_name || body.firstName || '').toString(),
+      last_name: (body.last_name || body.lastName || '').toString(),
+      phone: (body.phone || body.phone_number || '').toString(),
+      linkedin: (body.linkedin || '').toString(),
+      twitter: (body.twitter || body.x || '').toString(),
+      website: (body.website || body.site || body.website_url || '').toString(),
+    };
 
-    // stockage par email
-    if (profile.email) {
-      MEMORY[profile.email] = profile;
+    const cid = await resolveCustomerId(email, shopifyCustomerIdRaw);
+    if (cid) {
+      await saveProfileToCustomer(cid, profile);
+      profile.shopifyCustomerId = String(cid);
     }
 
     return json(req, { ok: true, profile }, 200);
