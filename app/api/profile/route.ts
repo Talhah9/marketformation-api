@@ -4,7 +4,9 @@ import { NextResponse } from 'next/server';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-// -------- CORS partagé --------
+/* ============================================================
+   CORS
+============================================================ */
 const DEFAULT_SHOP_ORIGIN =
   process.env.SHOP_DOMAIN ? `https://${process.env.SHOP_DOMAIN}` : 'https://tqiccz-96.myshopify.com';
 
@@ -61,7 +63,9 @@ export async function OPTIONS(req: Request) {
   );
 }
 
-// --------- Pseudo-persistence en mémoire (par instance Vercel) ----------
+/* ============================================================
+   Types + mémoire
+============================================================ */
 type Profile = {
   bio: string;
   avatar_url: string;
@@ -86,19 +90,39 @@ function makeKey(email: string, shopifyCustomerId: string) {
   return shopifyCustomerId || email || 'anonymous';
 }
 
-// ===== GET profil public / privé =====
+function getFirst(obj: any, keys: string[]): string {
+  if (!obj) return '';
+  for (const k of keys) {
+    if (obj[k] != null && obj[k] !== '') {
+      return String(obj[k]);
+    }
+  }
+  return '';
+}
+
+/* ============================================================
+   GET profil public / privé
+============================================================ */
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
     const shopifyCustomerId = (url.searchParams.get('shopifyCustomerId') || '').toString();
-    const email = (url.searchParams.get('email') || '').toString();
+    const email = (url.searchParams.get('email') || '').toString().trim();
 
     const key = makeKey(email, shopifyCustomerId);
 
-    // on essaie d'abord la clé "normale", puis la clé email seule
-    let stored = MEMORY[key];
+    // 1) lookup direct par clé
+    let stored: Profile | undefined = MEMORY[key];
+
+    // 2) fallback clé email
     if (!stored && email) {
       stored = MEMORY[email];
+    }
+
+    // 3) dernier recours : on scanne tous les profils par email
+    if (!stored && email) {
+      const all = Object.values(MEMORY) as Profile[];
+      stored = all.find((p) => (p.email || '').trim() === email) as Profile | undefined;
     }
 
     const profile: Profile =
@@ -122,43 +146,50 @@ export async function GET(req: Request) {
   }
 }
 
-// ===== POST profil (sauvegarde) =====
+/* ============================================================
+   POST profil (sauvegarde)
+============================================================ */
 export async function POST(req: Request) {
   try {
-    const body = await req.json().catch(() => ({} as any));
+    const rawBody = await req.json().catch(() => ({} as any));
 
-    const email = (body.email || '').toString();
-    const shopifyCustomerId = (body.shopifyCustomerId || '').toString();
+    // le payload peut être { ... } ou { profile: {...} }
+    const body: any = rawBody.profile && typeof rawBody.profile === 'object'
+      ? rawBody.profile
+      : rawBody;
+
+    const email = getFirst(body, ['email', 'contact_email', 'customer_email']);
+    const shopifyCustomerId = getFirst(body, ['shopifyCustomerId', 'customerId', 'id']);
 
     const key = makeKey(email, shopifyCustomerId);
 
-    // 🔥 bio un peu plus tolérante (si jamais le front envoie description / about)
-    const rawBio =
-      body.bio ??
-      body.description ??
-      body.about ??
-      '';
+    const rawBio = getFirst(body, ['bio', 'description', 'about', 'mkt.bio']);
 
     const profile: Profile = {
-      bio: (rawBio || '').toString(),
-      avatar_url: (body.avatar_url || body.avatarUrl || '').toString(),
-      expertise_url: (body.expertise_url || body.expertiseUrl || '').toString(),
+      bio: rawBio || '',
+      avatar_url: getFirst(body, ['avatar_url', 'avatarUrl', 'image_url', 'imageUrl']),
+      expertise_url: getFirst(body, ['expertise_url', 'expertiseUrl']),
       email,
       shopifyCustomerId,
-      first_name: (body.first_name || body.firstName || '').toString(),
-      last_name: (body.last_name || body.lastName || '').toString(),
-      phone: (body.phone || '').toString(),
-      linkedin: (body.linkedin || '').toString(),
-      twitter: (body.twitter || '').toString(),
-      website: (body.website || '').toString(),
+      first_name: getFirst(body, ['first_name', 'firstName']),
+      last_name: getFirst(body, ['last_name', 'lastName']),
+      phone: getFirst(body, ['phone', 'phone_number']),
+      linkedin: getFirst(body, ['linkedin']),
+      twitter: getFirst(body, ['twitter', 'x']),
+      website: getFirst(body, ['website', 'site', 'website_url']),
     };
 
-    // PERSISTE EN MÉMOIRE (par instance)
+    // on ne laisse pas un email totalement vide si on peut l'avoir ailleurs
+    if (!profile.email && rawBody.email) {
+      profile.email = String(rawBody.email);
+    }
+
+    // stockage principal
     MEMORY[key] = profile;
 
-    // aussi sous la clé email pour /api/profile?email=...
-    if (email) {
-      MEMORY[email] = profile;
+    // stockage par email
+    if (profile.email) {
+      MEMORY[profile.email] = profile;
     }
 
     return json(req, { ok: true, profile }, 200);
