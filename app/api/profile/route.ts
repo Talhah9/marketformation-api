@@ -95,7 +95,7 @@ export async function GET(req: Request) {
 
     const key = makeKey(email, shopifyCustomerId);
 
-    // 🔧 on essaie d'abord la clé "normale", puis la clé email seule
+    // on essaie d'abord la clé "normale", puis la clé email seule
     let stored = MEMORY[key];
     if (!stored && email) {
       stored = MEMORY[email];
@@ -125,21 +125,28 @@ export async function GET(req: Request) {
 // ===== POST profil (sauvegarde) =====
 export async function POST(req: Request) {
   try {
-    const body = await req.json().catch(() => ({}));
+    const body = await req.json().catch(() => ({} as any));
 
     const email = (body.email || '').toString();
     const shopifyCustomerId = (body.shopifyCustomerId || '').toString();
 
     const key = makeKey(email, shopifyCustomerId);
 
+    // 🔥 bio un peu plus tolérante (si jamais le front envoie description / about)
+    const rawBio =
+      body.bio ??
+      body.description ??
+      body.about ??
+      '';
+
     const profile: Profile = {
-      bio: (body.bio || '').toString(),
+      bio: (rawBio || '').toString(),
       avatar_url: (body.avatar_url || body.avatarUrl || '').toString(),
       expertise_url: (body.expertise_url || body.expertiseUrl || '').toString(),
       email,
       shopifyCustomerId,
-      first_name: (body.first_name || '').toString(),
-      last_name: (body.last_name || '').toString(),
+      first_name: (body.first_name || body.firstName || '').toString(),
+      last_name: (body.last_name || body.lastName || '').toString(),
       phone: (body.phone || '').toString(),
       linkedin: (body.linkedin || '').toString(),
       twitter: (body.twitter || '').toString(),
@@ -149,7 +156,7 @@ export async function POST(req: Request) {
     // PERSISTE EN MÉMOIRE (par instance)
     MEMORY[key] = profile;
 
-    // 🔧 aussi sous la clé email pour /api/profile?email=...
+    // aussi sous la clé email pour /api/profile?email=...
     if (email) {
       MEMORY[email] = profile;
     }
