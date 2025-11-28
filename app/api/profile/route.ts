@@ -66,7 +66,7 @@ export async function OPTIONS(req: Request) {
 }
 
 /* ============================================================
-   Types
+   Types + mémoire
 ============================================================ */
 type Profile = {
   bio: string;
@@ -81,6 +81,26 @@ type Profile = {
   twitter?: string;
   website?: string;
 };
+
+const g = globalThis as any;
+if (!g.__MF_PROFILES) {
+  g.__MF_PROFILES = {};
+}
+const MEMORY: Record<string, Profile> = g.__MF_PROFILES;
+
+function makeKey(email: string, shopifyCustomerId: string) {
+  return shopifyCustomerId || email || 'anonymous';
+}
+
+function getFirst(obj: any, keys: string[]): string {
+  if (!obj) return '';
+  for (const k of keys) {
+    if (obj[k] != null && obj[k] !== '') {
+      return String(obj[k]);
+    }
+  }
+  return '';
+}
 
 /* ============================================================
    Shopify helpers
@@ -144,11 +164,11 @@ async function resolveCustomerId(email: string, shopifyCustomerId?: string): Pro
 }
 
 async function getProfileFromCustomer(customerId: number, fallbackEmail: string): Promise<Profile> {
-  // 1) Customer de base (prénom / nom / email)
+  // 1) customer de base
   const cRes = await shopifyFetch(`/customers/${customerId}.json`);
   const customer = (cRes.ok && (cRes.json as any)?.customer) || {};
 
-  // 2) Métachamps namespace "mkt"
+  // 2) métachamps "mkt.*"
   const mRes = await shopifyFetch(`/customers/${customerId}/metafields.json?limit=250`);
   const arr = (mRes.ok && (mRes.json as any)?.metafields)
     ? (mRes.json as any).metafields
@@ -230,26 +250,31 @@ export async function GET(req: Request) {
       return json(req, { ok: false, error: 'email_or_customerId_required' }, 400);
     }
 
-    let profile: Profile;
-
     const cid = await resolveCustomerId(email, shopifyCustomerId);
+
+    let profile: Profile = {
+      bio: '',
+      avatar_url: '',
+      expertise_url: '',
+      email,
+      shopifyCustomerId,
+      first_name: '',
+      last_name: '',
+      phone: '',
+      linkedin: '',
+      twitter: '',
+      website: '',
+    };
+
     if (cid) {
       profile = await getProfileFromCustomer(cid, email);
-    } else {
-      // Pas de customer trouvé → profil minimal
-      profile = {
-        bio: '',
-        avatar_url: '',
-        expertise_url: '',
-        email,
-        shopifyCustomerId,
-        first_name: '',
-        last_name: '',
-        phone: '',
-        linkedin: '',
-        twitter: '',
-        website: '',
-      };
+    }
+
+    // 🔥 FALLBACK MÉMOIRE POUR LA BIO (si Shopify n'a rien)
+    const memKey = makeKey(email, shopifyCustomerId);
+    const mem = MEMORY[memKey] || (email ? MEMORY[email] : undefined);
+    if (!profile.bio && mem && mem.bio) {
+      profile.bio = mem.bio;
     }
 
     return json(req, { ok: true, profile }, 200);
@@ -259,7 +284,7 @@ export async function GET(req: Request) {
 }
 
 /* ============================================================
-   POST profil (sauvegarde dans les métachamps mkt.*)
+   POST profil (sauvegarde dans Shopify + mémoire)
 ============================================================ */
 export async function POST(req: Request) {
   try {
@@ -267,32 +292,38 @@ export async function POST(req: Request) {
     const body: any =
       raw.profile && typeof raw.profile === 'object' ? raw.profile : raw;
 
-    const email = (body.email || body.contact_email || '').toString().trim();
-    const shopifyCustomerIdRaw = (body.shopifyCustomerId || body.customerId || '').toString().trim();
+    const email = getFirst(body, ['email', 'contact_email']);
+    const shopifyCustomerIdRaw = getFirst(body, ['shopifyCustomerId', 'customerId']);
 
     if (!email && !shopifyCustomerIdRaw) {
       return json(req, { ok: false, error: 'email_or_customerId_required' }, 400);
     }
 
     const profile: Profile = {
-      bio: (body.bio || body.description || body.about || '').toString(),
-      avatar_url: (body.avatar_url || body.avatarUrl || body.image_url || body.imageUrl || '').toString(),
-      expertise_url: (body.expertise_url || body.expertiseUrl || '').toString(),
+      bio: getFirst(body, ['bio', 'description', 'about']),
+      avatar_url: getFirst(body, ['avatar_url', 'avatarUrl', 'image_url', 'imageUrl']),
+      expertise_url: getFirst(body, ['expertise_url', 'expertiseUrl']),
       email,
       shopifyCustomerId: shopifyCustomerIdRaw,
-      first_name: (body.first_name || body.firstName || '').toString(),
-      last_name: (body.last_name || body.lastName || '').toString(),
-      phone: (body.phone || body.phone_number || '').toString(),
-      linkedin: (body.linkedin || '').toString(),
-      twitter: (body.twitter || body.x || '').toString(),
-      website: (body.website || body.site || body.website_url || '').toString(),
+      first_name: getFirst(body, ['first_name', 'firstName']),
+      last_name: getFirst(body, ['last_name', 'lastName']),
+      phone: getFirst(body, ['phone', 'phone_number']),
+      linkedin: getFirst(body, ['linkedin']),
+      twitter: getFirst(body, ['twitter', 'x']),
+      website: getFirst(body, ['website', 'site', 'website_url']),
     };
 
+    // 1) Shopify
     const cid = await resolveCustomerId(email, shopifyCustomerIdRaw);
     if (cid) {
       await saveProfileToCustomer(cid, profile);
       profile.shopifyCustomerId = String(cid);
     }
+
+    // 2) Mémoire locale pour fallback
+    const memKey = makeKey(email, profile.shopifyCustomerId);
+    MEMORY[memKey] = profile;
+    if (email) MEMORY[email] = profile;
 
     return json(req, { ok: true, profile }, 200);
   } catch (e: any) {
