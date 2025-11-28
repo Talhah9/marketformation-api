@@ -8,7 +8,7 @@ import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-/* ===== ENV requis ===== */
+/* ===== Utils ===== */
 function ym(d = new Date()) {
   return String(d.getFullYear()) + String(d.getMonth() + 1).padStart(2, '0');
 }
@@ -42,13 +42,29 @@ async function shopifyFetch(path: string, init?: RequestInit & { json?: any }) {
 
   const text = await res.text();
   let json: any = {};
-  try { json = text ? JSON.parse(text) : {}; } catch {}
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {}
 
   return { ok: res.ok, status: res.status, json, text };
 }
 
+/* ===== Labels thématiques (mêmes clés que côté front) ===== */
+const THEME_LABELS: Record<string, string> = {
+  'tech-ia': 'Tech & IA',
+  'business-entrepreneuriat': 'Business & Entrepreneuriat',
+  'carriere-competences': 'Carrière & Compétences',
+  'finance-investissement': 'Finance & Investissement',
+  'creativite-design': 'Créativité & Design',
+  'developpement-personnel-bien-etre': 'Développement perso & Bien-être',
+};
+
 /* ===== Métachamps ===== */
-async function getProductMetafieldValue(productId: number, namespace: string, key: string) {
+async function getProductMetafieldValue(
+  productId: number,
+  namespace: string,
+  key: string,
+) {
   const r = await shopifyFetch(`/products/${productId}/metafields.json?limit=250`);
   if (!r.ok) return null;
   const arr = (r.json as any)?.metafields || [];
@@ -86,11 +102,15 @@ async function resolveCollectionId(handleOrId?: string | number): Promise<number
 
   const handle = String(handleOrId).trim();
 
-  let r = await shopifyFetch(`/custom_collections.json?handle=${encodeURIComponent(handle)}&limit=1`);
+  let r = await shopifyFetch(
+    `/custom_collections.json?handle=${encodeURIComponent(handle)}&limit=1`,
+  );
   if (r.ok && (r.json as any)?.custom_collections?.[0]?.id)
     return Number((r.json as any).custom_collections[0].id);
 
-  r = await shopifyFetch(`/smart_collections.json?handle=${encodeURIComponent(handle)}&limit=1`);
+  r = await shopifyFetch(
+    `/smart_collections.json?handle=${encodeURIComponent(handle)}&limit=1`,
+  );
   if (r.ok && (r.json as any)?.smart_collections?.[0]?.id)
     return Number((r.json as any).smart_collections[0].id);
 
@@ -147,11 +167,16 @@ export async function OPTIONS(req: Request) {
 /* =====================================================================
    GET /api/courses
    → Liste les formations + renvoie le quota Starter
+   + renvoie mf_theme / theme_label pour les blocs de thématiques
 ===================================================================== */
 export async function GET(req: Request) {
   try {
     if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' }, { status: 500 });
+      return jsonWithCors(
+        req,
+        { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' },
+        { status: 500 },
+      );
     }
 
     const url = new URL(req.url);
@@ -169,14 +194,26 @@ export async function GET(req: Request) {
 
     const products = (r.json as any)?.products || [];
 
-    const items = products.map((p: any) => ({
-      id: p.id,
-      title: p.title,
-      coverUrl: p.image?.src || '',
-      image_url: p.image?.src || '',
-      published: !!p.published_at,
-      createdAt: p.created_at,
-    }));
+    // 🔥 on enrichit chaque produit avec la thématique (mfapp.theme)
+    const items = await Promise.all(
+      products.map(async (p: any) => {
+        const themeHandleRaw = await getProductMetafieldValue(p.id, 'mfapp', 'theme');
+        const mf_theme = String(themeHandleRaw || '').trim();
+        const theme_label =
+          mf_theme && THEME_LABELS[mf_theme] ? THEME_LABELS[mf_theme] : '';
+
+        return {
+          id: p.id,
+          title: p.title,
+          coverUrl: p.image?.src || '',
+          image_url: p.image?.src || '',
+          published: !!p.published_at,
+          createdAt: p.created_at,
+          mf_theme,
+          theme_label,
+        };
+      }),
+    );
 
     /* ==== QUOTA pour abonnement ==== */
     let plan: 'Starter' | 'Pro' | 'Business' | 'Unknown' = 'Unknown';
@@ -221,6 +258,7 @@ export async function GET(req: Request) {
 /* =====================================================================
    POST /api/courses
    → Création d’un produit (Course) + quota Starter
+   + enregistre la thématique (mfapp.theme)
 ===================================================================== */
 export async function POST(req: Request) {
   try {
@@ -248,6 +286,10 @@ export async function POST(req: Request) {
       collectionId,
       collectionHandle,
       collectionHandleOrId,
+      // éventuellement envoyé par le front
+      theme,
+      themeHandle,
+      mf_theme,
     } = body || {};
 
     const pdfUrl = String(pdfUrlRaw || pdf_url || '').trim();
@@ -311,7 +353,7 @@ export async function POST(req: Request) {
       );
     }
 
-    /* Métachamps mkt */
+    /* Métachamps mkt (comme avant) */
     await upsertProductMetafield(
       created.id,
       'mkt',
@@ -348,8 +390,20 @@ export async function POST(req: Request) {
       );
     }
 
-    /* Assignation collection */
+    /* Assignation collection + thématique */
     const selector = collectionId ?? collectionHandleOrId ?? collectionHandle;
+
+    let themeHandleFinal =
+      (mf_theme || themeHandle || theme || '').toString().trim() || '';
+
+    // si pas de theme explicite mais un handle de collection texte, on l'utilise
+    if (!themeHandleFinal && selector && typeof selector === 'string') {
+      const isNumeric = /^[0-9]+$/.test(selector);
+      if (!isNumeric) {
+        themeHandleFinal = selector.trim();
+      }
+    }
+
     if (selector) {
       const cid = await resolveCollectionId(selector);
       if (cid) {
@@ -357,6 +411,17 @@ export async function POST(req: Request) {
           json: { collect: { product_id: created.id, collection_id: cid } },
         });
       }
+    }
+
+    // 🔥 on persiste aussi la thématique pour la page publique
+    if (themeHandleFinal) {
+      await upsertProductMetafield(
+        created.id,
+        'mfapp',
+        'theme',
+        'single_line_text_field',
+        themeHandleFinal,
+      );
     }
 
     return jsonWithCors(req, {
