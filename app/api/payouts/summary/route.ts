@@ -1,9 +1,28 @@
 // app/api/payouts/summary/route.ts
 export const dynamic = 'force-dynamic';
-export const revalidate = 0;
 
 import { NextRequest, NextResponse } from 'next/server';
+import { prisma } from '@/lib/db';
 import { getCurrentTrainer } from '@/lib/authTrainer';
+
+const ALLOWED_ORIGINS = [
+  'https://marketformation.fr',
+  'https://tqiccz-96.myshopify.com', // dev store (garde / enlève si besoin)
+];
+
+// Détermine l’origin à renvoyer pour CORS
+function getCorsHeaders(req: NextRequest) {
+  const origin = req.headers.get('origin') || '';
+  const allowed = ALLOWED_ORIGINS.includes(origin)
+    ? origin
+    : ALLOWED_ORIGINS[0];
+
+  return {
+    'Access-Control-Allow-Origin': allowed,
+    'Access-Control-Allow-Methods': 'GET,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  };
+}
 
 function maskIban(iban?: string | null) {
   if (!iban) return null;
@@ -12,11 +31,31 @@ function maskIban(iban?: string | null) {
   return clean.slice(0, 4) + '••••••' + clean.slice(-4);
 }
 
+// Petit helper pour renvoyer du JSON avec CORS
+function json(
+  req: NextRequest,
+  data: any,
+  status: number = 200,
+): NextResponse {
+  return new NextResponse(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      ...getCorsHeaders(req),
+    },
+  });
+}
+
+// Préflight CORS
+export async function OPTIONS(req: NextRequest) {
+  return new NextResponse(null, {
+    status: 204,
+    headers: getCorsHeaders(req),
+  });
+}
+
 export async function GET(req: NextRequest) {
   try {
-    // ⬇️ Import dynamique de Prisma pour éviter tout souci au build
-    const { prisma } = await import('@/lib/db');
-
     const { trainerId } = await getCurrentTrainer(req);
 
     const [banking, summary, history] = await Promise.all([
@@ -29,7 +68,7 @@ export async function GET(req: NextRequest) {
       }),
     ]);
 
-    return NextResponse.json({
+    return json(req, {
       ok: true,
       banking: banking
         ? {
@@ -65,15 +104,15 @@ export async function GET(req: NextRequest) {
     });
   } catch (err: any) {
     console.error('[MF] GET /api/payouts/summary error', err);
+
     if (err instanceof Error && err.message === 'Trainer not authenticated') {
-      return NextResponse.json(
-        { error: 'Non authentifié.' },
-        { status: 401 },
-      );
+      return json(req, { error: 'Non authentifié.' }, 401);
     }
-    return NextResponse.json(
+
+    return json(
+      req,
       { error: 'Erreur serveur lors du chargement du solde.' },
-      { status: 500 },
+      500,
     );
   }
 }
