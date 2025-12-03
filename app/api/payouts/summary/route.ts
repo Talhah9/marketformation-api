@@ -1,4 +1,6 @@
 // app/api/payouts/summary/route.ts
+export const dynamic = 'force-dynamic';
+
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/db';
 import { getCurrentTrainer } from '@/lib/authTrainer';
