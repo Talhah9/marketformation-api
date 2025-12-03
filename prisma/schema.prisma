@@ -1,0 +1,63 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model TrainerBanking {
+  id            String           @id @default(cuid())
+  trainerId     String           @unique
+  email         String?
+  payoutName    String?
+  payoutCountry String?
+  payoutIban    String?
+  payoutBic     String?
+  autoPayout    Boolean          @default(false)
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  summary       PayoutsSummary?
+  history       PayoutsHistory[]
+}
+
+model PayoutsSummary {
+  id             String    @id @default(cuid())
+  trainerId      String    @unique
+  availableAmount Decimal   @default(0.0)
+  pendingAmount   Decimal   @default(0.0)
+  currency        String    @default("EUR")
+  updatedAt       DateTime  @updatedAt
+
+  trainer         TrainerBanking @relation(fields: [trainerId], references: [trainerId])
+}
+
+model PayoutsHistory {
+  id        String        @id @default(cuid())
+  trainerId String
+  type      PayoutType
+  status    PayoutStatus
+  amount    Decimal
+  currency  String        @default("EUR")
+  date      DateTime      @default(now())
+  meta      Json?
+
+  trainer   TrainerBanking @relation(fields: [trainerId], references: [trainerId])
+
+  @@index([trainerId, date])
+}
+
+enum PayoutType {
+  sale
+  withdraw
+  paid
+}
+
+enum PayoutStatus {
+  available
+  requested
+  paid
+  reversed
+}
