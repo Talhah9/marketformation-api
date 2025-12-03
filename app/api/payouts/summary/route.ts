@@ -5,23 +5,22 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/db';
 import { getCurrentTrainer } from '@/lib/authTrainer';
 
-const ALLOWED_ORIGINS = [
-  'https://marketformation.fr',
-  'https://tqiccz-96.myshopify.com', // dev store (garde / enlève si besoin)
-];
+// CORS fixe (prod Shopify)
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': 'https://marketformation.fr',
+  'Access-Control-Allow-Methods': 'GET,OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+};
 
-// Détermine l’origin à renvoyer pour CORS
-function getCorsHeaders(req: NextRequest) {
-  const origin = req.headers.get('origin') || '';
-  const allowed = ALLOWED_ORIGINS.includes(origin)
-    ? origin
-    : ALLOWED_ORIGINS[0];
-
-  return {
-    'Access-Control-Allow-Origin': allowed,
-    'Access-Control-Allow-Methods': 'GET,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-  };
+// Helper JSON + CORS
+function json(data: any, status: number = 200): NextResponse {
+  return new NextResponse(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      ...CORS_HEADERS,
+    },
+  });
 }
 
 function maskIban(iban?: string | null) {
@@ -31,31 +30,17 @@ function maskIban(iban?: string | null) {
   return clean.slice(0, 4) + '••••••' + clean.slice(-4);
 }
 
-// Petit helper pour renvoyer du JSON avec CORS
-function json(
-  req: NextRequest,
-  data: any,
-  status: number = 200,
-): NextResponse {
-  return new NextResponse(JSON.stringify(data), {
-    status,
-    headers: {
-      'Content-Type': 'application/json',
-      ...getCorsHeaders(req),
-    },
-  });
-}
-
 // Préflight CORS
-export async function OPTIONS(req: NextRequest) {
+export async function OPTIONS() {
   return new NextResponse(null, {
     status: 204,
-    headers: getCorsHeaders(req),
+    headers: CORS_HEADERS,
   });
 }
 
 export async function GET(req: NextRequest) {
   try {
+    // On garde req uniquement pour l’auth
     const { trainerId } = await getCurrentTrainer(req);
 
     const [banking, summary, history] = await Promise.all([
@@ -68,7 +53,7 @@ export async function GET(req: NextRequest) {
       }),
     ]);
 
-    return json(req, {
+    return json({
       ok: true,
       banking: banking
         ? {
@@ -106,11 +91,10 @@ export async function GET(req: NextRequest) {
     console.error('[MF] GET /api/payouts/summary error', err);
 
     if (err instanceof Error && err.message === 'Trainer not authenticated') {
-      return json(req, { error: 'Non authentifié.' }, 401);
+      return json({ error: 'Non authentifié.' }, 401);
     }
 
     return json(
-      req,
       { error: 'Erreur serveur lors du chargement du solde.' },
       500,
     );
