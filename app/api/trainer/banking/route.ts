@@ -1,8 +1,8 @@
 // app/api/trainer/banking/route.ts
-export const dynamic = "force-dynamic";
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
 
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '@/lib/db';
 import { getCurrentTrainer } from '@/lib/authTrainer';
 
 type BankingPayload = {
@@ -20,6 +20,9 @@ function maskIban(iban: string) {
 
 export async function POST(req: NextRequest) {
   try {
+    // ⬇️ Import dynamique de Prisma (évite les problèmes au build Vercel)
+    const { prisma } = await import('@/lib/db');
+
     const { trainerId, email } = await getCurrentTrainer(req);
     const body = (await req.json()) as BankingPayload;
 
@@ -40,7 +43,7 @@ export async function POST(req: NextRequest) {
         email: email || null,
         payoutName: body.payoutName,
         payoutCountry: body.payoutCountry,
-        payoutIban: iban, // à chiffrer plus tard si tu veux
+        payoutIban: iban,
         payoutBic: bic,
       },
       update: {
