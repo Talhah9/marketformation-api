@@ -1,8 +1,8 @@
 // app/api/payouts/summary/route.ts
 export const dynamic = 'force-dynamic';
+export const revalidate = 0;
 
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '@/lib/db';
 import { getCurrentTrainer } from '@/lib/authTrainer';
 
 function maskIban(iban?: string | null) {
@@ -14,6 +14,9 @@ function maskIban(iban?: string | null) {
 
 export async function GET(req: NextRequest) {
   try {
+    // ⬇️ Import dynamique de Prisma pour éviter tout souci au build
+    const { prisma } = await import('@/lib/db');
+
     const { trainerId } = await getCurrentTrainer(req);
 
     const [banking, summary, history] = await Promise.all([
