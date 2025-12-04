@@ -6,7 +6,8 @@
   "scripts": {
     "clean": "rimraf .next dist",
     "dev": "next dev",
-    "build": "npm run clean && next build",
+    "build": "npm run clean && prisma generate && next build",
+    "vercel-build": "npm run build",
     "start": "next start",
     "lint": "next lint"
   },
