@@ -1,47 +1,22 @@
-// middleware.ts 
+// middleware.ts
 import { NextResponse, NextRequest } from 'next/server'
 
-const ENV_ORIGINS = (process.env.CORS_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean)
+/**
+ * CORS global pour toutes les routes /api/*
+ * - Autorise l'origine qui appelle (Shopify, marketformation.fr, etc.)
+ * - Gère correctement le préflight OPTIONS
+ */
 
-const DEFAULT_ORIGINS = [
-  'https://tqiccz-96.myshopify.com',
-  'https://marketformation.fr',
-]
-
-const ALLOWED_ORIGINS = new Set([
-  ...(ENV_ORIGINS.length ? ENV_ORIGINS : DEFAULT_ORIGINS),
-])
-
-// ✅ j’ai juste ajouté la ligne /^\/api\/payouts\/summary$/,
-const CORS_PATHS: RegExp[] = [
-  /^\/api\/upload\/image$/,
-  /^\/api\/upload\/pdf$/,
-  /^\/api\/upload\/pdf\/start$/,
-  /^\/api\/courses$/,
-  /^\/api\/profile$/,
-  /^\/api\/profile\/password$/,
-  /^\/api\/subscription$/,
-  /^\/api\/stripe\/checkout$/,
-  /^\/api\/stripe\/portal$/,
-  /^\/api\/ping$/,
-  /^\/api\/payouts\/summary$/,   // <-- AJOUT
-]
-
-function needsCors(pathname: string): boolean {
-  return CORS_PATHS.some(rx => rx.test(pathname))
-}
-
-function isAllowedOrigin(origin: string | null): origin is string {
-  if (!origin) return false
-  return ALLOWED_ORIGINS.has(origin)
-}
-
-function buildCorsHeaders(origin: string) {
+function buildCorsHeaders(origin: string | null) {
   const h = new Headers()
-  h.set('Access-Control-Allow-Origin', origin)
+  if (origin) {
+    // On renvoie exactement l'origine appelante
+    h.set('Access-Control-Allow-Origin', origin)
+  } else {
+    // fallback (normalement on a toujours un origin dans ton cas)
+    h.set('Access-Control-Allow-Origin', '*')
+  }
+
   h.set('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS')
   h.set(
     'Access-Control-Allow-Headers',
@@ -49,42 +24,45 @@ function buildCorsHeaders(origin: string) {
   )
   h.set('Access-Control-Allow-Credentials', 'true')
   h.set('Vary', 'Origin')
+
+  // petit debug pour vérifier que le middleware passe bien
+  h.set('x-mf-cors', '1')
   return h
 }
 
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl
 
+  // Ne touche qu’aux routes API
   if (!pathname.startsWith('/api')) {
     return NextResponse.next()
   }
 
   const origin = req.headers.get('origin')
   const isPreflight =
-    req.method === 'OPTIONS' && req.headers.has('access-control-request-method')
+    req.method === 'OPTIONS' &&
+    req.headers.has('access-control-request-method')
 
-  const shouldCors = needsCors(pathname) && isAllowedOrigin(origin)
-
-  if (isPreflight && shouldCors) {
-    const headers = buildCorsHeaders(origin!)
+  // 🔁 1) Préflight OPTIONS → on répond direct avec les bons headers
+  if (isPreflight) {
+    const headers = buildCorsHeaders(origin)
     return new NextResponse(null, {
       status: 204,
       headers,
     })
   }
 
+  // 🔁 2) Requête normale → on laisse passer puis on ajoute les headers
   const res = NextResponse.next()
-
-  if (shouldCors && origin) {
-    const cors = buildCorsHeaders(origin)
-    cors.forEach((value, key) => {
-      res.headers.set(key, value)
-    })
-  }
+  const corsHeaders = buildCorsHeaders(origin)
+  corsHeaders.forEach((value, key) => {
+    res.headers.set(key, value)
+  })
 
   return res
 }
 
+// Middleware actif sur toutes les routes /api/*
 export const config = {
   matcher: ['/api/:path*'],
 }
