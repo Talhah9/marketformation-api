@@ -42,18 +42,35 @@ export async function OPTIONS() {
 }
 
 export async function GET(req: NextRequest) {
+  // 🔁 1) MODE BUILD (Vercel "Collecting page data")
+  // Pendant le build (NEXT_PHASE = "phase-production-build"),
+  // on ne touche PAS à Prisma → on renvoie un stub, juste pour que le build passe.
+  if (process.env.NEXT_PHASE === 'phase-production-build') {
+    return withCors({
+      ok: true,
+      banking: null,
+      summary: {
+        totalEarned: 0,
+        available: 0,
+        availableAmount: 0,
+        pending: 0,
+        pendingAmount: 0,
+        currency: 'EUR',
+        updatedAt: null,
+      },
+      history: [],
+      _note: 'build stub',
+    });
+  }
+
+  // 🔁 2) MODE RUNTIME (Vercel lambda / dev server / prod)
   try {
-    // 1) Auth formateur (même logique que tes autres endpoints)
     const { trainerId } = await getCurrentTrainer(req);
 
-    // 2) S'assurer qu'il existe une ligne de résumé pour ce formateur
+    // S'assurer qu'il existe un résumé
     await ensureSummaryRow(trainerId);
 
-    // 3) Charger en parallèle :
-    //    - infos bancaires
-    //    - résumé (available/pending/currency)
-    //    - historique (50 derniers)
-    //    - totalEarned = somme des ventes (type = 'sale')
+    // Charger banking + summary + history + total ventes
     const [banking, summaryRow, historyRows, salesAgg] = await Promise.all([
       prisma.trainerBanking.findUnique({
         where: { trainerId },
@@ -110,9 +127,8 @@ export async function GET(req: NextRequest) {
         : null,
 
       summary: {
-        // pour compatibilité max : on duplique les champs
-        totalEarned,              // total ventes (type = sale)
-        available,                // solde disponible
+        totalEarned,              // somme des "sale"
+        available,                // solde dispo
         availableAmount: available,
         pending,                  // en attente (retraits demandés)
         pendingAmount: pending,
@@ -122,8 +138,8 @@ export async function GET(req: NextRequest) {
 
       history: historyRows.map((h) => ({
         id: h.id,
-        type: h.type,           // 'sale' | 'withdraw' | 'paid' | ...
-        status: h.status,       // 'available' | 'requested' | 'paid'
+        type: h.type,
+        status: h.status,
         amount: Number(h.amount),
         currency: h.currency,
         date: h.date,
@@ -133,7 +149,6 @@ export async function GET(req: NextRequest) {
   } catch (err: any) {
     console.error('[MF] GET /api/payouts/summary error', err);
 
-    // même comportement que le reste de ton API
     if (err instanceof Error && err.message === 'Trainer not authenticated') {
       return withCors({ error: 'Unauthorized' }, 401);
     }
