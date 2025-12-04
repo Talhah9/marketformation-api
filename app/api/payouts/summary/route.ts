@@ -5,9 +5,10 @@ export const revalidate = 0;
 import { NextRequest, NextResponse } from 'next/server';
 import { getCurrentTrainer } from '@/lib/authTrainer';
 
-// CORS fixe pour ton domaine Shopify
+// 👇 CORS pour Shopify (avec credentials)
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': 'https://marketformation.fr',
+  'Access-Control-Allow-Credentials': 'true',
   'Access-Control-Allow-Methods': 'GET,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
@@ -34,7 +35,7 @@ export async function GET(req: NextRequest) {
   try {
     const { trainerId } = await getCurrentTrainer(req);
 
-    // Stub pour tester le front + CORS
+    // Stub pour tester (on garde la logique d’auth)
     return withCors({
       ok: true,
       trainerId,
