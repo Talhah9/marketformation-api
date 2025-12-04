@@ -2,42 +2,68 @@
 import { NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
 
-// ⚠️ Pour l'instant, on utilise un trainerId fixe pour tester.
-// Plus tard, on branchera ça sur le vrai customer Shopify.
-const STATIC_TRAINER_ID = 'trainer-demo-1'
+// --- CORS helper ---
+function withCors(res: NextResponse, req: Request) {
+  const origin = req.headers.get('origin') || '*'
 
-function errorJSON(message: string, status = 400) {
-  return NextResponse.json({ ok: false, error: message }, { status })
+  res.headers.set('Access-Control-Allow-Origin', origin)
+  res.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+  res.headers.set(
+    'Access-Control-Allow-Headers',
+    'Origin, Accept, Content-Type, Authorization, X-Requested-With'
+  )
+  res.headers.set('Access-Control-Allow-Credentials', 'true')
+  res.headers.set('Vary', 'Origin')
+  res.headers.set('x-mf-banking-cors', '1')
+
+  return res
 }
 
-// GET /api/trainer/banking
-// ➜ Récupère les infos bancaires stockées pour ce formateur
-export async function GET() {
+// 👉 pour l’instant : ID formateur fixe juste pour tester le flux
+const STATIC_TRAINER_ID = 'demo-trainer-1'
+
+// --- OPTIONS (préflight CORS) ---
+export async function OPTIONS(req: Request) {
+  const res = new NextResponse(null, { status: 204 })
+  return withCors(res, req)
+}
+
+// --- GET : charger les infos bancaires ---
+export async function GET(req: Request) {
   try {
     const banking = await prisma.trainerBanking.findUnique({
       where: { trainerId: STATIC_TRAINER_ID },
     })
 
-    return NextResponse.json(
-      {
-        ok: true,
-        auto_payout: banking?.autoPayout ?? false,
-        iban_last4: banking?.ibanLast4 ?? null,
-        banking,
-      },
-      { status: 200 }
-    )
+    const ibanLast4 =
+      banking?.payoutIban && banking.payoutIban.length >= 4
+        ? banking.payoutIban.slice(-4)
+        : null
+
+    const body = {
+      ok: true,
+      auto_payout: banking?.autoPayout ?? false,
+      payout_name: banking?.payoutName ?? null,
+      payout_country: banking?.payoutCountry ?? null,
+      payout_iban: banking?.payoutIban ?? null,
+      payout_bic: banking?.payoutBic ?? null,
+      iban_last4: ibanLast4,
+    }
+
+    return withCors(NextResponse.json(body), req)
   } catch (err) {
     console.error('[MF] GET /api/trainer/banking error', err)
-    return errorJSON('Erreur interne (GET banking)', 500)
+    return withCors(
+      NextResponse.json({ ok: false, error: 'SERVER_ERROR' }, { status: 500 }),
+      req
+    )
   }
 }
 
-// POST /api/trainer/banking
-// ➜ Sauvegarde les infos venant du formulaire (nom, pays, IBAN, BIC, auto_payout)
+// --- POST : sauver les infos bancaires ---
 export async function POST(req: Request) {
   try {
-    const body = await req.json().catch(() => ({} as any))
+    const json = await req.json().catch(() => ({}))
 
     const {
       payout_name,
@@ -45,63 +71,55 @@ export async function POST(req: Request) {
       payout_iban,
       payout_bic,
       auto_payout,
-      email,
-    } = body as {
+    } = json as {
       payout_name?: string
       payout_country?: string
       payout_iban?: string
       payout_bic?: string
       auto_payout?: boolean
-      email?: string
-    }
-
-    // On calcule les 4 derniers chiffres d’IBAN (sans stocker l’IBAN complet si tu veux le retirer plus tard)
-    let ibanLast4: string | null = null
-    if (typeof payout_iban === 'string' && payout_iban.trim().length >= 4) {
-      const digits = payout_iban.replace(/\s+/g, '')
-      ibanLast4 = digits.slice(-4)
     }
 
     const banking = await prisma.trainerBanking.upsert({
       where: { trainerId: STATIC_TRAINER_ID },
       create: {
         trainerId: STATIC_TRAINER_ID,
-        email: email ?? null,
+        email: null,
         payoutName: payout_name ?? null,
         payoutCountry: payout_country ?? null,
         payoutIban: payout_iban ?? null,
         payoutBic: payout_bic ?? null,
         autoPayout: !!auto_payout,
-        ibanLast4,
       },
       update: {
-        email: email ?? null,
         payoutName: payout_name ?? null,
         payoutCountry: payout_country ?? null,
         payoutIban: payout_iban ?? null,
         payoutBic: payout_bic ?? null,
         autoPayout: !!auto_payout,
-        ibanLast4,
       },
     })
 
-    return NextResponse.json(
-      {
-        ok: true,
-        auto_payout: banking.autoPayout,
-        iban_last4: banking.ibanLast4,
-        banking,
-      },
-      { status: 200 }
-    )
+    const ibanLast4 =
+      banking.payoutIban && banking.payoutIban.length >= 4
+        ? banking.payoutIban.slice(-4)
+        : null
+
+    const body = {
+      ok: true,
+      auto_payout: banking.autoPayout,
+      payout_name: banking.payoutName,
+      payout_country: banking.payoutCountry,
+      payout_iban: banking.payoutIban,
+      payout_bic: banking.payoutBic,
+      iban_last4: ibanLast4,
+    }
+
+    return withCors(NextResponse.json(body), req)
   } catch (err) {
     console.error('[MF] POST /api/trainer/banking error', err)
-    return errorJSON('Erreur interne (POST banking)', 500)
+    return withCors(
+      NextResponse.json({ ok: false, error: 'SERVER_ERROR' }, { status: 500 }),
+      req
+    )
   }
-}
-
-// OPTIONS géré par le middleware CORS, donc pas nécessaire ici,
-// mais tu peux le laisser si tu veux :
-export async function OPTIONS() {
-  return new NextResponse(null, { status: 204 })
 }
