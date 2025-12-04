@@ -6,8 +6,6 @@ export const revalidate = 0;
 export const runtime = 'nodejs';
 
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '@/lib/db';
-import { getCurrentTrainer } from '@/lib/authTrainer';
 
 function maskIban(iban?: string | null) {
   if (!iban) return null;
@@ -18,7 +16,6 @@ function maskIban(iban?: string | null) {
 
 export async function GET(req: NextRequest) {
   try {
-    // Petite sécurité : si jamais DATABASE_URL manque en prod
     if (!process.env.DATABASE_URL) {
       console.error('[MF] DATABASE_URL manquante sur le serveur');
       return NextResponse.json(
@@ -26,6 +23,12 @@ export async function GET(req: NextRequest) {
         { status: 500 },
       );
     }
+
+    // ⚠️ Import DYNAMIQUE pour éviter le crash au chargement du module pendant le build
+    const [{ getCurrentTrainer }, { prisma }] = await Promise.all([
+      import('@/lib/authTrainer'),
+      import('@/lib/db'),
+    ]);
 
     const { trainerId } = await getCurrentTrainer(req);
 
@@ -83,7 +86,6 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // On renvoie une 500 propre, sans laisser l’exception remonter au build
     return NextResponse.json(
       { error: 'Erreur serveur lors du chargement du solde.' },
       { status: 500 },
