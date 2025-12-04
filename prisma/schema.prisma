@@ -44,7 +44,8 @@ model PayoutsHistory {
   date      DateTime      @default(now())
   meta      Json?
 
-  trainer   TrainerBanking @relation(fields: [trainerId], references: [trainerId])
+  trainer   TrainerBanking @relation(fields: [trainerId], references: [id])
+
 
   @@index([trainerId, date])
 }
