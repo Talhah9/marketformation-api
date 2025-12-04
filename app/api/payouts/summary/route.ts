@@ -4,13 +4,12 @@ import Stripe from 'stripe';
 
 export const runtime = 'nodejs';
 
-// ----- Config env -----
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
-const CORS_ORIGINS = process.env.CORS_ORIGINS || ''; // ex: "https://tqiccz-96.myshopify.com,https://marketformation.fr"
+const CORS_ORIGINS = process.env.CORS_ORIGINS || '';
 
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
-// ----- Helpers CORS -----
+// ---- CORS helpers ----
 function getCorsOrigin(req: NextRequest): string | null {
   const origin = req.headers.get('origin');
   if (!origin) return null;
@@ -19,87 +18,80 @@ function getCorsOrigin(req: NextRequest): string | null {
     .map((o) => o.trim())
     .filter(Boolean);
 
-  if (allowed.length === 0) return origin; // si pas configuré, on laisse passer
-
+  if (allowed.length === 0) return origin;
   if (allowed.includes(origin)) return origin;
 
   return null;
 }
 
-function withCors(response: NextResponse, origin: string | null) {
+function withCors(res: NextResponse, origin: string | null) {
   if (origin) {
-    response.headers.set('Access-Control-Allow-Origin', origin);
-    response.headers.set('Vary', 'Origin');
+    res.headers.set('Access-Control-Allow-Origin', origin);
+    res.headers.set('Vary', 'Origin');
   }
-  response.headers.set('Access-Control-Allow-Credentials', 'true');
-  response.headers.set(
+  res.headers.set('Access-Control-Allow-Credentials', 'true');
+  res.headers.set(
     'Access-Control-Allow-Headers',
     'Content-Type,Authorization'
   );
-  response.headers.set('Access-Control-Allow-Methods', 'GET,OPTIONS');
-  return response;
+  res.headers.set('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  return res;
 }
 
-// ----- OPTIONS (préflight) -----
 export async function OPTIONS(req: NextRequest) {
   const origin = getCorsOrigin(req);
   const res = new NextResponse(null, { status: 204 });
   return withCors(res, origin);
 }
 
-// ----- GET /api/payouts/summary -----
 export async function GET(req: NextRequest) {
   const origin = getCorsOrigin(req);
 
-  if (!stripe) {
-    const res = NextResponse.json(
-      { ok: false, error: 'Stripe non configuré (STRIPE_SECRET_KEY manquant)' },
-      { status: 500 }
-    );
-    return withCors(res, origin);
-  }
-
   try {
-    // 1) Solde Stripe (available / pending)
-    const balance = await stripe.balance.retrieve();
+    if (!stripe) {
+      const res = NextResponse.json(
+        {
+          ok: false,
+          error: 'stripe_not_configured',
+          message: 'STRIPE_SECRET_KEY manquant en production.',
+        },
+        { status: 200 } // <-- jamais 500/401 ici
+      );
+      return withCors(res, origin);
+    }
 
+    // 1) Solde
+    const balance = await stripe.balance.retrieve();
     const available = balance.available?.[0] || null;
     const pending = balance.pending?.[0] || null;
 
-    // 2) Derniers payouts (par ex. 10 derniers)
-    const payouts = await stripe.payouts.list({
-      limit: 10,
-    });
+    // 2) Payouts récents
+    const payouts = await stripe.payouts.list({ limit: 10 });
 
-    // 3) Prochain payout "en transit" (optionnel)
-    const upcoming = payouts.data.find(
-      (p) => p.status === 'in_transit' || p.status === 'pending'
-    ) || null;
+    // 3) Payout prochain / en transit
+    const upcoming =
+      payouts.data.find(
+        (p) => p.status === 'in_transit' || p.status === 'pending'
+      ) || null;
 
     const payload = {
       ok: true,
       balance: {
         available: available
-          ? {
-              amount: available.amount,
-              currency: available.currency,
-            }
+          ? { amount: available.amount, currency: available.currency }
           : null,
         pending: pending
-          ? {
-              amount: pending.amount,
-              currency: pending.currency,
-            }
+          ? { amount: pending.amount, currency: pending.currency }
           : null,
       },
       upcoming: upcoming
         ? {
-          id: upcoming.id,
-          amount: upcoming.amount,
-          currency: upcoming.currency,
-          status: upcoming.status,
-          arrival_date: upcoming.arrival_date,
-        }
+            id: upcoming.id,
+            amount: upcoming.amount,
+            currency: upcoming.currency,
+            status: upcoming.status,
+            arrival_date: upcoming.arrival_date,
+          }
         : null,
       payouts: payouts.data.map((p) => ({
         id: p.id,
@@ -118,14 +110,16 @@ export async function GET(req: NextRequest) {
   } catch (err: any) {
     console.error('[MF] /api/payouts/summary error', err);
 
-    const message =
-      err?.message ||
-      err?.toString?.() ||
-      'Erreur serveur lors du chargement du solde.';
-
     const res = NextResponse.json(
-      { ok: false, error: 'server_error', message },
-      { status: 500 }
+      {
+        ok: false,
+        error: 'server_error',
+        message:
+          err?.message ||
+          err?.toString?.() ||
+          'Erreur serveur lors du chargement du solde.',
+      },
+      { status: 200 } // <-- même en erreur, on reste en 200
     );
     return withCors(res, origin);
   }

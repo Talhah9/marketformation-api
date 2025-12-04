@@ -1,30 +1,21 @@
-// middleware.ts
+// middleware.ts 
 import { NextResponse, NextRequest } from 'next/server'
 
-/**
- * CORS pour :
- * - Shopify : https://tqiccz-96.myshopify.com
- * - Domaine public : https://marketformation.fr
- *
- * Si plus tard tu veux ajouter un domaine, tu peux l’ajouter dans ALLOWED_ORIGINS
- * OU dans la variable d'env CORS_ORIGINS (séparées par virgules).
- */
-
-// Origines depuis l'env (optionnel)
 const ENV_ORIGINS = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean)
 
-// Origines par défaut si CORS_ORIGINS est vide
 const DEFAULT_ORIGINS = [
   'https://tqiccz-96.myshopify.com',
   'https://marketformation.fr',
 ]
 
-const ALLOWED_ORIGINS = new Set([...(ENV_ORIGINS.length ? ENV_ORIGINS : DEFAULT_ORIGINS)])
+const ALLOWED_ORIGINS = new Set([
+  ...(ENV_ORIGINS.length ? ENV_ORIGINS : DEFAULT_ORIGINS),
+])
 
-// Routes à protéger par CORS
+// ✅ j’ai juste ajouté la ligne /^\/api\/payouts\/summary$/,
 const CORS_PATHS: RegExp[] = [
   /^\/api\/upload\/image$/,
   /^\/api\/upload\/pdf$/,
@@ -36,6 +27,7 @@ const CORS_PATHS: RegExp[] = [
   /^\/api\/stripe\/checkout$/,
   /^\/api\/stripe\/portal$/,
   /^\/api\/ping$/,
+  /^\/api\/payouts\/summary$/,   // <-- AJOUT
 ]
 
 function needsCors(pathname: string): boolean {
@@ -55,7 +47,6 @@ function buildCorsHeaders(origin: string) {
     'Access-Control-Allow-Headers',
     'Origin, Accept, Content-Type, Authorization, X-Requested-With'
   )
-  // ✅ Shopify/fetch utilise souvent credentials: 'include'
   h.set('Access-Control-Allow-Credentials', 'true')
   h.set('Vary', 'Origin')
   return h
@@ -64,7 +55,6 @@ function buildCorsHeaders(origin: string) {
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl
 
-  // On ne gère que les routes API
   if (!pathname.startsWith('/api')) {
     return NextResponse.next()
   }
@@ -75,7 +65,6 @@ export function middleware(req: NextRequest) {
 
   const shouldCors = needsCors(pathname) && isAllowedOrigin(origin)
 
-  // 1) Préflight: on répond direct avec les headers CORS
   if (isPreflight && shouldCors) {
     const headers = buildCorsHeaders(origin!)
     return new NextResponse(null, {
@@ -84,12 +73,10 @@ export function middleware(req: NextRequest) {
     })
   }
 
-  // 2) Requête normale: on laisse passer vers la route,
-  //    puis on ajoute les headers CORS à la réponse.
   const res = NextResponse.next()
 
-  if (shouldCors) {
-    const cors = buildCorsHeaders(origin!)
+  if (shouldCors && origin) {
+    const cors = buildCorsHeaders(origin)
     cors.forEach((value, key) => {
       res.headers.set(key, value)
     })
