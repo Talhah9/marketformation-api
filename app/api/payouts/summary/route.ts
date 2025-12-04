@@ -3,154 +3,130 @@ import { NextRequest, NextResponse } from 'next/server';
 import Stripe from 'stripe';
 
 export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
 
-// --- Helpers CORS simples (comme tes autres routes publiques) ---
-function withCors(req: NextRequest, res: NextResponse) {
-  const origin = req.headers.get('origin') || '';
-  const allowed =
-    process.env.CORS_ORIGINS
-      ?.split(',')
-      .map((o) => o.trim())
-      .filter(Boolean) || [];
-
-  if (allowed.length === 0) {
-    // fallback : autorise Shopify + le domaine public
-    const fallback = ['https://marketformation.fr', 'https://tqiccz-96.myshopify.com'];
-    if (fallback.includes(origin)) {
-      res.headers.set('Access-Control-Allow-Origin', origin);
-      res.headers.set('Vary', 'Origin');
-    }
-  } else if (allowed.includes(origin)) {
-    res.headers.set('Access-Control-Allow-Origin', origin);
-    res.headers.set('Vary', 'Origin');
-  }
-
-  res.headers.set('Access-Control-Allow-Credentials', 'true');
-  res.headers.set(
-    'Access-Control-Allow-Headers',
-    'Origin, X-Requested-With, Content-Type, Accept'
-  );
-  res.headers.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
-
-  return res;
-}
-
-export async function OPTIONS(req: NextRequest) {
-  const res = NextResponse.json({ ok: true });
-  return withCors(req, res);
-}
-
-// --- Stripe client ---
+// ----- Config env -----
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const CORS_ORIGINS = process.env.CORS_ORIGINS || ''; // ex: "https://tqiccz-96.myshopify.com,https://marketformation.fr"
 
-if (!STRIPE_SECRET_KEY) {
-  console.warn('[MF] STRIPE_SECRET_KEY manquante pour /api/payouts/summary');
+const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
+
+// ----- Helpers CORS -----
+function getCorsOrigin(req: NextRequest): string | null {
+  const origin = req.headers.get('origin');
+  if (!origin) return null;
+
+  const allowed = CORS_ORIGINS.split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+
+  if (allowed.length === 0) return origin; // si pas configuré, on laisse passer
+
+  if (allowed.includes(origin)) return origin;
+
+  return null;
 }
 
-const stripe = STRIPE_SECRET_KEY
-  ? new Stripe(STRIPE_SECRET_KEY)
-  : null;
+function withCors(response: NextResponse, origin: string | null) {
+  if (origin) {
+    response.headers.set('Access-Control-Allow-Origin', origin);
+    response.headers.set('Vary', 'Origin');
+  }
+  response.headers.set('Access-Control-Allow-Credentials', 'true');
+  response.headers.set(
+    'Access-Control-Allow-Headers',
+    'Content-Type,Authorization'
+  );
+  response.headers.set('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  return response;
+}
 
+// ----- OPTIONS (préflight) -----
+export async function OPTIONS(req: NextRequest) {
+  const origin = getCorsOrigin(req);
+  const res = new NextResponse(null, { status: 204 });
+  return withCors(res, origin);
+}
 
-// --- Type de réponse envoyé au front ---
-type PayoutItem = {
-  id: string;
-  amount: number;
-  currency: string;
-  status: string;
-  arrivalDate: string | null;
-  createdAt: string;
-};
-
-type PayoutSummary = {
-  lifetimePaid: number; // total des virements déjà payés
-  upcomingAmount: number; // montant des prochains virements en "pending"
-  lastPayoutAmount: number | null;
-  lastPayoutDate: string | null;
-  currency: string;
-};
-
+// ----- GET /api/payouts/summary -----
 export async function GET(req: NextRequest) {
-  try {
-    if (!stripe) {
-      const res = NextResponse.json(
-        {
-          ok: false,
-          error: 'Stripe non configuré',
-        },
-        { status: 500 }
-      );
-      return withCors(req, res);
-    }
+  const origin = getCorsOrigin(req);
 
-    // On récupère une liste de virements Stripe (payouts)
-    // On limite à 50 pour rester léger, suffisant pour un résumé sur le dashboard
-    const payoutsList = await stripe.payouts.list({
-      limit: 50,
-    });
-
-    const payouts: PayoutItem[] = payoutsList.data.map((p) => ({
-      id: p.id,
-      amount: (p.amount || 0) / 100, // Stripe est en cents
-      currency: p.currency || 'eur',
-      status: p.status,
-      arrivalDate: p.arrival_date
-        ? new Date(p.arrival_date * 1000).toISOString()
-        : null,
-      createdAt: new Date(p.created * 1000).toISOString(),
-    }));
-
-    // Devise principale (on prend la première, sinon "eur")
-    const currency =
-      payouts[0]?.currency || payoutsList.data[0]?.currency || 'eur';
-
-    // Total déjà payé
-    const lifetimePaid = payouts
-      .filter((p) => p.status === 'paid')
-      .reduce((sum, p) => sum + p.amount, 0);
-
-    // Montant des virements en attente (pending / in_transit)
-    const upcomingAmount = payouts
-      .filter((p) => p.status === 'pending' || p.status === 'in_transit')
-      .reduce((sum, p) => sum + p.amount, 0);
-
-    // Dernier virement payé (tri par date)
-    const paidPayouts = [...payouts].filter((p) => p.status === 'paid');
-    paidPayouts.sort(
-      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-    );
-
-    const lastPayout = paidPayouts[0] || null;
-
-    const summary: PayoutSummary = {
-      lifetimePaid,
-      upcomingAmount,
-      lastPayoutAmount: lastPayout ? lastPayout.amount : null,
-      lastPayoutDate: lastPayout ? lastPayout.createdAt : null,
-      currency,
-    };
-
+  if (!stripe) {
     const res = NextResponse.json(
-      {
-        ok: true,
-        summary,
-        payouts,
-      },
-      { status: 200 }
-    );
-
-    return withCors(req, res);
-  } catch (err: any) {
-    console.error('[MF] GET /api/payouts/summary error', err);
-
-    const res = NextResponse.json(
-      {
-        ok: false,
-        error: 'Internal Server Error',
-      },
+      { ok: false, error: 'Stripe non configuré (STRIPE_SECRET_KEY manquant)' },
       { status: 500 }
     );
-    return withCors(req, res);
+    return withCors(res, origin);
+  }
+
+  try {
+    // 1) Solde Stripe (available / pending)
+    const balance = await stripe.balance.retrieve();
+
+    const available = balance.available?.[0] || null;
+    const pending = balance.pending?.[0] || null;
+
+    // 2) Derniers payouts (par ex. 10 derniers)
+    const payouts = await stripe.payouts.list({
+      limit: 10,
+    });
+
+    // 3) Prochain payout "en transit" (optionnel)
+    const upcoming = payouts.data.find(
+      (p) => p.status === 'in_transit' || p.status === 'pending'
+    ) || null;
+
+    const payload = {
+      ok: true,
+      balance: {
+        available: available
+          ? {
+              amount: available.amount,
+              currency: available.currency,
+            }
+          : null,
+        pending: pending
+          ? {
+              amount: pending.amount,
+              currency: pending.currency,
+            }
+          : null,
+      },
+      upcoming: upcoming
+        ? {
+          id: upcoming.id,
+          amount: upcoming.amount,
+          currency: upcoming.currency,
+          status: upcoming.status,
+          arrival_date: upcoming.arrival_date,
+        }
+        : null,
+      payouts: payouts.data.map((p) => ({
+        id: p.id,
+        amount: p.amount,
+        currency: p.currency,
+        status: p.status,
+        arrival_date: p.arrival_date,
+        created: p.created,
+        method: p.method,
+        type: p.type,
+      })),
+    };
+
+    const res = NextResponse.json(payload, { status: 200 });
+    return withCors(res, origin);
+  } catch (err: any) {
+    console.error('[MF] /api/payouts/summary error', err);
+
+    const message =
+      err?.message ||
+      err?.toString?.() ||
+      'Erreur serveur lors du chargement du solde.';
+
+    const res = NextResponse.json(
+      { ok: false, error: 'server_error', message },
+      { status: 500 }
+    );
+    return withCors(res, origin);
   }
 }
