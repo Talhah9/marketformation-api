@@ -1,7 +1,18 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql" // garde ça si ta DB est bien Postgres
+  url      = env("DATABASE_URL")
+}
+
 model TrainerBanking {
-  id            String           @id @default(cuid())
-  /// Identifiant stable du formateur (Shopify customer id, email hash, etc.)
-  trainerId     String           @unique
+  id        String @id @default(cuid())
+  // identifiant stable du formateur (customer id Shopify, email hash, etc.)
+  trainerId String @unique
 
   email         String?
   payoutName    String?
@@ -9,44 +20,43 @@ model TrainerBanking {
   payoutIban    String?
   payoutBic     String?
 
-  // Flags/infos pour le paiement automatique
-  autoPayout    Boolean          @default(false)
-  ibanLast4     String?          // 4 derniers digits de l’IBAN
-  ibanToken     String?          // token Stripe/autre, pas l’IBAN en clair
+  // infos / flags pour paiement automatique
+  autoPayout Boolean @default(false)
+  ibanLast4  String? // 4 derniers digits de l’IBAN
+  ibanToken  String? // token Stripe/autre, pas l’IBAN en clair
 
-  createdAt     DateTime         @default(now())
-  updatedAt     DateTime         @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  summary       PayoutsSummary?
-  history       PayoutsHistory[]
+  summary PayoutsSummary?
+  history PayoutsHistory[]
 }
 
 model PayoutsSummary {
-  id              String   @id @default(cuid())
-  trainerId       String   @unique
+  id        String @id @default(cuid())
+  trainerId String @unique
 
-  availableAmount Decimal  @default(0.0)
-  pendingAmount   Decimal  @default(0.0)
+  // 💡 On passe en Float pour éviter l’erreur "Decimal non supporté"
+  availableAmount Float    @default(0.0)
+  pendingAmount   Float    @default(0.0)
   currency        String   @default("EUR")
   updatedAt       DateTime @updatedAt
 
-  // Relation vers TrainerBanking via trainerId (qui est unique)
-  trainer         TrainerBanking @relation(fields: [trainerId], references: [trainerId])
+  trainer TrainerBanking @relation(fields: [trainerId], references: [trainerId])
 }
 
 model PayoutsHistory {
-  id        String        @id @default(cuid())
+  id        String @id @default(cuid())
   trainerId String
 
-  type      PayoutType
-  status    PayoutStatus
-  amount    Decimal
-  currency  String        @default("EUR")
-  date      DateTime      @default(now())
-  meta      Json?
+  type     PayoutType
+  status   PayoutStatus
+  amount   Float // idem : Float au lieu de Decimal
+  currency String       @default("EUR")
+  date     DateTime     @default(now())
+  meta     Json?
 
-  // Même clé étrangère que pour Summary
-  trainer   TrainerBanking @relation(fields: [trainerId], references: [trainerId])
+  trainer TrainerBanking @relation(fields: [trainerId], references: [trainerId])
 
   @@index([trainerId, date])
 }
