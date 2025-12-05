@@ -17,51 +17,55 @@ function getOrigin(req: NextRequest): string | null {
   return origin;
 }
 
-function buildCorsHeaders(origin: string) {
-  const headers = new Headers();
-  headers.set('Access-Control-Allow-Origin', origin);
-  headers.set('Access-Control-Allow-Credentials', 'true');
-  headers.set(
-    'Access-Control-Allow-Headers',
-    // 👇 **X-Trainer-Id ajouté ici**
-    'Origin, Accept, Content-Type, Authorization, X-Requested-With, X-Trainer-Id'
-  );
-  headers.set(
-    'Access-Control-Allow-Methods',
-    'GET, POST, PUT, PATCH, DELETE, OPTIONS'
-  );
-  headers.set('Vary', 'Origin');
-  return headers;
-}
-
 export function middleware(req: NextRequest) {
   const origin = getOrigin(req);
+
   const isPreflight =
     req.method === 'OPTIONS' &&
     req.headers.has('access-control-request-method');
 
-  // Si pas d'origin autorisé → laisser passer sans CORS spécial
+  // Domaine non autorisé
   if (!origin) {
     if (isPreflight) {
-      // préflight d’un domaine non autorisé → on bloque “proprement”
       return new NextResponse(null, { status: 403 });
     }
     return NextResponse.next();
   }
 
-  const corsHeaders = buildCorsHeaders(origin);
+  // 🔑 On récupère dynamiquement les headers demandés par le navigateur
+  const requestedHeaders =
+    req.headers.get('access-control-request-headers') || '';
 
-  // ✅ Réponse PRE-FLIGHT
+  const resHeaders = new Headers();
+  resHeaders.set('Access-Control-Allow-Origin', origin);
+  resHeaders.set('Access-Control-Allow-Credentials', 'true');
+  resHeaders.set(
+    'Access-Control-Allow-Methods',
+    'GET,POST,PUT,PATCH,DELETE,OPTIONS'
+  );
+
+  // ✅ On autorise explicitement nos headers + ceux demandés
+  const baseAllowed =
+    'Origin, Accept, Content-Type, Authorization, X-Requested-With, X-Trainer-Id, X-Trainer-Email';
+
+  const allowHeaders = requestedHeaders
+    ? baseAllowed + ', ' + requestedHeaders
+    : baseAllowed;
+
+  resHeaders.set('Access-Control-Allow-Headers', allowHeaders);
+  resHeaders.set('Vary', 'Origin');
+
+  // 🔁 Réponse PRE-FLIGHT
   if (isPreflight) {
     return new NextResponse(null, {
       status: 204,
-      headers: corsHeaders,
+      headers: resHeaders,
     });
   }
 
-  // ✅ Requête normale : on laisse passer et on ajoute les headers CORS
+  // 🔁 Requête normale
   const res = NextResponse.next();
-  corsHeaders.forEach((value, key) => {
+  resHeaders.forEach((value, key) => {
     res.headers.set(key, value);
   });
   return res;
