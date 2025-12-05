@@ -1,51 +1,18 @@
-// app/api/payouts/auto/route.ts
-export const dynamic = 'force-dynamic';
-export const revalidate = 0;
+// app/api/payouts/summary/auto/route.ts
+import { NextResponse } from 'next/server';
 
-import { NextRequest, NextResponse } from 'next/server';
-import { getCurrentTrainer } from '@/lib/authTrainer';
-
-type AutoPayload = {
-  autoPayout: boolean;
-};
-
-export async function POST(req: NextRequest) {
-  try {
-    const { trainerId, email } = await getCurrentTrainer(req);
-
-    const body = (await req.json()) as AutoPayload;
-    const autoPayout = body.autoPayout ?? false;
-
-    // Import dynamique pour éviter les soucis au build
-    const { prisma } = await import('@/lib/db');
-
-    const banking = await prisma.trainerBanking.upsert({
-      where: { trainerId },
-      create: {
-        trainerId,
-        email: email || null,
-        autoPayout,
-      },
-      update: {
-        autoPayout,
-      },
-    });
-
-    return NextResponse.json({
-      ok: true,
-      autoPayout: banking.autoPayout,
-    });
-  } catch (err: any) {
-    console.error('[MF] POST /api/payouts/auto error', err);
-    if (err instanceof Error && err.message === 'Trainer not authenticated') {
-      return NextResponse.json(
-        { error: 'Non authentifié.' },
-        { status: 401 },
-      );
-    }
-    return NextResponse.json(
-      { error: 'Erreur serveur lors de la mise à jour du virement automatique.' },
-      { status: 500 },
-    );
-  }
+/**
+ * Ancienne route interne d’auto-mise à jour des résumés de paiements.
+ * Elle n’est plus utilisée par le front. On la garde uniquement pour
+ * éviter les 404 si jamais quelque chose tente encore de l’appeler.
+ */
+export async function POST() {
+  return NextResponse.json(
+    {
+      ok: false,
+      error: 'AUTO_PAYOUT_SUMMARY_DISABLED',
+      message: 'Cette route est désactivée dans la nouvelle version de MarketFormation.',
+    },
+    { status: 410 } // Gone
+  );
 }
