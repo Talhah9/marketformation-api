@@ -7,28 +7,21 @@ import { NextResponse, NextRequest } from 'next/server'
  * - Gère correctement le préflight OPTIONS
  */
 
-function buildCorsHeaders(origin: string | null) {
-  const h = new Headers()
-  if (origin) {
-    // On renvoie exactement l'origine appelante
-    h.set('Access-Control-Allow-Origin', origin)
-  } else {
-    // fallback (normalement on a toujours un origin dans ton cas)
-    h.set('Access-Control-Allow-Origin', '*')
-  }
+function buildCorsHeaders(origin: string) {
+  const h = new Headers();
 
-  h.set('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS')
+  h.set('Access-Control-Allow-Origin', origin);
+  h.set('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
   h.set(
     'Access-Control-Allow-Headers',
-    'Origin, Accept, Content-Type, Authorization, X-Requested-With'
-  )
-  h.set('Access-Control-Allow-Credentials', 'true')
-  h.set('Vary', 'Origin')
+    'Origin, Accept, Content-Type, Authorization, X-Requested-With, X-Trainer-Id'
+  );
+  h.set('Access-Control-Allow-Credentials', 'true');
+  h.set('Vary', 'Origin');
 
-  // petit debug pour vérifier que le middleware passe bien
-  h.set('x-mf-cors', '1')
-  return h
+  return h;
 }
+
 
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl
