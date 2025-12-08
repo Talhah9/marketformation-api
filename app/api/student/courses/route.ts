@@ -17,8 +17,8 @@ export async function GET(req: Request) {
       );
     }
 
-    // 👇 cast en any pour calmer TS sur "studentCourse"
-    const studentCourses = await (prisma as any).studentCourse.findMany({
+    // On cast prisma en any pour éviter les erreurs TS sur studentCourse
+    const studentCourses: any[] = await (prisma as any).studentCourse.findMany({
       where: {
         OR: [
           email ? { studentEmail: email } : {},
@@ -34,9 +34,7 @@ export async function GET(req: Request) {
       },
     });
 
-    type StudentCourseWithCourse = (typeof studentCourses)[number];
-
-    const items = studentCourses.map((sc: StudentCourseWithCourse) => ({
+    const items = studentCourses.map((sc) => ({
       id: sc.course.id,
       title: sc.course.title,
       subtitle: sc.course.subtitle ?? '',
@@ -44,7 +42,7 @@ export async function GET(req: Request) {
       level_label: sc.course.levelLabel ?? '',
       estimated_hours: sc.course.estimatedHours ?? 0,
 
-      // 👇 on transforme juste en string, pas besoin de l’enum TS
+      // enum Prisma -> string front : "not_started" | "in_progress" | "completed"
       status: String(sc.status ?? 'IN_PROGRESS').toLowerCase(),
 
       image_url: sc.course.imageUrl ?? null,
