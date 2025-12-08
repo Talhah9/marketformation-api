@@ -9,6 +9,10 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// -----------------------------------------------------
+// PAIEMENTS FORMATEURS
+// -----------------------------------------------------
+
 model TrainerBanking {
   id            String   @id @default(cuid())
   trainerId     String   @unique
@@ -62,4 +66,76 @@ enum PayoutStatus {
   requested
   paid
   reversed
+}
+
+// -----------------------------------------------------
+// FORMATIONS (plateforme)
+// -----------------------------------------------------
+
+model Course {
+  id String @id @default(cuid())
+
+  // Lien vers le produit Shopify
+  shopifyProductId     String  @unique
+  shopifyProductHandle String?
+  shopifyProductTitle  String?
+
+  // Contenu / affichage
+  title     String
+  subtitle  String?
+  imageUrl  String?
+  pdfUrl    String?
+  accessUrl String // ex: "/pages/formation-demo-ia"
+
+  // Métadonnées pédagogiques
+  categoryLabel  String? // ex: "Tech & IA"
+  levelLabel     String? // ex: "Débutant"
+  estimatedHours Float? // ex: 4.5
+
+  // Formateur
+  trainerEmail     String?
+  trainerShopifyId String?
+
+  // Relations
+  enrollments StudentCourse[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([shopifyProductId])
+  @@index([accessUrl])
+  @@index([trainerEmail])
+}
+
+model StudentCourse {
+  id String @id @default(cuid())
+
+  // Élève
+  studentEmail      String
+  shopifyCustomerId String?
+
+  // Formation
+  courseId String
+  course   Course @relation(fields: [courseId], references: [id])
+
+  // Commande Shopify
+  shopifyOrderId    String?
+  shopifyLineItemId String?
+
+  // Suivi
+  purchaseDate DateTime     @default(now())
+  lastAccessAt DateTime?
+  status       CourseStatus @default(IN_PROGRESS)
+  archived     Boolean      @default(false)
+
+  @@index([studentEmail])
+  @@index([shopifyCustomerId])
+  @@index([shopifyOrderId])
+  @@index([courseId])
+}
+
+enum CourseStatus {
+  NOT_STARTED // "not_started"
+  IN_PROGRESS // "in_progress"
+  COMPLETED // "completed"
 }
