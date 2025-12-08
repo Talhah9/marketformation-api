@@ -18,6 +18,9 @@ type StudentCourseItem = {
   cta_label?: string
 }
 
+// (optionnel mais utile pour être sûr que ce n’est pas statique)
+export const dynamic = 'force-dynamic'
+
 export async function GET(req: Request) {
   const url = new URL(req.url)
 
@@ -35,10 +38,6 @@ export async function GET(req: Request) {
       { status: 400 }
     )
   }
-
-  // 👉 plus tard : ici on ira chercher les commandes Shopify + produits "course"
-  // (via ADMIN_TOKEN) et on construira la vraie liste.
-  // Pour l’instant : on renvoie des données de test, juste pour valider le flux.
 
   const now = new Date()
 
