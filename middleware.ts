@@ -66,8 +66,10 @@ export function middleware(req: NextRequest) {
     'GET,POST,PUT,PATCH,DELETE,OPTIONS'
   );
 
+  // ⬇️ ON AJOUTE UNIQUEMENT LES 2 HEADERS ÉLÈVE
   const baseAllowed =
-    'Origin, Accept, Content-Type, Authorization, X-Requested-With, X-Trainer-Id, X-Trainer-Email';
+    'Origin, Accept, Content-Type, Authorization, X-Requested-With, ' +
+    'X-Trainer-Id, X-Trainer-Email, X-Student-Id, X-Student-Email';
 
   const allowHeaders = requestedHeaders
     ? baseAllowed + ', ' + requestedHeaders
