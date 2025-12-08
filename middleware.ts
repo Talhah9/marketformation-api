@@ -17,14 +17,33 @@ function getOrigin(req: NextRequest): string | null {
   return origin;
 }
 
+// 🔥 Liste des endpoints CORS autorisés
+const CORS_PATHS: RegExp[] = [
+  /^\/api\/upload\/image$/,
+  /^\/api\/upload\/pdf$/,
+  /^\/api\/upload\/pdf\/start$/,
+  /^\/api\/courses$/,
+  /^\/api\/profile$/,
+  /^\/api\/profile\/password$/,
+  /^\/api\/subscription$/,
+  /^\/api\/stripe\/checkout$/,
+  /^\/api\/stripe\/portal$/,
+  /^\/api\/ping$/,
+  /^\/api\/student\/courses$/,   // ✅ AJOUT ICI
+];
+
 export function middleware(req: NextRequest) {
   const origin = getOrigin(req);
+
+  const { pathname } = req.nextUrl;
+
+  // Si l’endpoint n’est pas dans CORS_PATHS → on laisse passer sans CORS
+  const isCorsEndpoint = CORS_PATHS.some((r) => r.test(pathname));
 
   const isPreflight =
     req.method === 'OPTIONS' &&
     req.headers.has('access-control-request-method');
 
-  // Domaine non autorisé
   if (!origin) {
     if (isPreflight) {
       return new NextResponse(null, { status: 403 });
@@ -32,7 +51,10 @@ export function middleware(req: NextRequest) {
     return NextResponse.next();
   }
 
-  // 🔑 On récupère dynamiquement les headers demandés par le navigateur
+  if (!isCorsEndpoint) {
+    return NextResponse.next();
+  }
+
   const requestedHeaders =
     req.headers.get('access-control-request-headers') || '';
 
@@ -44,7 +66,6 @@ export function middleware(req: NextRequest) {
     'GET,POST,PUT,PATCH,DELETE,OPTIONS'
   );
 
-  // ✅ On autorise explicitement nos headers + ceux demandés
   const baseAllowed =
     'Origin, Accept, Content-Type, Authorization, X-Requested-With, X-Trainer-Id, X-Trainer-Email';
 
@@ -55,7 +76,6 @@ export function middleware(req: NextRequest) {
   resHeaders.set('Access-Control-Allow-Headers', allowHeaders);
   resHeaders.set('Vary', 'Origin');
 
-  // 🔁 Réponse PRE-FLIGHT
   if (isPreflight) {
     return new NextResponse(null, {
       status: 204,
@@ -63,7 +83,6 @@ export function middleware(req: NextRequest) {
     });
   }
 
-  // 🔁 Requête normale
   const res = NextResponse.next();
   resHeaders.forEach((value, key) => {
     res.headers.set(key, value);
