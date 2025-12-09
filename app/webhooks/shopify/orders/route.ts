@@ -1,135 +1,126 @@
-// app/api/webhooks/shopify/orders/route.ts
-import { NextResponse } from 'next/server';
-import crypto from 'crypto';
-import { prisma } from '@/lib/prisma';
+// app/webhooks/shopify/orders/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import crypto from "crypto";
+import { prisma } from "@/lib/prisma";
 
-// On force le runtime Node pour pouvoir utiliser "crypto" de Node
-export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
-
-// Petit helper pour calmer TypeScript sur timingSafeEqual
-function timingSafeEqual(a: Buffer, b: Buffer) {
-  if (a.length !== b.length) return false;
-  return (crypto as any).timingSafeEqual(a, b);
-}
-
-function verifyShopifyHmac(rawBody: string, hmacHeader: string | null) {
-  const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
-  if (!secret || !hmacHeader) return false;
+function verifyShopifyHmac(
+  rawBody: string,
+  hmacHeader: string | null,
+  secret: string
+): boolean {
+  if (!hmacHeader) return false;
 
   const digest = crypto
-    .createHmac('sha256', secret)
-    .update(rawBody, 'utf8')
-    .digest('base64');
+    .createHmac("sha256", secret)
+    .update(rawBody, "utf8")
+    .digest("base64");
 
-  const hmacBuffer = Buffer.from(hmacHeader, 'utf8');
-  const digestBuffer = Buffer.from(digest, 'utf8');
+  const digestBuf = Buffer.from(digest, "utf8");
+  const hmacBuf = Buffer.from(hmacHeader, "utf8");
 
-  if (hmacBuffer.length !== digestBuffer.length) return false;
+  if (digestBuf.length !== hmacBuf.length) return false;
 
-  return timingSafeEqual(hmacBuffer, digestBuffer);
+  // 👇 Cast en any pour éviter l'erreur TS ArrayBufferView / Buffer
+  return crypto.timingSafeEqual(digestBuf as any, hmacBuf as any);
 }
 
-// On cast prisma en any pour éviter les erreurs "course / studentCourse n'existe pas"
-const db = prisma as any;
+export async function POST(req: NextRequest) {
+  const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
+  if (!secret) {
+    console.error("[MF] Missing SHOPIFY_WEBHOOK_SECRET");
+    return NextResponse.json({ ok: false }, { status: 500 });
+  }
 
-export async function POST(req: Request) {
+  const rawBody = await req.text();
+  const hmacHeader = req.headers.get("x-shopify-hmac-sha256");
+  const topic = req.headers.get("x-shopify-topic") || "";
+
+  // ✅ Vérification HMAC
+  if (!verifyShopifyHmac(rawBody, hmacHeader, secret)) {
+    console.warn("[MF] Invalid HMAC");
+    return NextResponse.json({ ok: false }, { status: 401 });
+  }
+
+  // ✅ On ne traite que les commandes payées
+  if (topic !== "orders/paid") {
+    return NextResponse.json({ ok: true, ignored: true }, { status: 200 });
+  }
+
+  let payload: any;
   try {
-    const rawBody = await req.text(); // body brut pour la signature
-    const hmacHeader = req.headers.get('x-shopify-hmac-sha256');
-    const topic = req.headers.get('x-shopify-topic') || '';
-    const shopDomain = req.headers.get('x-shopify-shop-domain') || '';
+    payload = JSON.parse(rawBody);
+  } catch (e) {
+    console.error("[MF] JSON parse error", e);
+    return NextResponse.json({ ok: false }, { status: 400 });
+  }
 
-    if (!verifyShopifyHmac(rawBody, hmacHeader)) {
-      console.warn('[Webhook Shopify] HMAC invalide');
-      return new NextResponse('Invalid HMAC', { status: 401 });
-    }
+  try {
+    const prismaAny = prisma as any; // 👈 hack TS comme sur student/courses
 
-    // On ne traite que les commandes payées / créées
-    if (topic !== 'orders/paid' && topic !== 'orders/create') {
-      console.log('[Webhook Shopify] topic ignoré :', topic);
-      return NextResponse.json({ ok: true, ignored: true });
-    }
-
-    const payload = JSON.parse(rawBody);
-
-    const email: string | null =
-      payload.email || payload.customer?.email || null;
-
-    const shopifyCustomerId: string | null = payload.customer?.id
-      ? String(payload.customer.id)
-      : null;
-
-    const shopifyOrderId: string = String(payload.id);
+    const orderId = String(payload.id);
+    const customer = payload.customer || {};
+    const email = customer.email;
+    const shopifyCustomerId = customer.id ? String(customer.id) : null;
 
     if (!email) {
-      console.warn(
-        '[Webhook Shopify] Pas d’email sur la commande, on ignore.',
-        { shopDomain, shopifyOrderId }
+      console.warn("[MF] Order paid but missing email");
+      return NextResponse.json(
+        { ok: true, skipped: "no_email" },
+        { status: 200 }
       );
-      return NextResponse.json({ ok: true, skipped: 'no_email' });
     }
 
-    const lineItems: any[] = payload.line_items || [];
-    if (!lineItems.length) {
-      return NextResponse.json({ ok: true, skipped: 'no_line_items' });
-    }
-
-    let createdCount = 0;
+    const lineItems = payload.line_items || [];
+    const purchasedAt = new Date(
+      payload.processed_at || payload.created_at || new Date().toISOString()
+    );
 
     for (const li of lineItems) {
       const productId = li.product_id ? String(li.product_id) : null;
       const lineItemId = li.id ? String(li.id) : null;
+
       if (!productId) continue;
 
-      // 1) On vérifie si le product_id correspond à un Course
-      const course = await db.course.findUnique({
+      // 🔎 Trouver la formation liée au produit Shopify
+      const course = await prismaAny.course.findUnique({
         where: { shopifyProductId: productId },
       });
 
       if (!course) {
-        // Produit non géré par MarketFormation → on ignore
+        // Pas une formation MarketFormation : on ignore
         continue;
       }
 
-      // 2) Idempotence : on ne recrée pas si déjà présent
-      const existing = await db.studentCourse.findFirst({
+      // 🔁 Idempotence : vérifier si déjà enrôlé
+      const existing = await prismaAny.studentCourse.findFirst({
         where: {
+          studentEmail: email,
           courseId: course.id,
-          shopifyOrderId,
-          shopifyLineItemId: lineItemId,
+          shopifyOrderId: orderId,
+          shopifyLineItemId: lineItemId || undefined,
         },
       });
 
       if (existing) continue;
 
-      // 3) Création de l’inscription élève
-      await db.studentCourse.create({
+      // 🧑‍🎓 Créer l'enrôlement élève
+      await prismaAny.studentCourse.create({
         data: {
           studentEmail: email,
           shopifyCustomerId,
           courseId: course.id,
-          shopifyOrderId,
-          shopifyLineItemId: lineItemId,
-          status: 'IN_PROGRESS',
-          purchaseDate: payload.created_at
-            ? new Date(payload.created_at)
-            : new Date(),
+          shopifyOrderId: orderId,
+          shopifyLineItemId: lineItemId || null,
+          status: "IN_PROGRESS",
+          purchaseDate: purchasedAt,
         },
       });
-
-      createdCount += 1;
     }
 
-    console.log('[Webhook Shopify] Traitement terminé', {
-      shopDomain,
-      shopifyOrderId,
-      createdCount,
-    });
-
-    return NextResponse.json({ ok: true, created: createdCount });
+    return NextResponse.json({ ok: true }, { status: 200 });
   } catch (err) {
-    console.error('[Webhook Shopify] Erreur serveur', err);
-    return new NextResponse('Server error', { status: 500 });
+    console.error("[MF] Webhook orders error:", err);
+    // On renvoie 200 pour que Shopify ne spamme pas, mais on log l’erreur
+    return NextResponse.json({ ok: true, logged: true }, { status: 200 });
   }
 }
