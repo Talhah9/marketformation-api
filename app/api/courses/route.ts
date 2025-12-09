@@ -332,6 +332,13 @@ export async function POST(req: Request) {
         images: imageUrl ? [{ src: imageUrl }] : [],
         tags: ['mkt-course'],
         status,
+        // 🧠 Variante digitale : pas d’expédition, pas de TVA par défaut
+        variants: [
+          {
+            requires_shipping: false,
+            taxable: false,
+          },
+        ],
       },
     };
 
@@ -429,6 +436,7 @@ export async function POST(req: Request) {
       id: created.id,
       handle: created.handle,
       admin_url: `https://${process.env.SHOP_DOMAIN}/admin/products/${created.id}`,
+
     });
   } catch (e: any) {
     return jsonWithCors(
