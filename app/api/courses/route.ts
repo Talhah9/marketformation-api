@@ -4,6 +4,7 @@
 // Retourne aussi { plan, quota: { limit, used, remaining } } pour l'abonnement.
 
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
+import { prisma } from '@/lib/prisma';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -259,6 +260,7 @@ export async function GET(req: Request) {
    POST /api/courses
    → Création d’un produit (Course) + quota Starter
    + enregistre la thématique (mfapp.theme)
+   + crée / met à jour la Course en base Prisma
 ===================================================================== */
 export async function POST(req: Request) {
   try {
@@ -327,18 +329,11 @@ export async function POST(req: Request) {
     const productPayload = {
       product: {
         title,
-        body_html: description ? `<p>${description}</p>` : '',
+        body_html: description ? `<p>{description}</p>` : '',
         vendor: email,
         images: imageUrl ? [{ src: imageUrl }] : [],
         tags: ['mkt-course'],
         status,
-        // 🧠 Variante digitale : pas d’expédition, pas de TVA par défaut
-        variants: [
-          {
-            requires_shipping: false,
-            taxable: false,
-          },
-        ],
       },
     };
 
@@ -431,12 +426,65 @@ export async function POST(req: Request) {
       );
     }
 
+    // =====================================================
+    // 🔥 Création / mise à jour de la Course en base Prisma
+    // =====================================================
+    try {
+      const shopifyProductId = String(created.id);
+      const shopifyProductHandle = created.handle || null;
+      const shopifyProductTitle = created.title || title;
+
+      const mfThemeKey = themeHandleFinal || '';
+      const categoryLabel =
+        mfThemeKey && THEME_LABELS[mfThemeKey]
+          ? THEME_LABELS[mfThemeKey]
+          : null;
+
+      // Pour l’instant, on pointe vers la page produit Shopify
+      const accessUrl = shopifyProductHandle
+        ? `/products/${shopifyProductHandle}`
+        : '';
+
+      await (prisma as any).course.upsert({
+        where: {
+          shopifyProductId,
+        },
+        update: {
+          shopifyProductHandle,
+          shopifyProductTitle,
+          title,
+          subtitle: description || null,
+          imageUrl,
+          pdfUrl,
+          accessUrl,
+          categoryLabel,
+          trainerEmail: email,
+          trainerShopifyId: shopifyCustomerId ? String(shopifyCustomerId) : null,
+        },
+        create: {
+          shopifyProductId,
+          shopifyProductHandle,
+          shopifyProductTitle,
+          title,
+          subtitle: description || null,
+          imageUrl,
+          pdfUrl,
+          accessUrl,
+          categoryLabel,
+          trainerEmail: email,
+          trainerShopifyId: shopifyCustomerId ? String(shopifyCustomerId) : null,
+        },
+      });
+    } catch (e) {
+      console.error('[MF] prisma.course upsert error', e);
+      // On ne bloque pas la création produit côté Shopify si la BDD fail
+    }
+
     return jsonWithCors(req, {
       ok: true,
       id: created.id,
       handle: created.handle,
       admin_url: `https://${process.env.SHOP_DOMAIN}/admin/products/${created.id}`,
-
     });
   } catch (e: any) {
     return jsonWithCors(
