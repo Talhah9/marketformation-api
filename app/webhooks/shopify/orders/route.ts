@@ -82,14 +82,13 @@ export async function POST(req: Request) {
     shopifyCustomerId,
     shopifyOrderId,
     shopifyLineItemId: String(item.id),
-    shopifyProductId: productId,
-    shopifyProductTitle: String(item.name ?? ''),
     courseId: course.id,
     purchaseDate: order.created_at
       ? new Date(order.created_at)
-      : new Date(), // optionnel, mais propre
+      : new Date(),
   },
 });
+
 
         console.log('[MF][orders-webhook] ✅ StudentCourse created', {
           email,
