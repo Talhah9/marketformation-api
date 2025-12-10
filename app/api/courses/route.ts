@@ -334,6 +334,13 @@ export async function POST(req: Request) {
         images: imageUrl ? [{ src: imageUrl }] : [],
         tags: ['mkt-course'],
         status,
+        // ✅ On force le produit en digital : aucune expédition
+        variants: [
+          {
+            requires_shipping: false,
+            taxable: false,
+          },
+        ],
       },
     };
 
