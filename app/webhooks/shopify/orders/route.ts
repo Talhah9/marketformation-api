@@ -7,15 +7,26 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 /**
+ * Récupère le secret utilisé par Shopify pour signer les webhooks.
+ */
+function getWebhookSecret(): string {
+  return (
+    process.env.SHOPIFY_WEBHOOK_SECRET || // ton vrai secret de webhook
+    process.env.SHOPIFY_SHARED_SECRET ||  // fallback éventuel
+    ''
+  );
+}
+
+/**
  * Vérifie la signature HMAC envoyée par Shopify.
  * Typage volontairement large (any) pour éviter les erreurs TS avec Buffer.
  */
 function verifyShopifySignature(
   body: any,
   hmacHeader: string | null,
-  secret: string,
 ): boolean {
-  if (!hmacHeader || !secret) return false;
+  const secret = getWebhookSecret();
+  if (!secret || !hmacHeader) return false;
 
   const generated = crypto
     .createHmac('sha256', secret)
@@ -27,157 +38,94 @@ function verifyShopifySignature(
 
   if (safeGenerated.length !== safeHeader.length) return false;
 
-  // on caste en any pour contenter TypeScript
+  // cast en any pour éviter le bug ArrayBufferView
   return crypto.timingSafeEqual(
     safeGenerated as any,
     safeHeader as any,
   );
 }
 
-/**
- * Shopify enverra ici les webhooks "orders/create" (et éventuellement "orders/paid").
- * But : créer des entrées StudentCourse pour chaque produit qui correspond
- * à une formation (Course) dans ta base Prisma.
- */
 export async function POST(req: Request) {
-  const secret =
-    process.env.SHOPIFY_WEBHOOK_SECRET ||
-    process.env.SHOPIFY_WEBHOOK_SHARED_SECRET ||
-    process.env.SHOPIFY_API_SECRET_KEY ||
-    '';
-
-  if (!secret) {
-    console.error('[MF][webhook] Missing SHOPIFY_WEBHOOK_SECRET');
-    return new NextResponse('Missing secret', { status: 500 });
-  }
-
-  // On récupère le body brut pour la vérif HMAC
-  const arrayBuffer = await req.arrayBuffer();
-  const rawBody = Buffer.from(arrayBuffer);
-
+  // on lit le raw body pour la signature ET le JSON
+  const rawBody = await req.text();
   const hmacHeader = req.headers.get('x-shopify-hmac-sha256');
-  const topic      = req.headers.get('x-shopify-topic') || '';
-  const shopDomain = req.headers.get('x-shopify-shop-domain') || '';
 
-  if (!verifyShopifySignature(rawBody, hmacHeader, secret)) {
-    console.warn('[MF][webhook] Invalid signature from Shopify', { shopDomain, topic });
-    return new NextResponse('Invalid signature', { status: 401 });
+  if (!verifyShopifySignature(rawBody, hmacHeader)) {
+    console.warn('[MF][orders-webhook] invalid HMAC');
+    return NextResponse.json({ ok: false, error: 'invalid_hmac' }, { status: 401 });
   }
 
-  // On parse le JSON seulement après avoir vérifié la signature
-  let payload: any;
+  let order: any;
   try {
-    payload = JSON.parse(rawBody.toString('utf8'));
+    order = JSON.parse(rawBody);
   } catch (e) {
-    console.error('[MF][webhook] Unable to parse JSON payload', e);
-    return new NextResponse('Bad request', { status: 400 });
-  }
-
-  // On ne traite vraiment que les orders.*
-  if (!topic.startsWith('orders/')) {
-    console.log('[MF][webhook] Ignored topic', topic);
-    return new NextResponse('OK', { status: 200 });
+    console.error('[MF][orders-webhook] invalid JSON', e);
+    return NextResponse.json({ ok: false, error: 'invalid_json' }, { status: 400 });
   }
 
   try {
-    const prismaAny = prisma as any;
+    const email: string | null = order.email
+      ? String(order.email).toLowerCase().trim()
+      : null;
 
-    const orderId   = String(payload.id ?? '');
-    const createdAt = payload.created_at ? new Date(payload.created_at) : new Date();
+    const shopifyCustomerId: string | null = order.customer?.id
+      ? String(order.customer.id)
+      : null;
 
-    const customer  = payload.customer || {};
-    const email     = (customer.email || payload.email || '').toString().trim();
-    const customerId =
-      customer.id != null ? String(customer.id) : (payload.customer_id ? String(payload.customer_id) : null);
+    const shopifyOrderId   = String(order.id);
+    const shopifyOrderName = order.name ? String(order.name) : null;
 
-    const lineItems: any[] = Array.isArray(payload.line_items) ? payload.line_items : [];
-
-    if (!email || !lineItems.length) {
-      console.log('[MF][webhook] No email or no line items, nothing to create', {
-        orderId,
+    if (!Array.isArray(order.line_items) || !email) {
+      console.warn('[MF][orders-webhook] no line_items or email', {
         email,
-        lineItemsCount: lineItems.length,
+        line_items_count: order.line_items?.length || 0,
       });
-      return new NextResponse('OK', { status: 200 });
+      // 200 pour éviter les retries Shopify
+      return NextResponse.json({ ok: true, skipped: true });
     }
 
-    // On récupère tous les product_id de la commande
-    const productIds = Array.from(
-      new Set(
-        lineItems
-          .map((li) => li.product_id)
-          .filter((id) => id != null)
-          .map((id) => String(id)),
-      ),
-    );
-
-    if (!productIds.length) {
-      console.log('[MF][webhook] No product_ids in line items', { orderId });
-      return new NextResponse('OK', { status: 200 });
-    }
-
-    // On va chercher les Course correspondants dans Prisma
-    const courses = await prismaAny.course.findMany({
-      where: {
-        shopifyProductId: { in: productIds },
-      },
-    });
-
-    if (!courses.length) {
-      console.log('[MF][webhook] No matching courses for order', {
-        orderId,
-        productIds,
-      });
-      return new NextResponse('OK', { status: 200 });
-    }
-
-    const courseByProductId = new Map<string, any>();
-    for (const c of courses) {
-      courseByProductId.set(String(c.shopifyProductId), c);
-    }
-
-    const creations: any[] = [];
-
-    for (const li of lineItems) {
-      const productId = li.product_id != null ? String(li.product_id) : null;
-      const lineId    = li.id != null ? String(li.id) : null;
-
-      if (!productId || !courseByProductId.has(productId)) continue;
-
-      const course = courseByProductId.get(productId);
-
-      // (Pour l’instant on crée 1 StudentCourse par line item, pas par quantité)
-      creations.push({
-        studentEmail:      email,
-        shopifyCustomerId: customerId,
-        courseId:          course.id,
-        shopifyOrderId:    orderId,
-        shopifyLineItemId: lineId,
-        purchaseDate:      createdAt,
-        status:            'IN_PROGRESS',
-        archived:          false,
-      });
-    }
-
-    if (!creations.length) {
-      console.log('[MF][webhook] No line items mapped to courses', { orderId });
-      return new NextResponse('OK', { status: 200 });
-    }
-
-    await prismaAny.studentCourse.createMany({
-      data: creations,
-    });
-
-    console.log('[MF][webhook] StudentCourse created', {
-      orderId,
+    console.log('[MF][orders-webhook] processing order', {
       email,
-      count: creations.length,
+      order_id: shopifyOrderId,
+      line_items: order.line_items.length,
     });
 
-    return new NextResponse('OK', { status: 200 });
-  } catch (err) {
-    console.error('[MF][webhook] Internal error processing order', err);
-    // On renvoie quand même 200 pour éviter les retry infinis si bug côté nous
-    return new NextResponse('OK', { status: 200 });
+    for (const item of order.line_items as any[]) {
+      if (!item) continue;
+
+      // 🔎 heuristique : tes produits “formations” ont comme vendor l’email du formateur
+      const vendor = item.vendor ? String(item.vendor) : '';
+      const looksLikeCourse = vendor.includes('@');
+
+      if (!looksLikeCourse) {
+        continue;
+      }
+
+      try {
+        await (prisma as any).studentCourse.create({
+          data: {
+            studentEmail: email,
+            shopifyCustomerId,
+            shopifyOrderId,
+            shopifyOrderNumber: shopifyOrderName,
+            shopifyLineItemId: String(item.id),
+            shopifyProductId: item.product_id ? String(item.product_id) : null,
+            shopifyProductTitle: String(item.name ?? ''),
+            status: 'IN_PROGRESS', // enum Prisma
+          },
+        });
+      } catch (err) {
+        console.error('[MF][orders-webhook] prisma.studentCourse.create failed', {
+          order_id: shopifyOrderId,
+          line_item_id: item.id,
+          error: err,
+        });
+      }
+    }
+
+    return NextResponse.json({ ok: true });
+  } catch (e) {
+    console.error('[MF][orders-webhook] unexpected error', e);
+    return NextResponse.json({ ok: false, error: 'internal_error' }, { status: 500 });
   }
 }
