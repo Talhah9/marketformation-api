@@ -77,18 +77,20 @@ export async function POST(req: Request) {
 
       try {
         await (prisma as any).studentCourse.create({
-          data: {
-            studentEmail: email,
-            shopifyCustomerId,
-            shopifyOrderId,
-            shopifyOrderNumber: shopifyOrderName,
-            shopifyLineItemId: String(item.id),
-            shopifyProductId: productId,
-            shopifyProductTitle: String(item.name ?? ''),
-            courseId: course.id, // 🔗 liaison avec Course
-            // purchaseDate: new Date(order.created_at || Date.now()), // si tu as ce champ
-          },
-        });
+  data: {
+    studentEmail: email,
+    shopifyCustomerId,
+    shopifyOrderId,
+    shopifyLineItemId: String(item.id),
+    shopifyProductId: productId,
+    shopifyProductTitle: String(item.name ?? ''),
+    courseId: course.id,
+    purchaseDate: order.created_at
+      ? new Date(order.created_at)
+      : new Date(), // optionnel, mais propre
+  },
+});
+
         console.log('[MF][orders-webhook] ✅ StudentCourse created', {
           email,
           productId,
