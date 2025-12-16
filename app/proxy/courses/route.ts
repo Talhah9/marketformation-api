@@ -5,49 +5,61 @@ import crypto from 'crypto';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-function safeEqualHex(a: string, b: string) {
-  // timingSafeEqual exige même longueur
-  if (a.length !== b.length) return false;
+function verifyAppProxySignature(url: URL): boolean {
+  const secret =
+    process.env.APP_PROXY_SHARED_SECRET ||
+    process.env.SHOPIFY_APP_PROXY_SHARED_SECRET ||
+    '';
 
-  // Uint8Array = ArrayBufferView (TS happy)
-  const ua = new Uint8Array(Buffer.from(a, 'utf8'));
-  const ub = new Uint8Array(Buffer.from(b, 'utf8'));
-  return crypto.timingSafeEqual(ua, ub);
-}
-
-/** Vérifie la signature App Proxy Shopify */
-function verifyProxyHmac(req: NextRequest) {
-  const secret = process.env.APP_PROXY_SHARED_SECRET || '';
   if (!secret) return false;
 
-  const url = new URL(req.url);
-  const params = new URLSearchParams(url.search);
+  const signature = (url.searchParams.get('signature') || '').trim();
+  if (!signature) return false;
 
-  const provided = params.get('hmac') || '';
-  params.delete('hmac');
-  params.delete('signature'); // legacy
+  // params sans signature, triés
+  const pairs: string[] = [];
+  url.searchParams.forEach((value, key) => {
+    if (key === 'signature') return;
+    pairs.push(`${key}=${value}`);
+  });
+  pairs.sort((a, b) => a.localeCompare(b));
 
-  const message = params.toString();
+  const message = pairs.join('&');
   const digest = crypto.createHmac('sha256', secret).update(message).digest('hex');
 
-  try {
-    return safeEqualHex(digest, provided);
-  } catch {
-    return false;
-  }
+  // ✅ comparaison simple (évite Buffer / timingSafeEqual)
+  return digest.toLowerCase() === signature.toLowerCase();
+}
+
+function withCors(res: NextResponse, req: NextRequest) {
+  const origin = req.headers.get('origin') || '*';
+  res.headers.set('Access-Control-Allow-Origin', origin);
+  res.headers.set('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  res.headers.set('Access-Control-Allow-Headers', 'Origin, Accept, Content-Type, Authorization');
+  res.headers.set('Access-Control-Allow-Credentials', 'true');
+  res.headers.set('Vary', 'Origin');
+  return res;
+}
+
+export async function OPTIONS(req: NextRequest) {
+  return withCors(new NextResponse(null, { status: 204 }), req);
 }
 
 export async function GET(req: NextRequest) {
-  if (!verifyProxyHmac(req)) {
-    return NextResponse.json({ ok: false, error: 'unauthorized' }, { status: 401 });
+  const url = new URL(req.url);
+
+  if (!verifyAppProxySignature(url)) {
+    return withCors(
+      NextResponse.json({ ok: false, error: 'unauthorized' }, { status: 401 }),
+      req,
+    );
   }
 
-  const incoming = new URL(req.url);
+  const email = url.searchParams.get('email') || '';
+  const shopifyCustomerId = url.searchParams.get('shopifyCustomerId') || '';
 
-  const email = (incoming.searchParams.get('email') || '').trim();
-  const shopifyCustomerId = (incoming.searchParams.get('shopifyCustomerId') || '').trim();
-
-  const base = `${incoming.protocol}//${incoming.host}`;
+  // forward vers /api/courses (server-side)
+  const base = `${url.protocol}//${url.host}`;
   const target = new URL(`${base}/api/courses`);
   if (email) target.searchParams.set('email', email);
   if (shopifyCustomerId) target.searchParams.set('shopifyCustomerId', shopifyCustomerId);
@@ -58,13 +70,6 @@ export async function GET(req: NextRequest) {
     cache: 'no-store',
   });
 
-  const text = await r.text();
-  let json: any = {};
-  try {
-    json = text ? JSON.parse(text) : {};
-  } catch {
-    json = { ok: false, error: 'bad_json', raw: text };
-  }
-
-  return NextResponse.json(json, { status: r.status });
+  const data = await r.json().catch(() => ({}));
+  return withCors(NextResponse.json(data, { status: r.status }), req);
 }
