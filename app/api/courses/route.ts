@@ -66,7 +66,9 @@ async function getProductMetafieldValue(
   namespace: string,
   key: string,
 ) {
-  const r = await shopifyFetch(`/products/${productId}/metafields.json?limit=250`);
+  const r = await shopifyFetch(
+    `/products/${productId}/metafields.json?limit=250`,
+  );
   if (!r.ok) return null;
   const arr = (r.json as any)?.metafields || [];
   const mf = arr.find((m: any) => m?.namespace === namespace && m?.key === key);
@@ -95,7 +97,9 @@ async function upsertProductMetafield(
 }
 
 /* ===== Collection resolve ===== */
-async function resolveCollectionId(handleOrId?: string | number): Promise<number | null> {
+async function resolveCollectionId(
+  handleOrId?: string | number,
+): Promise<number | null> {
   if (!handleOrId) return null;
 
   const num = Number(handleOrId);
@@ -160,6 +164,42 @@ async function countPublishedThisMonthByMetafield(email: string) {
   return count;
 }
 
+/* ===== NEW: sanitize helpers for sync fields ===== */
+function cleanStr(v: any, max = 180) {
+  return String(v ?? '').trim().slice(0, max);
+}
+function cleanList(arr: any, maxItems = 12, maxLen = 180) {
+  if (!Array.isArray(arr)) return [];
+  const out = arr.map((x) => cleanStr(x, maxLen)).filter(Boolean);
+  return out.slice(0, maxItems);
+}
+
+/**
+ * ✅ FIX: accepte aussi une liste de strings (ta nouvelle page envoie des lignes),
+ * et/ou une liste d’objets {title, meta, desc} (si tu évolues plus tard).
+ */
+function cleanModules(arr: any, maxItems = 30) {
+  if (!Array.isArray(arr)) return [];
+
+  const out: Array<{ title: string; meta?: string; desc?: string }> = [];
+
+  for (const m of arr) {
+    if (typeof m === 'string') {
+      const t = cleanStr(m, 180);
+      if (t) out.push({ title: t });
+      continue;
+    }
+    if (m && typeof m === 'object') {
+      const title = cleanStr(m?.title, 140);
+      const meta = cleanStr(m?.meta, 80);
+      const desc = cleanStr(m?.desc, 600);
+      if (title) out.push({ title, meta, desc });
+    }
+  }
+
+  return out.slice(0, maxItems);
+}
+
 /* ===== OPTIONS (CORS) ===== */
 export async function OPTIONS(req: Request) {
   return handleOptions(req);
@@ -184,7 +224,9 @@ export async function GET(req: Request) {
     const email = (url.searchParams.get('email') || '').trim();
     const vendor = email || 'unknown@vendor';
 
-    const r = await shopifyFetch(`/products.json?vendor=${encodeURIComponent(vendor)}&limit=250`);
+    const r = await shopifyFetch(
+      `/products.json?vendor=${encodeURIComponent(vendor)}&limit=250`,
+    );
     if (!r.ok) {
       return jsonWithCors(
         req,
@@ -195,10 +237,13 @@ export async function GET(req: Request) {
 
     const products = (r.json as any)?.products || [];
 
-    // 🔥 on enrichit chaque produit avec la thématique (mfapp.theme)
     const items = await Promise.all(
       products.map(async (p: any) => {
-        const themeHandleRaw = await getProductMetafieldValue(p.id, 'mfapp', 'theme');
+        const themeHandleRaw = await getProductMetafieldValue(
+          p.id,
+          'mfapp',
+          'theme',
+        );
         const mf_theme = String(themeHandleRaw || '').trim();
         const theme_label =
           mf_theme && THEME_LABELS[mf_theme] ? THEME_LABELS[mf_theme] : '';
@@ -216,7 +261,6 @@ export async function GET(req: Request) {
       }),
     );
 
-    /* ==== QUOTA pour abonnement ==== */
     let plan: 'Starter' | 'Pro' | 'Business' | 'Unknown' = 'Unknown';
     let quota: any = null;
 
@@ -232,21 +276,11 @@ export async function GET(req: Request) {
           remaining: Math.max(0, 3 - used),
         };
       } else {
-        quota = {
-          plan,
-          limit: null,
-          used: null,
-          remaining: null,
-        };
+        quota = { plan, limit: null, used: null, remaining: null };
       }
     }
 
-    return jsonWithCors(req, {
-      ok: true,
-      items,
-      plan,
-      quota,
-    });
+    return jsonWithCors(req, { ok: true, items, plan, quota });
   } catch (e: any) {
     return jsonWithCors(
       req,
@@ -261,6 +295,7 @@ export async function GET(req: Request) {
    → Création d’un produit (Course) + quota Starter
    + enregistre la thématique (mfapp.theme)
    + crée / met à jour la Course en base Prisma
+   + écrit les champs synchronisés pour la fiche produit
 ===================================================================== */
 export async function POST(req: Request) {
   try {
@@ -282,22 +317,43 @@ export async function POST(req: Request) {
       title,
       description,
       imageUrl,
+
+      // ✅ FIX: récupérer le prix (front "compte formateur" + nouvelle page)
+      price,
+
       pdfUrl: pdfUrlRaw,
       pdf_url,
       status = 'active',
       collectionId,
       collectionHandle,
       collectionHandleOrId,
-      // éventuellement envoyé par le front
+
       theme,
       themeHandle,
       mf_theme,
+
+      // ✅ FIX: ton nouveau front envoie mfapp:{...}
+      mfapp,
+
+      // compat: anciens champs top-level si tu en as encore quelque part
+      subtitle,
+      learn,
+      modules,
+      audience,
+      duration_text,
+      level_text,
+      language_text,
+      requirements,
     } = body || {};
 
     const pdfUrl = String(pdfUrlRaw || pdf_url || '').trim();
 
     if (!email || !title || !imageUrl || !pdfUrl) {
-      return jsonWithCors(req, { ok: false, error: 'missing fields' }, { status: 400 });
+      return jsonWithCors(
+        req,
+        { ok: false, error: 'missing fields' },
+        { status: 400 },
+      );
     }
 
     if (!/^https?:\/\//i.test(pdfUrl)) {
@@ -325,20 +381,31 @@ export async function POST(req: Request) {
       }
     }
 
+    // ✅ FIX: normaliser prix Shopify (string "12.34")
+    let priceStr = '';
+    if (price !== undefined && price !== null && String(price).trim() !== '') {
+      const n = Number(price);
+      if (!Number.isNaN(n) && n >= 0) priceStr = n.toFixed(2);
+      else priceStr = String(price).trim();
+    }
+
     /* Création produit */
     const productPayload = {
       product: {
         title,
-        body_html: description ? `<p>{description}</p>` : '',
+        body_html: description ? `<p>${description}</p>` : '',
         vendor: email,
         images: imageUrl ? [{ src: imageUrl }] : [],
         tags: ['mkt-course'],
         status,
-        // ✅ On force le produit en digital : aucune expédition
+
         variants: [
           {
             requires_shipping: false,
             taxable: false,
+
+            // ✅ FIX: on met le prix directement sur le variant si fourni
+            ...(priceStr ? { price: priceStr } : {}),
           },
         ],
       },
@@ -379,13 +446,7 @@ export async function POST(req: Request) {
         String(shopifyCustomerId),
       );
     }
-    await upsertProductMetafield(
-      created.id,
-      'mkt',
-      'pdf_url',
-      'url',
-      pdfUrl,
-    );
+    await upsertProductMetafield(created.id, 'mkt', 'pdf_url', 'url', pdfUrl);
 
     /* Marquage quota */
     if (status === 'active') {
@@ -405,12 +466,9 @@ export async function POST(req: Request) {
     let themeHandleFinal =
       (mf_theme || themeHandle || theme || '').toString().trim() || '';
 
-    // si pas de theme explicite mais un handle de collection texte, on l'utilise
     if (!themeHandleFinal && selector && typeof selector === 'string') {
       const isNumeric = /^[0-9]+$/.test(selector);
-      if (!isNumeric) {
-        themeHandleFinal = selector.trim();
-      }
+      if (!isNumeric) themeHandleFinal = selector.trim();
     }
 
     if (selector) {
@@ -422,7 +480,6 @@ export async function POST(req: Request) {
       }
     }
 
-    // 🔥 on persiste aussi la thématique pour la page publique
     if (themeHandleFinal) {
       await upsertProductMetafield(
         created.id,
@@ -434,7 +491,140 @@ export async function POST(req: Request) {
     }
 
     // =====================================================
-    // 🔥 Création / mise à jour de la Course en base Prisma
+    // ✅ Synchro fiche produit (Udemy-like)
+    // - support mfapp:{} (nouvelle page)
+    // - support anciens champs top-level (compat)
+    // =====================================================
+    try {
+      const mf = (mfapp && typeof mfapp === 'object') ? mfapp : {};
+
+      const subtitleFinal =
+        cleanStr(mf.subtitle ?? subtitle, 600);
+
+      const formatFinal =
+        cleanStr(mf.format ?? '', 60);
+
+      const levelFinal =
+        cleanStr(mf.level ?? level_text ?? '', 80);
+
+      const durationFinal =
+        cleanStr(mf.duration ?? duration_text ?? '', 80);
+
+      const learnArr = cleanList(mf.learn ?? learn, 12, 160);
+      const audienceArr = cleanList(mf.audience ?? audience, 12, 160);
+      const includesArr = cleanList(mf.includes ?? [], 12, 160);
+      const reqArr = cleanList(requirements, 10, 160);
+
+      // modules: strings (nouvelle page) ou objets (plus tard)
+      const modulesArr = cleanModules(mf.modules ?? modules, 30);
+
+      if (subtitleFinal) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'subtitle',
+          'multi_line_text_field',
+          subtitleFinal,
+        );
+      }
+
+      if (formatFinal) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'format',
+          'single_line_text_field',
+          formatFinal,
+        );
+      }
+
+      if (durationFinal) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'duration',
+          'single_line_text_field',
+          durationFinal,
+        );
+      }
+
+      if (levelFinal) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'level',
+          'single_line_text_field',
+          levelFinal,
+        );
+      }
+
+      // si tu utilises language_text ailleurs, on le garde
+      if (language_text && String(language_text).trim()) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'language_text',
+          'single_line_text_field',
+          cleanStr(language_text, 60),
+        );
+      }
+
+      if (learnArr.length) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'learn',
+          'json',
+          JSON.stringify(learnArr),
+        );
+      }
+
+      if (modulesArr.length) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'modules',
+          'json',
+          JSON.stringify(modulesArr),
+        );
+      }
+
+      if (audienceArr.length) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'audience',
+          'json',
+          JSON.stringify(audienceArr),
+        );
+      }
+
+      if (includesArr.length) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'includes',
+          'json',
+          JSON.stringify(includesArr),
+        );
+      }
+
+      if (reqArr.length) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'requirements',
+          'json',
+          JSON.stringify(reqArr),
+        );
+      }
+    } catch (e) {
+      console.error('[MF] sync metafields error', e);
+      // On ne bloque pas la création si un metafield sync échoue
+    }
+
+    // =====================================================
+    // Prisma (on garde le comportement + améliore subtitle si fourni)
     // =====================================================
     try {
       const shopifyProductId = String(created.id);
@@ -443,24 +633,22 @@ export async function POST(req: Request) {
 
       const mfThemeKey = themeHandleFinal || '';
       const categoryLabel =
-        mfThemeKey && THEME_LABELS[mfThemeKey]
-          ? THEME_LABELS[mfThemeKey]
-          : null;
+        mfThemeKey && THEME_LABELS[mfThemeKey] ? THEME_LABELS[mfThemeKey] : null;
 
-      // Pour l’instant, on pointe vers la page produit Shopify
-      const accessUrl = shopifyProductHandle
-        ? `/products/${shopifyProductHandle}`
-        : '';
+      const accessUrl = shopifyProductHandle ? `/products/${shopifyProductHandle}` : '';
+
+      // ✅ FIX: si un vrai subtitle existe, on le met, sinon on garde l’existant
+      const mf = (mfapp && typeof mfapp === 'object') ? mfapp : {};
+      const subtitleFinal =
+        (String(mf.subtitle ?? subtitle ?? '').trim()) || (description || null);
 
       await (prisma as any).course.upsert({
-        where: {
-          shopifyProductId,
-        },
+        where: { shopifyProductId },
         update: {
           shopifyProductHandle,
           shopifyProductTitle,
           title,
-          subtitle: description || null,
+          subtitle: subtitleFinal,
           imageUrl,
           pdfUrl,
           accessUrl,
@@ -473,7 +661,7 @@ export async function POST(req: Request) {
           shopifyProductHandle,
           shopifyProductTitle,
           title,
-          subtitle: description || null,
+          subtitle: subtitleFinal,
           imageUrl,
           pdfUrl,
           accessUrl,
@@ -484,7 +672,6 @@ export async function POST(req: Request) {
       });
     } catch (e) {
       console.error('[MF] prisma.course upsert error', e);
-      // On ne bloque pas la création produit côté Shopify si la BDD fail
     }
 
     return jsonWithCors(req, {
@@ -500,4 +687,21 @@ export async function POST(req: Request) {
       { status: 500 },
     );
   }
+}
+
+// (tes helpers en bas ne gênaient pas, je les laisse si tu veux, mais ils ne sont pas utilisés ici)
+function mfText(ns: string, key: string, value?: string) {
+  const v = (value || '').trim();
+  if (!v) return null;
+  return { namespace: ns, key, type: 'single_line_text_field', value: v };
+}
+function mfUrl(ns: string, key: string, value?: string) {
+  const v = (value || '').trim();
+  if (!v) return null;
+  return { namespace: ns, key, type: 'url', value: v };
+}
+function mfJson(ns: string, key: string, value: any) {
+  if (value == null) return null;
+  if (Array.isArray(value) && value.length === 0) return null;
+  return { namespace: ns, key, type: 'json', value: JSON.stringify(value) };
 }
