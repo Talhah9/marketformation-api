@@ -1,50 +1,51 @@
 // app/api/_lib/proxy.ts
-import crypto from 'crypto';
-import type { NextRequest } from 'next/server';
+import { NextRequest } from 'next/server';
+import { createHmac } from 'crypto';
 
-function getProxySecret() {
-  return (
-    process.env.APP_PROXY_SHARED_SECRET ||
-    process.env.SHOPIFY_APP_PROXY_SECRET ||
-    ''
-  );
+function timingSafeEqualStr(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let out = 0;
+  for (let i = 0; i < a.length; i++) {
+    out |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return out === 0;
 }
 
-/**
- * Shopify App Proxy signature verification.
- * Shopify sends a `signature` query param (hex).
- * We re-build the message from all query params except `signature`, sorted by key.
- */
-export function verifyAppProxySignature(req: NextRequest): boolean {
-  const secret = getProxySecret();
+export function verifyShopifyAppProxy(req: NextRequest): boolean {
+  const secret =
+    process.env.APP_PROXY_SHARED_SECRET ||
+    process.env.SHOPIFY_APP_PROXY_SECRET ||
+    '';
+
   if (!secret) return false;
 
   const url = new URL(req.url);
-  const sig = url.searchParams.get('signature') || '';
-  if (!sig) return false;
+  const signature = url.searchParams.get('signature') || '';
+  if (!signature) return false;
 
-  // collect params except signature
-  const pairs: Array<[string, string]> = [];
+  // Rebuild message = concat key=value (sorted) excluding signature
+  const entries: Array<[string, string]> = [];
   url.searchParams.forEach((value, key) => {
     if (key === 'signature') return;
-    pairs.push([key, value]);
+    entries.push([key, value]);
   });
+  entries.sort((a, b) => a[0].localeCompare(b[0]));
 
-  // sort by key (Shopify requirement)
-  pairs.sort((a, b) => a[0].localeCompare(b[0]));
+  const message = entries.map(([k, v]) => `${k}=${v}`).join('');
 
-  // build message: key=valuekey=value...
-  const message = pairs.map(([k, v]) => `${k}=${v}`).join('');
+  const digest = createHmac('sha256', secret).update(message, 'utf8').digest('hex');
 
-  const digestHex = crypto
-    .createHmac('sha256', secret)
-    .update(message)
-    .digest('hex');
+  return timingSafeEqualStr(digest, signature);
+}
 
-  // constant-time compare (TS-safe)
-  const a = Buffer.from(digestHex, 'hex');
-  const b = Buffer.from(sig, 'hex');
-  if (a.length !== b.length) return false;
-
-  return crypto.timingSafeEqual(new Uint8Array(a), new Uint8Array(b));
+export function proxyCorsHeaders(origin?: string | null) {
+  const o = origin || '*';
+  return {
+    'Access-Control-Allow-Origin': o,
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Headers':
+      'Origin, Accept, Content-Type, Authorization, X-Requested-With',
+    'Access-Control-Allow-Credentials': 'true',
+    Vary: 'Origin',
+  };
 }
