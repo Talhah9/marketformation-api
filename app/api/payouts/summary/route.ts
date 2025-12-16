@@ -1,4 +1,3 @@
-// app/proxy/payouts/summary/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
 import { prisma } from '@/lib/prisma';
@@ -6,10 +5,16 @@ import { prisma } from '@/lib/prisma';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-/**
- * Vérifie la signature Shopify App Proxy.
- * Shopify appelle /apps/mf/... → ton backend reçoit /proxy/... avec ?signature=...
- */
+function withCors(res: NextResponse, req: NextRequest) {
+  const origin = req.headers.get('origin') || '*';
+  res.headers.set('Access-Control-Allow-Origin', origin);
+  res.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.headers.set('Access-Control-Allow-Headers', 'Origin, Accept, Content-Type, Authorization, X-Requested-With');
+  res.headers.set('Access-Control-Allow-Credentials', 'true');
+  res.headers.set('Vary', 'Origin');
+  return res;
+}
+
 function verifyShopifyAppProxy(req: NextRequest): boolean {
   const secret = process.env.APP_PROXY_SHARED_SECRET || '';
   if (!secret) return false;
@@ -18,7 +23,6 @@ function verifyShopifyAppProxy(req: NextRequest): boolean {
   const sig = url.searchParams.get('signature') || '';
   if (!sig) return false;
 
-  // Recrée le message: concat key=value (sans signature), trié par key
   const pairs: Array<[string, string]> = [];
   url.searchParams.forEach((value, key) => {
     if (key === 'signature') return;
@@ -33,11 +37,10 @@ function verifyShopifyAppProxy(req: NextRequest): boolean {
   const b = Buffer.from(sig, 'hex');
   if (a.length !== b.length) return false;
 
-  // ✅ Fix TS Buffer vs ArrayBufferView
+  // TS-safe
   return crypto.timingSafeEqual(new Uint8Array(a), new Uint8Array(b));
 }
 
-// Petit helper pour masquer l’IBAN côté front
 function maskIban(iban: string | null | undefined): string | null {
   if (!iban) return null;
   const clean = iban.replace(/\s+/g, '');
@@ -45,45 +48,47 @@ function maskIban(iban: string | null | undefined): string | null {
   return clean.slice(0, 4) + ' •• •• •• ' + clean.slice(-4);
 }
 
+export async function OPTIONS(req: NextRequest) {
+  return withCors(new NextResponse(null, { status: 204 }), req);
+}
+
+// Shopify / certains scripts peuvent appeler en POST → on supporte aussi
+export async function POST(req: NextRequest) {
+  return GET(req);
+}
+
 export async function GET(req: NextRequest) {
   try {
-    // 1) Vérif signature App Proxy
     if (!verifyShopifyAppProxy(req)) {
-      return NextResponse.json({ ok: false, error: 'unauthorized' }, { status: 401 });
+      return withCors(
+        NextResponse.json({ ok: false, error: 'unauthorized' }, { status: 401 }),
+        req
+      );
     }
 
-    // 2) Récup params (ton front ajoute email + shopifyCustomerId)
     const url = new URL(req.url);
     const email = (url.searchParams.get('email') || '').trim();
     const trainerId = (url.searchParams.get('shopifyCustomerId') || '').trim();
 
     if (!trainerId) {
-      return NextResponse.json(
-        { ok: false, error: 'missing_trainerId' },
-        { status: 400 }
+      return withCors(
+        NextResponse.json({ ok: false, error: 'missing_trainerId' }, { status: 400 }),
+        req
       );
     }
 
-    // 3) On s’assure qu’un TrainerBanking existe
     const banking = await prisma.trainerBanking.upsert({
       where: { trainerId },
       update: { email: email || undefined },
       create: { trainerId, email: email || null },
     });
 
-    // 4) Résumé payouts
     const summary = await prisma.payoutsSummary.upsert({
       where: { trainerId },
       update: {},
-      create: {
-        trainerId,
-        availableAmount: 0,
-        pendingAmount: 0,
-        currency: 'EUR',
-      },
+      create: { trainerId, availableAmount: 0, pendingAmount: 0, currency: 'EUR' },
     });
 
-    // 5) Historique (20 derniers)
     const history = await prisma.payoutsHistory.findMany({
       where: { trainerId },
       orderBy: { date: 'desc' },
@@ -105,15 +110,12 @@ export async function GET(req: NextRequest) {
       meta: item.meta ?? null,
     }));
 
-    // ✅ compat front “graph + kpi”
     const available_cents = Number(summary.availableAmount || 0);
     const pending_cents = Number(summary.pendingAmount || 0);
 
-    return NextResponse.json(
+    const res = NextResponse.json(
       {
         ok: true,
-
-        // legacy / UI banking
         currency: summary.currency,
         available: available_cents,
         pending: pending_cents,
@@ -128,7 +130,7 @@ export async function GET(req: NextRequest) {
         },
         history: historyPayload,
 
-        // ✅ champs attendus par ton script profil (fallback si pas encore branché Stripe)
+        // compat script
         available_cents,
         pending_cents,
         total_revenue_cents: 0,
@@ -137,8 +139,13 @@ export async function GET(req: NextRequest) {
       },
       { status: 200 }
     );
+
+    return withCors(res, req);
   } catch (err) {
-    console.error('[MF] /proxy/payouts/summary GET error', err);
-    return NextResponse.json({ ok: false, error: 'server_error' }, { status: 500 });
+    console.error('[MF] /proxy/payouts/summary error', err);
+    return withCors(
+      NextResponse.json({ ok: false, error: 'server_error' }, { status: 500 }),
+      req
+    );
   }
 }
