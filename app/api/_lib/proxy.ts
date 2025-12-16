@@ -1,57 +1,42 @@
-// app/api/_lib/proxy.ts
-import { NextRequest } from 'next/server';
-import { createHmac, timingSafeEqual } from 'crypto';
+import crypto from "crypto";
+import { NextRequest } from "next/server";
 
-export type ProxyAuth =
-  | { ok: true; shop: string | null; loggedInCustomerId: string | null }
-  | { ok: false; error: 'unauthorized'; reason: string };
-
-function safeEq(a: string, b: string) {
-  // ✅ Fix TS Buffer/ArrayBufferView : on compare des Uint8Array
-  const aa = new Uint8Array(Buffer.from(a, 'utf8'));
-  const bb = new Uint8Array(Buffer.from(b, 'utf8'));
-  if (aa.length !== bb.length) return false;
-  return timingSafeEqual(aa, bb);
-}
-
-export function verifyShopifyAppProxy(req: NextRequest): ProxyAuth {
+/**
+ * Vérifie la signature Shopify App Proxy.
+ * Nécessite APP_PROXY_SHARED_SECRET (le secret "App proxy" de Shopify).
+ */
+export function verifyShopifyAppProxy(req: NextRequest): boolean {
   const secret =
     process.env.APP_PROXY_SHARED_SECRET ||
     process.env.SHOPIFY_APP_PROXY_SECRET ||
-    '';
+    "";
 
-  if (!secret) {
-    return { ok: false, error: 'unauthorized', reason: 'missing_APP_PROXY_SHARED_SECRET' };
-  }
+  if (!secret) return false;
 
   const url = new URL(req.url);
-  const params = Array.from(url.searchParams.entries());
+  const signature = url.searchParams.get("signature");
+  if (!signature) return false;
 
-  const signature = url.searchParams.get('signature') || '';
-  if (!signature) {
-    return { ok: false, error: 'unauthorized', reason: 'missing_signature' };
-  }
+  // Shopify signe tous les params sauf "signature"
+  const params: [string, string][] = [];
+  url.searchParams.forEach((value, key) => {
+    if (key === "signature") return;
+    params.push([key, value]);
+  });
 
-  // Shopify App Proxy signing:
-  // - take all query params except "signature"
-  // - sort by key lexicographically
-  // - concatenate as "key=value" (no separators)
-  // - HMAC-SHA256 hex with shared secret
-  const basePairs = params
-    .filter(([k]) => k !== 'signature')
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([k, v]) => `${k}=${v}`)
-    .join('');
+  params.sort((a, b) => a[0].localeCompare(b[0]));
 
-  const computed = createHmac('sha256', secret).update(basePairs).digest('hex');
+  const message = params.map(([k, v]) => `${k}=${v}`).join("");
 
-  if (!safeEq(computed, signature)) {
-    return { ok: false, error: 'unauthorized', reason: 'bad_signature' };
-  }
+  const generated = crypto
+    .createHmac("sha256", secret)
+    .update(message)
+    .digest("hex");
 
-  return {
-    ok: true,
-    shop: url.searchParams.get('shop'),
-    loggedInCustomerId: url.searchParams.get('logged_in_customer_id'),
-  };
+  // TS-safe timing compare (évite ton erreur Buffer/ArrayBufferView)
+  const a = new Uint8Array(Buffer.from(signature, "utf8"));
+  const b = new Uint8Array(Buffer.from(generated, "utf8"));
+  if (a.length !== b.length) return false;
+
+  return crypto.timingSafeEqual(a, b);
 }
