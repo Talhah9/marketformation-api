@@ -1,51 +1,38 @@
 // app/api/_lib/proxy.ts
 import crypto from 'crypto';
-import { NextRequest } from 'next/server';
+import type { NextRequest } from 'next/server';
 
-function toU8(s: string) {
-  return new TextEncoder().encode(s);
-}
-
-function safeEqual(a: string, b: string) {
-  // compare constant-time
-  const aa = toU8(a);
-  const bb = toU8(b);
-  if (aa.length !== bb.length) return false;
-  return crypto.timingSafeEqual(aa, bb);
-}
-
-/**
- * Vérifie la signature Shopify App Proxy.
- * Shopify calcule la signature sur :
- * - tous les query params SAUF "signature"
- * - triés par clé
- * - concaténés "key=value" (sans &)
- * HMAC-SHA256(secret) en HEX
- */
-export function verifyShopifyAppProxy(req: NextRequest) {
+export function verifyShopifyAppProxy(req: NextRequest): boolean {
   const secret =
     process.env.APP_PROXY_SHARED_SECRET ||
     process.env.SHOPIFY_APP_PROXY_SHARED_SECRET ||
     '';
 
-  if (!secret) return { ok: false, error: 'missing_shared_secret' as const };
+  if (!secret) return false;
 
   const url = new URL(req.url);
   const signature = url.searchParams.get('signature') || '';
+  if (!signature) return false;
 
-  if (!signature) return { ok: false, error: 'missing_signature' as const };
+  // Build message: sort all params except "signature"
+  const pairs: string[] = [];
+  url.searchParams.forEach((value, key) => {
+    if (key === 'signature') return;
+    pairs.push(`${key}=${value}`);
+  });
+  pairs.sort();
+  const message = pairs.join('');
 
-  const pairs = Array.from(url.searchParams.entries())
-    .filter(([k]) => k !== 'signature')
-    .sort(([a], [b]) => a.localeCompare(b));
-
-  const message = pairs.map(([k, v]) => `${k}=${v}`).join('');
-
-  const expected = crypto
+  const digest = crypto
     .createHmac('sha256', secret)
-    .update(message)
+    .update(message, 'utf8')
     .digest('hex');
 
-  const ok = safeEqual(expected, signature);
-  return ok ? { ok: true as const } : { ok: false as const, error: 'bad_signature' as const };
+  // ✅ TS-safe timing compare (no Buffer)
+  const enc = new TextEncoder();
+  const a = enc.encode(digest);
+  const b = enc.encode(signature);
+
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
 }

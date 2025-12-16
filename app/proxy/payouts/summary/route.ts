@@ -1,41 +1,40 @@
-// app/api/_lib/proxy.ts
-import crypto from 'crypto';
-import type { NextRequest } from 'next/server';
+// app/proxy/payouts/summary/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import { verifyShopifyAppProxy } from '@/app/api/_lib/proxy';
 
-function getProxySecret() {
-  return (
-    process.env.APP_PROXY_SHARED_SECRET ||
-    process.env.SHOPIFY_APP_PROXY_SECRET ||
-    ''
-  );
-}
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-export function verifyShopifyAppProxy(req: NextRequest): boolean {
-  const secret = getProxySecret();
-  if (!secret) return false;
+export async function GET(req: NextRequest) {
+  if (!verifyShopifyAppProxy(req)) {
+    return NextResponse.json({ ok: false, error: 'unauthorized' }, { status: 401 });
+  }
 
   const url = new URL(req.url);
-  const sig = url.searchParams.get('signature') || '';
-  if (!sig) return false;
+  const email = url.searchParams.get('email') || '';
+  const shopifyCustomerId = url.searchParams.get('shopifyCustomerId') || '';
 
-  // message = query params (sans signature), triés par key, concat "k=v"
-  const pairs: Array<[string, string]> = [];
-  url.searchParams.forEach((value, key) => {
-    if (key === 'signature') return;
-    pairs.push([key, value]);
+  const base = `${url.protocol}//${url.host}`;
+  const target = new URL('/api/payouts/summary', base);
+
+  // IMPORTANT : ton /api/payouts/summary utilise getTrainerFromRequest()
+  // donc on lui passe ce qu’il attend via headers
+  const r = await fetch(target.toString(), {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+      'x-trainer-id': shopifyCustomerId,
+      'x-trainer-email': email,
+    },
+    cache: 'no-store',
   });
-  pairs.sort((a, b) => a[0].localeCompare(b[0]));
-  const message = pairs.map(([k, v]) => `${k}=${v}`).join('');
 
-  const digestHex = crypto
-    .createHmac('sha256', secret)
-    .update(message)
-    .digest('hex');
-
-  // TS-safe timing compare
-  const a = Buffer.from(digestHex, 'hex');
-  const b = Buffer.from(sig, 'hex');
-  if (a.length !== b.length) return false;
-
-  return crypto.timingSafeEqual(new Uint8Array(a), new Uint8Array(b));
+  const text = await r.text();
+  return new NextResponse(text, {
+    status: r.status,
+    headers: {
+      'Content-Type': 'application/json',
+      'Cache-Control': 'no-store',
+    },
+  });
 }

@@ -2,9 +2,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { verifyShopifyAppProxy } from '@/app/api/_lib/proxy';
 
-export async function GET(req: NextRequest) {
-  const v = verifyShopifyAppProxy(req);
-  if (!v.ok) return NextResponse.json({ ok: false, error: v.error }, { status: 401 });
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-  return NextResponse.json({ ok: true, pong: true, ts: Date.now() }, { status: 200 });
+export async function GET(req: NextRequest) {
+  const ok = verifyShopifyAppProxy(req);
+  return NextResponse.json({ ok, pong: true, ts: Date.now() }, { status: 200 });
 }
