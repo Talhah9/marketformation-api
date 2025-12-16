@@ -1,62 +1,77 @@
-// app/api/payouts/summary/route.ts
-import { NextRequest, NextResponse } from 'next/server'
-import { prisma } from '@/lib/prisma'
-import { getTrainerFromRequest } from '@/lib/authTrainer'
+// app/proxy/payouts/summary/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import crypto from 'crypto';
+import { prisma } from '@/lib/prisma';
 
-function withCors(res: NextResponse, req: NextRequest) {
-  const origin = req.headers.get('origin') || '*'
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-  res.headers.set('Access-Control-Allow-Origin', origin)
-  res.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-  res.headers.set(
-    'Access-Control-Allow-Headers',
-    'Origin, Accept, Content-Type, Authorization, X-Requested-With, x-trainer-id, x-trainer-email'
-  )
-  res.headers.set('Access-Control-Allow-Credentials', 'true')
-  res.headers.set('Vary', 'Origin')
+/**
+ * Vérifie la signature Shopify App Proxy.
+ * Shopify appelle /apps/mf/... → ton backend reçoit /proxy/... avec ?signature=...
+ */
+function verifyShopifyAppProxy(req: NextRequest): boolean {
+  const secret = process.env.APP_PROXY_SHARED_SECRET || '';
+  if (!secret) return false;
 
-  return res
-}
+  const url = new URL(req.url);
+  const sig = url.searchParams.get('signature') || '';
+  if (!sig) return false;
 
-export async function OPTIONS(req: NextRequest) {
-  const res = new NextResponse(null, { status: 204 })
-  return withCors(res, req)
+  // Recrée le message: concat key=value (sans signature), trié par key
+  const pairs: Array<[string, string]> = [];
+  url.searchParams.forEach((value, key) => {
+    if (key === 'signature') return;
+    pairs.push([key, value]);
+  });
+  pairs.sort((a, b) => a[0].localeCompare(b[0]));
+  const message = pairs.map(([k, v]) => `${k}=${v}`).join('');
+
+  const digest = crypto.createHmac('sha256', secret).update(message).digest('hex');
+
+  const a = Buffer.from(digest, 'hex');
+  const b = Buffer.from(sig, 'hex');
+  if (a.length !== b.length) return false;
+
+  // ✅ Fix TS Buffer vs ArrayBufferView
+  return crypto.timingSafeEqual(new Uint8Array(a), new Uint8Array(b));
 }
 
 // Petit helper pour masquer l’IBAN côté front
 function maskIban(iban: string | null | undefined): string | null {
-  if (!iban) return null
-  const clean = iban.replace(/\s+/g, '')
-  if (clean.length <= 8) return '•••• ' + clean.slice(-4)
-  return clean.slice(0, 4) + ' •• •• •• ' + clean.slice(-4)
+  if (!iban) return null;
+  const clean = iban.replace(/\s+/g, '');
+  if (clean.length <= 8) return '•••• ' + clean.slice(-4);
+  return clean.slice(0, 4) + ' •• •• •• ' + clean.slice(-4);
 }
 
 export async function GET(req: NextRequest) {
   try {
-    const ctx = getTrainerFromRequest(req)
-    if (!ctx || !ctx.trainerId) {
-      const res = NextResponse.json(
-        { ok: false, error: 'unauthorized' },
-        { status: 401 }
-      )
-      return withCors(res, req)
+    // 1) Vérif signature App Proxy
+    if (!verifyShopifyAppProxy(req)) {
+      return NextResponse.json({ ok: false, error: 'unauthorized' }, { status: 401 });
     }
 
-    const { trainerId, email } = ctx
+    // 2) Récup params (ton front ajoute email + shopifyCustomerId)
+    const url = new URL(req.url);
+    const email = (url.searchParams.get('email') || '').trim();
+    const trainerId = (url.searchParams.get('shopifyCustomerId') || '').trim();
 
-    // 1) On s’assure qu’un enregistrement TrainerBanking existe
+    if (!trainerId) {
+      return NextResponse.json(
+        { ok: false, error: 'missing_trainerId' },
+        { status: 400 }
+      );
+    }
+
+    // 3) On s’assure qu’un TrainerBanking existe
     const banking = await prisma.trainerBanking.upsert({
       where: { trainerId },
-      update: {
-        email: email ?? undefined,
-      },
-      create: {
-        trainerId,
-        email: email ?? null,
-      },
-    })
+      update: { email: email || undefined },
+      create: { trainerId, email: email || null },
+    });
 
-    // 2) Résumé des paiements
+    // 4) Résumé payouts
     const summary = await prisma.payoutsSummary.upsert({
       where: { trainerId },
       update: {},
@@ -66,14 +81,14 @@ export async function GET(req: NextRequest) {
         pendingAmount: 0,
         currency: 'EUR',
       },
-    })
+    });
 
-    // 3) Historique (pour l’instant, on prend juste les 20 derniers)
+    // 5) Historique (20 derniers)
     const history = await prisma.payoutsHistory.findMany({
       where: { trainerId },
       orderBy: { date: 'desc' },
       take: 20,
-    })
+    });
 
     const historyPayload = history.map((item) => ({
       id: item.id,
@@ -88,14 +103,20 @@ export async function GET(req: NextRequest) {
         year: 'numeric',
       }),
       meta: item.meta ?? null,
-    }))
+    }));
 
-    const res = NextResponse.json(
+    // ✅ compat front “graph + kpi”
+    const available_cents = Number(summary.availableAmount || 0);
+    const pending_cents = Number(summary.pendingAmount || 0);
+
+    return NextResponse.json(
       {
         ok: true,
+
+        // legacy / UI banking
         currency: summary.currency,
-        available: Number(summary.availableAmount),
-        pending: Number(summary.pendingAmount),
+        available: available_cents,
+        pending: pending_cents,
         min_payout: 50,
         has_banking: !!banking.payoutIban,
         auto_payout: banking.autoPayout,
@@ -106,17 +127,18 @@ export async function GET(req: NextRequest) {
           payout_bic: banking.payoutBic,
         },
         history: historyPayload,
+
+        // ✅ champs attendus par ton script profil (fallback si pas encore branché Stripe)
+        available_cents,
+        pending_cents,
+        total_revenue_cents: 0,
+        eta_text: '—',
+        last_30_days_cents: new Array(30).fill(0),
       },
       { status: 200 }
-    )
-
-    return withCors(res, req)
+    );
   } catch (err) {
-    console.error('[MF] /api/payouts/summary GET error', err)
-    const res = NextResponse.json(
-      { ok: false, error: 'server_error' },
-      { status: 500 }
-    )
-    return withCors(res, req)
+    console.error('[MF] /proxy/payouts/summary GET error', err);
+    return NextResponse.json({ ok: false, error: 'server_error' }, { status: 500 });
   }
 }

@@ -1,124 +1,41 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
-import { verifyShopifyAppProxy } from '../../../api/_lib/proxy';
-export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
+// app/api/_lib/proxy.ts
+import crypto from 'crypto';
+import type { NextRequest } from 'next/server';
 
-function withCors(res: NextResponse, req: NextRequest) {
-  const origin = req.headers.get('origin') || '*';
-  res.headers.set('Access-Control-Allow-Origin', origin);
-  res.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.headers.set(
-    'Access-Control-Allow-Headers',
-    'Origin, Accept, Content-Type, Authorization, X-Requested-With, x-trainer-id, x-trainer-email',
+function getProxySecret() {
+  return (
+    process.env.APP_PROXY_SHARED_SECRET ||
+    process.env.SHOPIFY_APP_PROXY_SECRET ||
+    ''
   );
-  res.headers.set('Access-Control-Allow-Credentials', 'true');
-  res.headers.set('Vary', 'Origin');
-  return res;
 }
 
-export async function OPTIONS(req: NextRequest) {
-  return withCors(new NextResponse(null, { status: 204 }), req);
-}
+export function verifyShopifyAppProxy(req: NextRequest): boolean {
+  const secret = getProxySecret();
+  if (!secret) return false;
 
-// Petit helper pour masquer l’IBAN côté front
-function maskIban(iban: string | null | undefined): string | null {
-  if (!iban) return null;
-  const clean = iban.replace(/\s+/g, '');
-  if (clean.length <= 8) return '•••• ' + clean.slice(-4);
-  return clean.slice(0, 4) + ' •• •• •• ' + clean.slice(-4);
-}
+  const url = new URL(req.url);
+  const sig = url.searchParams.get('signature') || '';
+  if (!sig) return false;
 
-export async function GET(req: NextRequest) {
-  try {
-    // ✅ 1) Vérif App Proxy
-    const secret = process.env.APP_PROXY_SHARED_SECRET || '';
-    const ok = verifyShopifyAppProxy(req.url, secret);
-    if (!ok) {
-      const res = NextResponse.json({ ok: false, error: 'unauthorized' }, { status: 401 });
-      return withCors(res, req);
-    }
+  // message = query params (sans signature), triés par key, concat "k=v"
+  const pairs: Array<[string, string]> = [];
+  url.searchParams.forEach((value, key) => {
+    if (key === 'signature') return;
+    pairs.push([key, value]);
+  });
+  pairs.sort((a, b) => a[0].localeCompare(b[0]));
+  const message = pairs.map(([k, v]) => `${k}=${v}`).join('');
 
-    // ✅ 2) On accepte trainerId/email depuis query (car signature valide)
-    const url = new URL(req.url);
-    const trainerId = (url.searchParams.get('shopifyCustomerId') || '').trim();
-    const email = (url.searchParams.get('email') || '').trim();
+  const digestHex = crypto
+    .createHmac('sha256', secret)
+    .update(message)
+    .digest('hex');
 
-    if (!trainerId) {
-      const res = NextResponse.json({ ok: false, error: 'missing_trainer_id' }, { status: 400 });
-      return withCors(res, req);
-    }
+  // TS-safe timing compare
+  const a = Buffer.from(digestHex, 'hex');
+  const b = Buffer.from(sig, 'hex');
+  if (a.length !== b.length) return false;
 
-    // 1) On s’assure qu’un enregistrement TrainerBanking existe
-    const banking = await prisma.trainerBanking.upsert({
-      where: { trainerId },
-      update: {
-        email: email || undefined,
-      },
-      create: {
-        trainerId,
-        email: email || null,
-      },
-    });
-
-    // 2) Résumé des paiements
-    const summary = await prisma.payoutsSummary.upsert({
-      where: { trainerId },
-      update: {},
-      create: {
-        trainerId,
-        availableAmount: 0,
-        pendingAmount: 0,
-        currency: 'EUR',
-      },
-    });
-
-    // 3) Historique (20 derniers)
-    const history = await prisma.payoutsHistory.findMany({
-      where: { trainerId },
-      orderBy: { date: 'desc' },
-      take: 20,
-    });
-
-    const historyPayload = history.map((item) => ({
-      id: item.id,
-      type: item.type,
-      status: item.status,
-      amount: Number(item.amount),
-      currency: item.currency,
-      date: item.date.toISOString(),
-      date_label: item.date.toLocaleDateString('fr-FR', {
-        day: '2-digit',
-        month: '2-digit',
-        year: 'numeric',
-      }),
-      meta: item.meta ?? null,
-    }));
-
-    const res = NextResponse.json(
-      {
-        ok: true,
-        currency: summary.currency,
-        available: Number(summary.availableAmount),
-        pending: Number(summary.pendingAmount),
-        min_payout: 50,
-        has_banking: !!banking.payoutIban,
-        auto_payout: banking.autoPayout,
-        banking: {
-          payout_name: banking.payoutName,
-          payout_country: banking.payoutCountry,
-          payout_iban_masked: maskIban(banking.payoutIban),
-          payout_bic: banking.payoutBic,
-        },
-        history: historyPayload,
-      },
-      { status: 200 },
-    );
-
-    return withCors(res, req);
-  } catch (err) {
-    console.error('[MF] /proxy/payouts/summary GET error', err);
-    const res = NextResponse.json({ ok: false, error: 'server_error' }, { status: 500 });
-    return withCors(res, req);
-  }
+  return crypto.timingSafeEqual(new Uint8Array(a), new Uint8Array(b));
 }
