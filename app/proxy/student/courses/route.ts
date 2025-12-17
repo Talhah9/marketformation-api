@@ -6,90 +6,155 @@ import { verifyShopifyAppProxy } from "@/app/api/_lib/proxy";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function json(payload: any) {
+/**
+ * Shopify App Proxy :
+ * ⚠️ DOIT TOUJOURS répondre en 200
+ * sinon Shopify affiche "There was an error in the third-party application"
+ */
+function json200(payload: any) {
   return NextResponse.json(payload, {
-    status: 200, // IMPORTANT: toujours 200 sinon Shopify page d'erreur
-    headers: { "Cache-Control": "no-store" },
+    status: 200,
+    headers: {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json",
+    },
   });
 }
 
 export async function GET(req: NextRequest) {
   try {
+    /* =====================================================
+       1) Vérification App Proxy Shopify (HMAC)
+       ===================================================== */
     let verified: any;
     try {
-      verified = verifyShopifyAppProxy(req, process.env.APP_PROXY_SHARED_SECRET);
-    } catch (e: any) {
-      return json({ ok: false, step: "verify_throw", message: e?.message || String(e) });
+      verified = verifyShopifyAppProxy(
+        req,
+        process.env.APP_PROXY_SHARED_SECRET
+      );
+    } catch (err: any) {
+      return json200({
+        ok: false,
+        step: "verify_throw",
+        message: err?.message || String(err),
+      });
     }
 
     if (!verified?.ok) {
-      return json({ ok: false, step: "verify_failed", verified });
+      return json200({
+        ok: false,
+        step: "verify_failed",
+        verified,
+      });
     }
 
-    const u = new URL(req.url);
-    const email = u.searchParams.get("email") || "";
-    const shopifyCustomerId = u.searchParams.get("shopifyCustomerId") || "";
+    /* =====================================================
+       2) Lecture des paramètres
+       ===================================================== */
+    const url = new URL(req.url);
+    const email = url.searchParams.get("email") || "";
+    const shopifyCustomerId =
+      url.searchParams.get("shopifyCustomerId") || "";
 
     if (!email && !shopifyCustomerId) {
-      return json({ ok: false, step: "params", error: "email_or_customerId_required" });
+      return json200({
+        ok: false,
+        step: "params_missing",
+        error: "email_or_shopifyCustomerId_required",
+      });
     }
 
-    const logged = verified.loggedInCustomerId || "";
-    if (shopifyCustomerId && logged && shopifyCustomerId !== logged) {
-      return json({
+    /* =====================================================
+       3) Sécurité : cohérence client connecté Shopify
+       ===================================================== */
+    const loggedInCustomerId = verified.loggedInCustomerId || "";
+    if (
+      shopifyCustomerId &&
+      loggedInCustomerId &&
+      shopifyCustomerId !== loggedInCustomerId
+    ) {
+      return json200({
         ok: false,
         step: "customer_mismatch",
         shopifyCustomerId,
-        loggedInCustomerId: logged,
+        loggedInCustomerId,
       });
     }
 
-    // ✅ IMPORTANT : appeler le backend Vercel, pas le domaine Shopify
-    const API_BASE = process.env.API_BASE_URL || "https://mf-api-gold-topaz.vercel.app";
+    /* =====================================================
+       4) Appel du BACKEND VERCEL (PAS le domaine Shopify)
+       ===================================================== */
+    const API_BASE =
+      process.env.API_BASE_URL ||
+      "https://mf-api-gold-topaz.vercel.app";
+
     const internal = new URL("/api/student/courses", API_BASE);
     if (email) internal.searchParams.set("email", email);
-    if (shopifyCustomerId) internal.searchParams.set("shopifyCustomerId", shopifyCustomerId);
+    if (shopifyCustomerId) {
+      internal.searchParams.set(
+        "shopifyCustomerId",
+        shopifyCustomerId
+      );
+    }
 
-    let r: Response;
+    let response: Response;
     try {
-      r = await fetch(internal.toString(), {
+      response = await fetch(internal.toString(), {
         method: "GET",
-        headers: { accept: "application/json" },
+        headers: {
+          Accept: "application/json",
+        },
         cache: "no-store",
       });
-    } catch (e: any) {
-      return json({
+    } catch (err: any) {
+      return json200({
         ok: false,
         step: "fetch_internal_throw",
         internal: internal.toString(),
-        message: e?.message || String(e),
+        message: err?.message || String(err),
       });
     }
 
-    const text = await r.text().catch(() => "");
+    const raw = await response.text().catch(() => "");
 
-    // Si OK, on renvoie la réponse JSON telle quelle (pas de wrapper)
-    if (r.ok) {
+    /* =====================================================
+       5) Succès : on renvoie TEL QUEL le JSON upstream
+       ===================================================== */
+    if (response.ok) {
       try {
-        const data = JSON.parse(text);
+        const data = JSON.parse(raw);
         return NextResponse.json(data, {
           status: 200,
           headers: { "Cache-Control": "no-store" },
         });
-      } catch {
-        return json({ ok: false, step: "upstream_not_json", upstreamBody: text });
+      } catch (err: any) {
+        return json200({
+          ok: false,
+          step: "upstream_not_json",
+          internal: internal.toString(),
+          raw,
+        });
       }
     }
 
-    // Sinon on garde le debug
-    return json({
+    /* =====================================================
+       6) Erreur upstream (Prisma, DB, etc.)
+       ===================================================== */
+    return json200({
       ok: false,
-      step: "upstream",
-      upstreamStatus: r.status,
-      upstreamBody: text,
+      step: "upstream_error",
       internal: internal.toString(),
+      upstreamStatus: response.status,
+      upstreamBody: raw,
     });
-  } catch (e: any) {
-    return json({ ok: false, step: "proxy_catch", message: e?.message || String(e) });
+  } catch (err: any) {
+    /* =====================================================
+       7) Catch final (ne doit JAMAIS arriver)
+       ===================================================== */
+    return json200({
+      ok: false,
+      step: "proxy_catch",
+      message: err?.message || String(err),
+    });
   }
 }
