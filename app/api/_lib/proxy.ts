@@ -1,48 +1,72 @@
 // app/api/_lib/proxy.ts
 import crypto from "crypto";
-import { NextRequest } from "next/server";
+import type { NextRequest } from "next/server";
 
-export const runtime = "nodejs";
+type VerifyResult =
+  | { ok: true; shop?: string; loggedInCustomerId?: string }
+  | { ok: false; reason: string };
 
-/**
- * Shopify App Proxy signature verification
- * Shopify ajoute ?signature=...&timestamp=...&path_prefix=... etc.
- * On doit reconstruire la query string triée (sans "signature") puis HMAC-SHA256 hex.
- */
-export function verifyShopifyAppProxy(req: NextRequest, sharedSecret: string): boolean {
-  try {
-    if (!sharedSecret) return false;
+function safeTimingEqual(a: string, b: string) {
+  const ba = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
 
-    const url = req.nextUrl;
-    const sig = url.searchParams.get("signature") || "";
-    if (!sig) return false;
+  if (ba.length !== bb.length) return false;
 
-    // construire message = key=value triés, sans signature
-    const pairs: string[] = [];
-    url.searchParams.forEach((value, key) => {
-      if (key === "signature") return;
-      pairs.push(`${key}=${value}`);
-    });
-    pairs.sort(); // important
-    const message = pairs.join("");
+  // ✅ Convertit Buffer -> Uint8Array neuf (ArrayBuffer), compatible TS
+  const ua = Uint8Array.from(ba);
+  const ub = Uint8Array.from(bb);
 
-    const digest = crypto.createHmac("sha256", sharedSecret).update(message).digest("hex");
-
-    // comparaison safe
-    const a = Buffer.from(digest, "utf8");
-    const b = Buffer.from(sig, "utf8");
-    if (a.length !== b.length) return false;
-
-    return crypto.timingSafeEqual(new Uint8Array(a), new Uint8Array(b));
-  } catch {
-    return false;
-  }
+  return crypto.timingSafeEqual(ua, ub);
 }
 
-export function getProxyViewer(req: NextRequest) {
-  const sp = req.nextUrl.searchParams;
-  return {
-    email: sp.get("email") || "",
-    shopifyCustomerId: sp.get("shopifyCustomerId") || "",
-  };
+
+export function verifyShopifyAppProxy(
+  req: NextRequest,
+  sharedSecret: string | undefined
+): VerifyResult {
+  try {
+    if (!sharedSecret) return { ok: false, reason: "MISSING_SHARED_SECRET" };
+
+    const url = new URL(req.url);
+    const params = new URLSearchParams(url.search);
+
+    // Shopify App Proxy utilise `signature` (hex). On supporte aussi `hmac` au cas où.
+    const signature = params.get("signature") ?? params.get("hmac");
+    if (!signature) return { ok: false, reason: "MISSING_SIGNATURE" };
+
+    // Conserver certains champs utiles
+    const shop = params.get("shop") ?? undefined;
+    const loggedInCustomerId = params.get("logged_in_customer_id") ?? undefined;
+
+    // Construire un hash key -> valeurs[] (pour gérer extra=1&extra=2)
+    const map = new Map<string, string[]>();
+    for (const [k, v] of params.entries()) {
+      if (k === "signature" || k === "hmac") continue;
+      const arr = map.get(k) ?? [];
+      arr.push(v);
+      map.set(k, arr);
+    }
+
+    // Convertir en ["k=v1,v2", ...] puis trier lexicographiquement, puis join sans "&"
+    const pieces = Array.from(map.entries()).map(([k, values]) => {
+      return `${k}=${values.join(",")}`;
+    });
+
+    pieces.sort(); // tri lexicographique
+    const message = pieces.join("");
+
+    const computed = crypto
+      .createHmac("sha256", sharedSecret)
+      .update(message, "utf8")
+      .digest("hex");
+
+    if (!safeTimingEqual(signature, computed)) {
+      return { ok: false, reason: "INVALID_SIGNATURE" };
+    }
+
+    return { ok: true, shop, loggedInCustomerId };
+  } catch (e: any) {
+    // IMPORTANT: ne jamais throw → sinon 500
+    return { ok: false, reason: `VERIFY_EXCEPTION:${e?.message ?? "unknown"}` };
+  }
 }
