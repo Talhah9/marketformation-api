@@ -1,4 +1,3 @@
-// app/proxy/download/route.ts
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { verifyShopifyAppProxy } from "@/app/api/_lib/proxy";
@@ -12,8 +11,7 @@ async function shopifyGraphQL<T>(
   query: string,
   variables: Record<string, any>
 ): Promise<T> {
-  const url = `https://${shopDomain}/admin/api/2024-10/graphql.json`;
-  const res = await fetch(url, {
+  const res = await fetch(`https://${shopDomain}/admin/api/2024-10/graphql.json`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -23,18 +21,15 @@ async function shopifyGraphQL<T>(
     cache: "no-store",
   });
 
-  const json = await res.json();
-  if (!res.ok || json?.errors?.length) {
-    const msg =
-      json?.errors?.[0]?.message || `Shopify GraphQL HTTP ${res.status}`;
-    throw new Error(msg);
-  }
+  const json = await res.json().catch(() => null);
+  if (!res.ok || !json) throw new Error(`Shopify GraphQL HTTP ${res.status}`);
+  if (json.errors?.length) throw new Error(json.errors[0]?.message || "Shopify GraphQL error");
   return json as T;
 }
 
 export async function GET(req: NextRequest) {
   try {
-    // 1) Vérif App Proxy (signature)
+    // 1) Vérif App Proxy
     const verified = verifyShopifyAppProxy(req, process.env.APP_PROXY_SHARED_SECRET);
     if (!verified.ok) {
       return NextResponse.json(
@@ -43,39 +38,29 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // 2) Vérif client connecté (Shopify fournit logged_in_customer_id via App Proxy)
+    // 2) Client connecté (Shopify app proxy)
     const loggedCustomerId = verified.loggedInCustomerId;
     if (!loggedCustomerId) {
-      return NextResponse.json(
-        { ok: false, error: "NOT_LOGGED_IN" },
-        { status: 401 }
-      );
+      return NextResponse.json({ ok: false, error: "NOT_LOGGED_IN" }, { status: 401 });
     }
 
-    // 3) Paramètre productId
+    // 3) productId
     const url = new URL(req.url);
     const productId = url.searchParams.get("productId");
     if (!productId) {
-      return NextResponse.json(
-        { ok: false, error: "MISSING_PRODUCT_ID" },
-        { status: 400 }
-      );
+      return NextResponse.json({ ok: false, error: "MISSING_PRODUCT_ID" }, { status: 400 });
     }
 
-    // 4) Env Shopify Admin
+    // 4) Env
     const shopDomain = process.env.SHOP_DOMAIN;
     const adminToken = process.env.ADMIN_TOKEN;
     if (!shopDomain || !adminToken) {
-      return NextResponse.json(
-        { ok: false, error: "SERVER_MISCONFIG" },
-        { status: 500 }
-      );
+      return NextResponse.json({ ok: false, error: "SERVER_MISCONFIG" }, { status: 500 });
     }
 
-    const customerGid = `gid://shopify/Customer/${loggedCustomerId}`;
     const productGid = `gid://shopify/Product/${productId}`;
 
-    // 5) Vérifier que ce customer a acheté ce product (scan des dernières commandes)
+    // 5) Vérifier achat : commandes du customer, scan lineItems.product.id
     const ORDERS_QUERY = `
       query OrdersByCustomer($query: String!) {
         orders(first: 50, query: $query, sortKey: CREATED_AT, reverse: true) {
@@ -84,9 +69,7 @@ export async function GET(req: NextRequest) {
               id
               lineItems(first: 100) {
                 edges {
-                  node {
-                    product { id }
-                  }
+                  node { product { id } }
                 }
               }
             }
@@ -95,30 +78,21 @@ export async function GET(req: NextRequest) {
       }
     `;
 
-    const q = `customer_id:${loggedCustomerId} status:any`;
-    const ordersRes = await shopifyGraphQL<any>(
-      shopDomain,
-      adminToken,
-      ORDERS_QUERY,
-      { query: q }
-    );
+    const ordersSearch = `customer_id:${loggedCustomerId} status:any`;
+    const ordersRes = await shopifyGraphQL<any>(shopDomain, adminToken, ORDERS_QUERY, {
+      query: ordersSearch,
+    });
 
-    const orderEdges = ordersRes?.data?.orders?.edges || [];
-    const hasPurchased = orderEdges.some((e: any) =>
-      (e?.node?.lineItems?.edges || []).some(
-        (li: any) => li?.node?.product?.id === productGid
-      )
+    const hasPurchased = (ordersRes?.data?.orders?.edges || []).some((e: any) =>
+      (e?.node?.lineItems?.edges || []).some((li: any) => li?.node?.product?.id === productGid)
     );
 
     if (!hasPurchased) {
-      return NextResponse.json(
-        { ok: false, error: "NOT_PURCHASED" },
-        { status: 403 }
-      );
+      return NextResponse.json({ ok: false, error: "NOT_PURCHASED" }, { status: 403 });
     }
 
-    // 6) Récupérer le PDF depuis le metafield du produit
-    const PRODUCT_PDF_QUERY = `
+    // 6) Lire mfapp.pdf_url sur le produit
+    const PRODUCT_QUERY = `
       query ProductPdf($id: ID!) {
         product(id: $id) {
           id
@@ -127,19 +101,13 @@ export async function GET(req: NextRequest) {
       }
     `;
 
-    const productRes = await shopifyGraphQL<any>(
-      shopDomain,
-      adminToken,
-      PRODUCT_PDF_QUERY,
-      { id: productGid }
-    );
+    const productRes = await shopifyGraphQL<any>(shopDomain, adminToken, PRODUCT_QUERY, {
+      id: productGid,
+    });
 
     const pdfUrl = productRes?.data?.product?.metafield?.value;
     if (!pdfUrl) {
-      return NextResponse.json(
-        { ok: false, error: "PDF_NOT_FOUND" },
-        { status: 404 }
-      );
+      return NextResponse.json({ ok: false, error: "PDF_NOT_FOUND" }, { status: 404 });
     }
 
     // 7) Redirect vers le PDF (MVP)
