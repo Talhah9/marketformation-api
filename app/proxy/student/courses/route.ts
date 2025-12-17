@@ -7,29 +7,29 @@ export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
   try {
+    console.log("[MF] proxy/student/courses HIT");
+
     const verified = verifyShopifyAppProxy(req, process.env.APP_PROXY_SHARED_SECRET);
+    console.log("[MF] proxy verify:", verified);
+
     if (!verified.ok) {
       return NextResponse.json(
-        { ok: false, error: "UNAUTHORIZED", reason: verified.reason },
+        { ok: false, step: "verify", verified },
         { status: 401 }
       );
     }
 
     const u = new URL(req.url);
-    const email = u.searchParams.get("email") || "";
-    const shopifyCustomerId = u.searchParams.get("shopifyCustomerId") || "";
+    const email = u.searchParams.get("email");
+    const shopifyCustomerId = u.searchParams.get("shopifyCustomerId");
 
-    if (!email && !shopifyCustomerId) {
-      return NextResponse.json(
-        { ok: false, error: "email_or_customerId_required" },
-        { status: 400 }
-      );
-    }
+    console.log("[MF] params:", { email, shopifyCustomerId });
 
-    // ✅ Forward interne vers l’API Prisma
     const internal = new URL("/api/student/courses", u.origin);
     if (email) internal.searchParams.set("email", email);
     if (shopifyCustomerId) internal.searchParams.set("shopifyCustomerId", shopifyCustomerId);
+
+    console.log("[MF] forward to:", internal.toString());
 
     const r = await fetch(internal.toString(), {
       method: "GET",
@@ -38,33 +38,22 @@ export async function GET(req: NextRequest) {
     });
 
     const text = await r.text();
+    console.log("[MF] upstream status:", r.status);
+    console.log("[MF] upstream body:", text);
 
-    // Si l’API interne plante, on renvoie le body brut pour debug
-    if (!r.ok) {
-      console.error("[MF] /api/student/courses upstream error:", r.status, text);
-      return NextResponse.json(
-        { ok: false, error: "UPSTREAM_ERROR", status: r.status, body: text },
-        { status: 502 }
-      );
-    }
-
-    // Renvoi JSON normal
-    let data: any;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      console.error("[MF] upstream not json:", text);
-      return NextResponse.json(
-        { ok: false, error: "UPSTREAM_NOT_JSON", body: text },
-        { status: 502 }
-      );
-    }
-
-    return NextResponse.json(data, { status: 200 });
-  } catch (e: any) {
-    console.error("[MF] proxy/student/courses exception:", e);
     return NextResponse.json(
-      { ok: false, error: "PROXY_EXCEPTION", message: e?.message || "unknown" },
+      {
+        ok: r.ok,
+        upstreamStatus: r.status,
+        body: text
+      },
+      { status: r.ok ? 200 : 500 }
+    );
+
+  } catch (e: any) {
+    console.error("[MF] proxy exception:", e);
+    return NextResponse.json(
+      { ok: false, step: "catch", message: e?.message || "unknown" },
       { status: 500 }
     );
   }
