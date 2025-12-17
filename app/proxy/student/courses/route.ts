@@ -1,4 +1,3 @@
-// app/proxy/student/courses/route.ts
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { verifyShopifyAppProxy } from "@/app/api/_lib/proxy";
@@ -16,9 +15,9 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    const url = new URL(req.url);
-    const email = url.searchParams.get("email") || "";
-    const shopifyCustomerId = url.searchParams.get("shopifyCustomerId") || "";
+    const u = new URL(req.url);
+    const email = u.searchParams.get("email") || "";
+    const shopifyCustomerId = u.searchParams.get("shopifyCustomerId") || "";
 
     if (!email && !shopifyCustomerId) {
       return NextResponse.json(
@@ -27,16 +26,8 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // Option sécurité : si Shopify fournit logged_in_customer_id, on force la cohérence
-    const logged = verified.loggedInCustomerId || "";
-    if (shopifyCustomerId && logged && shopifyCustomerId !== logged) {
-      return NextResponse.json(
-        { ok: false, error: "FORBIDDEN", reason: "CUSTOMER_MISMATCH" },
-        { status: 403 }
-      );
-    }
-
-    const internal = new URL("/api/student/courses", url.origin);
+    // ✅ Forward interne vers l’API Prisma
+    const internal = new URL("/api/student/courses", u.origin);
     if (email) internal.searchParams.set("email", email);
     if (shopifyCustomerId) internal.searchParams.set("shopifyCustomerId", shopifyCustomerId);
 
@@ -47,20 +38,33 @@ export async function GET(req: NextRequest) {
     });
 
     const text = await r.text();
-    let data: any;
-    try {
-      data = JSON.parse(text);
-    } catch {
+
+    // Si l’API interne plante, on renvoie le body brut pour debug
+    if (!r.ok) {
+      console.error("[MF] /api/student/courses upstream error:", r.status, text);
       return NextResponse.json(
-        { ok: false, error: "UPSTREAM_NOT_JSON", status: r.status, body: text },
+        { ok: false, error: "UPSTREAM_ERROR", status: r.status, body: text },
         { status: 502 }
       );
     }
 
-    return NextResponse.json(data, { status: r.status });
+    // Renvoi JSON normal
+    let data: any;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      console.error("[MF] upstream not json:", text);
+      return NextResponse.json(
+        { ok: false, error: "UPSTREAM_NOT_JSON", body: text },
+        { status: 502 }
+      );
+    }
+
+    return NextResponse.json(data, { status: 200 });
   } catch (e: any) {
+    console.error("[MF] proxy/student/courses exception:", e);
     return NextResponse.json(
-      { ok: false, error: "PROXY_STUDENT_COURSES_EXCEPTION", message: e?.message || "unknown" },
+      { ok: false, error: "PROXY_EXCEPTION", message: e?.message || "unknown" },
       { status: 500 }
     );
   }
