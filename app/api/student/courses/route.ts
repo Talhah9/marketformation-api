@@ -1,82 +1,109 @@
-// app/api/student/courses/route.ts
+// app/proxy/download/route.ts
 import { NextResponse } from "next/server";
-import { prisma } from "@/lib/prisma";
+import type { NextRequest } from "next/server";
+import { verifyShopifyAppProxy } from "@/app/api/_lib/proxy";
 
-export async function GET(req: Request) {
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+async function shopifyGraphQL<T>(
+  shopDomain: string,
+  adminToken: string,
+  query: string,
+  variables: Record<string, any>
+): Promise<T> {
+  const res = await fetch(`https://${shopDomain}/admin/api/2024-10/graphql.json`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": adminToken,
+    },
+    body: JSON.stringify({ query, variables }),
+    cache: "no-store",
+  });
+
+  const json = await res.json().catch(() => null);
+  if (!res.ok || !json) throw new Error(`Shopify GraphQL HTTP ${res.status}`);
+  if (json.errors?.length) throw new Error(json.errors[0]?.message || "Shopify GraphQL error");
+  return json as T;
+}
+
+function redirectBack(req: NextRequest, code: string) {
+  // ⚠️ adapte si ta page élève a un autre handle
+  const back = new URL("/pages/mes-formations", req.nextUrl.origin);
+  back.searchParams.set("mf_error", code);
+  return NextResponse.redirect(back.toString(), 302);
+}
+
+export async function GET(req: NextRequest) {
   try {
-    const { searchParams } = new URL(req.url);
+    // 1) Vérif App Proxy
+    const verified = verifyShopifyAppProxy(req, process.env.APP_PROXY_SHARED_SECRET);
+    if (!verified.ok) return redirectBack(req, "unauthorized");
 
-    const email = searchParams.get("email");
-    const customerId = searchParams.get("shopifyCustomerId");
+    // 2) Client connecté
+    const loggedCustomerId = verified.loggedInCustomerId;
+    if (!loggedCustomerId) return redirectBack(req, "not_logged_in");
 
-    if (!email && !customerId) {
-      return NextResponse.json(
-        { ok: false, error: "email_or_customerId_required" },
-        { status: 400 }
-      );
-    }
+    // 3) productId
+    const url = new URL(req.url);
+    const productId = url.searchParams.get("productId");
+    if (!productId) return redirectBack(req, "missing_product_id");
 
-    // Construire le OR proprement (sans filter(Boolean) pour éviter bugs de parsing/collage)
-    const or: any[] = [];
-    if (email) or.push({ studentEmail: email });
-    if (customerId) or.push({ shopifyCustomerId: customerId });
+    // 4) Env
+    const shopDomain = process.env.SHOP_DOMAIN;
+    const adminToken = process.env.ADMIN_TOKEN;
+    if (!shopDomain || !adminToken) return redirectBack(req, "server_misconfig");
 
-    const studentCourses: any[] = await (prisma as any).studentCourse.findMany({
-      where: {
-        OR: or,
-        archived: false,
-      },
-      include: {
-        course: true,
-      },
-      orderBy: {
-        purchaseDate: "desc",
-      },
+    const productGid = `gid://shopify/Product/${productId}`;
+
+    // 5) Vérifier achat (scan commandes)
+    const ORDERS_QUERY = `
+      query OrdersByCustomer($query: String!) {
+        orders(first: 50, query: $query, sortKey: CREATED_AT, reverse: true) {
+          edges {
+            node {
+              id
+              lineItems(first: 100) {
+                edges { node { product { id } } }
+              }
+            }
+          }
+        }
+      }
+    `;
+    const ordersSearch = `customer_id:${loggedCustomerId} status:any`;
+    const ordersRes = await shopifyGraphQL<any>(shopDomain, adminToken, ORDERS_QUERY, {
+      query: ordersSearch,
     });
 
-    function gidToNumericProductId(gid?: string | null) {
-      if (!gid) return null;
-      const m = String(gid).match(/\/Product\/(\d+)$/);
-      return m ? Number(m[1]) : null;
-    }
+    const hasPurchased = (ordersRes?.data?.orders?.edges || []).some((e: any) =>
+      (e?.node?.lineItems?.edges || []).some((li: any) => li?.node?.product?.id === productGid)
+    );
 
-    const items = studentCourses.map((sc: any) => {
-      const directId =
-        sc?.course?.shopifyProductId ??
-        sc?.course?.productId ??
-        sc?.course?.shopify_product_id ??
-        null;
+    if (!hasPurchased) return redirectBack(req, "not_purchased");
 
-      const gidId = gidToNumericProductId(
-        sc?.course?.shopifyProductGid ?? sc?.course?.productGid ?? null
-      );
-
-      const product_id = directId != null ? Number(directId) : gidId;
-
-      return {
-        id: sc.course.id, // prisma id
-        product_id: product_id, // ✅ shopify product numeric id
-
-        title: sc.course.title,
-        subtitle: sc.course.subtitle ?? "",
-        category_label: sc.course.categoryLabel ?? "",
-        level_label: sc.course.levelLabel ?? "",
-        estimated_hours: sc.course.estimatedHours ?? 0,
-
-        status: String(sc.status ?? "IN_PROGRESS").toLowerCase(),
-
-        image_url: sc.course.imageUrl ?? null,
-        purchase_date: sc.purchaseDate,
-        last_access_at: sc.lastAccessAt,
-
-        access_url: sc.course.accessUrl ?? null,
-        cta_label: "Telecharger ma formation",
-      };
+    // 6) Lire mfapp.pdf_url
+    const PRODUCT_QUERY = `
+      query ProductPdf($id: ID!) {
+        product(id: $id) {
+          metafield(namespace: "mfapp", key: "pdf_url") { value }
+        }
+      }
+    `;
+    const productRes = await shopifyGraphQL<any>(shopDomain, adminToken, PRODUCT_QUERY, {
+      id: productGid,
     });
 
-    return NextResponse.json({ ok: true, items }, { status: 200 });
-  } catch (err) {
-    console.error("student/courses error:", err);
-    return NextResponse.json({ ok: false, error: "server_error" }, { status: 500 });
+    const pdfUrl = productRes?.data?.product?.metafield?.value;
+    if (!pdfUrl) return redirectBack(req, "pdf_not_found");
+
+    // 7) Redirect vers le PDF
+    const resp = NextResponse.redirect(pdfUrl, 302);
+    resp.headers.set("Cache-Control", "no-store");
+    return resp;
+  } catch (e: any) {
+    console.error("[MF] proxy/download exception:", e?.message || e);
+    return redirectBack(req, "download_exception");
   }
 }
