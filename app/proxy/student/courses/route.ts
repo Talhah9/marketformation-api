@@ -1,3 +1,4 @@
+// app/proxy/student/courses/route.ts
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { verifyShopifyAppProxy } from "@/app/api/_lib/proxy";
@@ -5,34 +6,25 @@ import { verifyShopifyAppProxy } from "@/app/api/_lib/proxy";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function ok200(payload: any) {
-  // Shopify App Proxy affiche sa page d'erreur dès qu'on sort du 200
+function json(payload: any, status = 200) {
   return NextResponse.json(payload, {
-    status: 200,
+    status,
     headers: { "Cache-Control": "no-store" },
   });
 }
 
 export async function GET(req: NextRequest) {
   try {
-    // 1) Vérif App Proxy (NE DOIT JAMAIS throw)
+    // 1) Vérif App Proxy (ne doit JAMAIS throw)
     let verified: any;
     try {
       verified = verifyShopifyAppProxy(req, process.env.APP_PROXY_SHARED_SECRET);
     } catch (e: any) {
-      return ok200({
-        ok: false,
-        step: "verify_throw",
-        message: e?.message || String(e),
-      });
+      return json({ ok: false, step: "verify_throw", message: e?.message || String(e) }, 200);
     }
 
     if (!verified?.ok) {
-      return ok200({
-        ok: false,
-        step: "verify_failed",
-        verified,
-      });
+      return json({ ok: false, step: "verify_failed", verified }, 200);
     }
 
     // 2) Params
@@ -41,25 +33,19 @@ export async function GET(req: NextRequest) {
     const shopifyCustomerId = u.searchParams.get("shopifyCustomerId") || "";
 
     if (!email && !shopifyCustomerId) {
-      return ok200({
-        ok: false,
-        step: "params",
-        error: "email_or_customerId_required",
-      });
+      return json({ ok: false, step: "params", error: "email_or_customerId_required" }, 200);
     }
 
-    // (Optionnel sécurité) si Shopify fournit logged_in_customer_id, on bloque mismatch
+    // Option sécurité : si Shopify fournit logged_in_customer_id, on vérifie cohérence
     const logged = verified.loggedInCustomerId || "";
     if (shopifyCustomerId && logged && shopifyCustomerId !== logged) {
-      return ok200({
-        ok: false,
-        step: "customer_mismatch",
-        shopifyCustomerId,
-        loggedInCustomerId: logged,
-      });
+      return json(
+        { ok: false, step: "customer_mismatch", shopifyCustomerId, loggedInCustomerId: logged },
+        200
+      );
     }
 
-    // 3) Forward vers l’API interne Prisma
+    // 3) Forward interne vers l’API Prisma (même déploiement)
     const internal = new URL("/api/student/courses", u.origin);
     if (email) internal.searchParams.set("email", email);
     if (shopifyCustomerId) internal.searchParams.set("shopifyCustomerId", shopifyCustomerId);
@@ -72,27 +58,30 @@ export async function GET(req: NextRequest) {
         cache: "no-store",
       });
     } catch (e: any) {
-      return ok200({
-        ok: false,
-        step: "fetch_internal_throw",
-        message: e?.message || String(e),
-        internal: internal.toString(),
-      });
+      return json(
+        {
+          ok: false,
+          step: "fetch_internal_throw",
+          internal: internal.toString(),
+          message: e?.message || String(e),
+        },
+        200
+      );
     }
 
     const text = await r.text().catch(() => "");
-    // On renvoie TOUJOURS 200, et on met le statut upstream dans le JSON
-    return ok200({
-      ok: r.ok,
-      step: "upstream",
-      upstreamStatus: r.status,
-      upstreamBody: text,
-    });
+
+    // On renvoie TOUJOURS 200 côté proxy (sinon Shopify met sa page générique / ton front masque)
+    return json(
+      {
+        ok: r.ok,
+        step: "upstream",
+        upstreamStatus: r.status,
+        upstreamBody: text,
+      },
+      200
+    );
   } catch (e: any) {
-    return ok200({
-      ok: false,
-      step: "proxy_catch",
-      message: e?.message || String(e),
-    });
+    return json({ ok: false, step: "proxy_catch", message: e?.message || String(e) }, 200);
   }
 }
