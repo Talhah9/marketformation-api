@@ -1,11 +1,16 @@
 // app/proxy/ping/route.ts
-import { NextRequest, NextResponse } from 'next/server';
-import { verifyShopifyAppProxy } from '@/app/api/_lib/proxy';
+import { NextRequest, NextResponse } from "next/server";
+import { verifyShopifyAppProxy } from "@/app/api/_lib/proxy";
 
-export const runtime = 'nodejs';
-export const dynamic = 'force-dynamic';
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
-  const ok = verifyShopifyAppProxy(req);
-  return NextResponse.json({ ok, pong: true, ts: Date.now() }, { status: 200 });
+  const ok = verifyShopifyAppProxy(req, process.env.APP_PROXY_SHARED_SECRET || "");
+
+  return NextResponse.json({
+    ok,
+    pong: true,
+    ts: Date.now(),
+  });
 }

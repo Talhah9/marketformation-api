@@ -5,7 +5,8 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
-  if (!verifyShopifyAppProxy(req)) {
+  if (!verifyShopifyAppProxy(req, process.env.APP_PROXY_SHARED_SECRET || "")
+) {
     return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
   }
 

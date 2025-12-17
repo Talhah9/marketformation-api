@@ -1,38 +1,48 @@
 // app/api/_lib/proxy.ts
-import crypto from 'crypto';
-import type { NextRequest } from 'next/server';
+import crypto from "crypto";
+import { NextRequest } from "next/server";
 
-export function verifyShopifyAppProxy(req: NextRequest): boolean {
-  const secret =
-    process.env.APP_PROXY_SHARED_SECRET ||
-    process.env.SHOPIFY_APP_PROXY_SHARED_SECRET ||
-    '';
+export const runtime = "nodejs";
 
-  if (!secret) return false;
+/**
+ * Shopify App Proxy signature verification
+ * Shopify ajoute ?signature=...&timestamp=...&path_prefix=... etc.
+ * On doit reconstruire la query string triée (sans "signature") puis HMAC-SHA256 hex.
+ */
+export function verifyShopifyAppProxy(req: NextRequest, sharedSecret: string): boolean {
+  try {
+    if (!sharedSecret) return false;
 
-  const url = new URL(req.url);
-  const signature = url.searchParams.get('signature') || '';
-  if (!signature) return false;
+    const url = req.nextUrl;
+    const sig = url.searchParams.get("signature") || "";
+    if (!sig) return false;
 
-  // Build message: sort all params except "signature"
-  const pairs: string[] = [];
-  url.searchParams.forEach((value, key) => {
-    if (key === 'signature') return;
-    pairs.push(`${key}=${value}`);
-  });
-  pairs.sort();
-  const message = pairs.join('');
+    // construire message = key=value triés, sans signature
+    const pairs: string[] = [];
+    url.searchParams.forEach((value, key) => {
+      if (key === "signature") return;
+      pairs.push(`${key}=${value}`);
+    });
+    pairs.sort(); // important
+    const message = pairs.join("");
 
-  const digest = crypto
-    .createHmac('sha256', secret)
-    .update(message, 'utf8')
-    .digest('hex');
+    const digest = crypto.createHmac("sha256", sharedSecret).update(message).digest("hex");
 
-  // ✅ TS-safe timing compare (no Buffer)
-  const enc = new TextEncoder();
-  const a = enc.encode(digest);
-  const b = enc.encode(signature);
+    // comparaison safe
+    const a = Buffer.from(digest, "utf8");
+    const b = Buffer.from(sig, "utf8");
+    if (a.length !== b.length) return false;
 
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
+    return crypto.timingSafeEqual(new Uint8Array(a), new Uint8Array(b));
+  } catch {
+    return false;
+  }
+}
+
+export function getProxyViewer(req: NextRequest) {
+  const sp = req.nextUrl.searchParams;
+  return {
+    email: sp.get("email") || "",
+    shopifyCustomerId: sp.get("shopifyCustomerId") || "",
+  };
 }
