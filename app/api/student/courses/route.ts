@@ -17,13 +17,13 @@ export async function GET(req: Request) {
       );
     }
 
-    // On cast prisma en any pour éviter les erreurs TS sur studentCourse
+    // ✅ Récupération DB
     const studentCourses: any[] = await (prisma as any).studentCourse.findMany({
       where: {
         OR: [
-          email ? { studentEmail: email } : {},
-          customerId ? { shopifyCustomerId: customerId } : {},
-        ],
+          email ? { studentEmail: email } : undefined,
+          customerId ? { shopifyCustomerId: customerId } : undefined,
+        ].filter(Boolean),
         archived: false,
       },
       include: {
@@ -34,28 +34,54 @@ export async function GET(req: Request) {
       },
     });
 
-    const items = studentCourses.map((sc) => ({
-      id: sc.course.id,
-      title: sc.course.title,
-      subtitle: sc.course.subtitle ?? '',
-      category_label: sc.course.categoryLabel ?? '',
-      level_label: sc.course.levelLabel ?? '',
-      estimated_hours: sc.course.estimatedHours ?? 0,
+    // Helper: gid://shopify/Product/123 -> 123
+    const gidToNumericProductId = (gid?: string | null) => {
+      if (!gid) return null;
+      const m = String(gid).match(/\/Product\/(\d+)$/);
+      return m ? Number(m[1]) : null;
+    };
 
-      // enum Prisma -> string front : "not_started" | "in_progress" | "completed"
-      status: String(sc.status ?? 'IN_PROGRESS').toLowerCase(),
+    const items = studentCourses.map((sc: any) => {
+      // 👉 IMPORTANT : il faut que ton modèle Prisma Course contienne
+      // soit shopifyProductId (numérique / string),
+      // soit shopifyProductGid (gid://shopify/Product/123).
+      const directId =
+        sc?.course?.shopifyProductId ??
+        sc?.course?.productId ??
+        sc?.course?.shopify_product_id ??
+        null;
 
-      image_url: sc.course.imageUrl ?? null,
-      purchase_date: sc.purchaseDate,
-      last_access_at: sc.lastAccessAt,
-      access_url: sc.course.accessUrl,
-      cta_label: 'Accéder à la formation',
-    }));
+      const gidId = gidToNumericProductId(
+        sc?.course?.shopifyProductGid ?? sc?.course?.productGid ?? null
+      );
 
-    return NextResponse.json(
-      { ok: true, items },
-      { status: 200 }
-    );
+      const product_id = directId != null ? Number(directId) : gidId;
+
+      return {
+        id: sc.course.id,          // id interne prisma (on garde)
+        product_id: product_id,    // ✅ id Shopify (numérique) pour /apps/mf/download
+
+        title: sc.course.title,
+        subtitle: sc.course.subtitle ?? '',
+        category_label: sc.course.categoryLabel ?? '',
+        level_label: sc.course.levelLabel ?? '',
+        estimated_hours: sc.course.estimatedHours ?? 0,
+
+        // enum Prisma -> string front : "not_started" | "in_progress" | "completed"
+        status: String(sc.status ?? 'IN_PROGRESS').toLowerCase(),
+
+        image_url: sc.course.imageUrl ?? null,
+        purchase_date: sc.purchaseDate,
+        last_access_at: sc.lastAccessAt,
+
+        // tu peux garder access_url si tu veux, mais le bouton n’utilise plus ça
+        access_url: sc.course.accessUrl ?? null,
+
+        cta_label: 'Télécharger ma formation',
+      };
+    });
+
+    return NextResponse.json({ ok: true, items }, { status: 200 });
   } catch (err) {
     console.error('student/courses error:', err);
     return NextResponse.json(
