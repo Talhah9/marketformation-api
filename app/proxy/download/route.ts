@@ -47,20 +47,21 @@ export async function GET(req: NextRequest) {
 
     /* 3️⃣ Vérifier que l’élève a acheté la formation */
     const purchase: any = await (prisma as any).studentCourse.findFirst({
-      where: {
-        shopifyCustomerId: String(customerId),
-        course: {
-          OR: [
-            { shopifyProductId: Number(productId) },
-            { productId: Number(productId) },
-          ],
-        },
-        archived: false,
-      },
-      include: {
-        course: true,
-      },
-    });
+  where: {
+    shopifyCustomerId: String(customerId),
+    archived: false,
+    course: {
+      OR: [
+        { shopifyProductId: String(productId) },
+        { productId: String(productId) },
+      ],
+    },
+  },
+  include: {
+    course: true,
+  },
+});
+
 
     if (!purchase || !purchase.course?.pdfUrl) {
       return json200({ ok: false, error: "not_allowed_or_missing_pdf" });
