@@ -8,9 +8,10 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /**
- * ⚠️ App Proxy RULE :
- * - JAMAIS de status ≠ 200
- * - JAMAIS de redirect HTTP
+ * ⚠️ Shopify App Proxy rule:
+ * - toujours répondre en 200
+ * - ne jamais throw
+ * - pas de 401 / 403 / 500
  */
 function json200(payload: any) {
   return NextResponse.json(payload, {
@@ -21,22 +22,30 @@ function json200(payload: any) {
 
 export async function GET(req: NextRequest) {
   try {
-    /* 1️⃣ Vérification App Proxy */
+    /* =====================================================
+       1) Vérification App Proxy
+       ===================================================== */
     let verified: any;
     try {
       verified = verifyShopifyAppProxy(
         req,
         process.env.APP_PROXY_SHARED_SECRET
       );
-    } catch (e: any) {
-      return json200({ ok: false, error: "verify_throw", message: e?.message });
+    } catch (err: any) {
+      return json200({
+        ok: false,
+        error: "verify_throw",
+        message: err?.message || String(err),
+      });
     }
 
     if (!verified?.ok) {
       return json200({ ok: false, error: "unauthorized" });
     }
 
-    /* 2️⃣ Params */
+    /* =====================================================
+       2) Lecture paramètres
+       ===================================================== */
     const url = new URL(req.url);
     const productId = url.searchParams.get("productId");
     const customerId = verified.loggedInCustomerId;
@@ -45,35 +54,48 @@ export async function GET(req: NextRequest) {
       return json200({ ok: false, error: "missing_params" });
     }
 
-    /* 3️⃣ Vérifier que l’élève a acheté la formation */
+    /* =====================================================
+       3) Vérifier l'achat de l'élève (Prisma)
+       ===================================================== */
     const purchase: any = await (prisma as any).studentCourse.findFirst({
-  where: {
-    shopifyCustomerId: String(customerId),
-    archived: false,
-    course: {
-      OR: [
-        { shopifyProductId: String(productId) },
-        { productId: String(productId) },
-      ],
-    },
-  },
-  include: {
-    course: true,
-  },
-});
+      where: {
+        shopifyCustomerId: String(customerId),
+        archived: false,
+        course: {
+          shopifyProductId: String(productId), // ✅ STRING uniquement
+        },
+      },
+      include: {
+        course: true,
+      },
+    });
 
-
-    if (!purchase || !purchase.course?.pdfUrl) {
-      return json200({ ok: false, error: "not_allowed_or_missing_pdf" });
+    if (!purchase || !purchase.course) {
+      return json200({ ok: false, error: "not_allowed" });
     }
 
-    /* 4️⃣ Télécharger le PDF */
-    return NextResponse.redirect(purchase.course.pdfUrl, 302);
-  } catch (e: any) {
+    /* =====================================================
+       4) Récupérer l'URL du PDF (tolérant)
+       ===================================================== */
+    const pdfUrl =
+      purchase.course.pdfUrl ||
+      purchase.course.pdf_url ||
+      purchase.course.pdfURL ||
+      null;
+
+    if (!pdfUrl) {
+      return json200({ ok: false, error: "missing_pdf_url" });
+    }
+
+    /* =====================================================
+       5) Redirection vers le PDF
+       ===================================================== */
+    return NextResponse.redirect(pdfUrl, 302);
+  } catch (err: any) {
     return json200({
       ok: false,
       error: "server_error",
-      message: e?.message || String(e),
+      message: err?.message || String(err),
     });
   }
 }
