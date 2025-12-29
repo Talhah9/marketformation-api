@@ -2,6 +2,12 @@
 // Crée un produit "Course" (vendor = email) + liste les courses.
 // Quota Starter (3 / mois) basé sur le métachamp mfapp.published_YYYYMM.
 // Retourne aussi { plan, quota: { limit, used, remaining } } pour l'abonnement.
+//
+// ✅ UPDATE (schema public):
+// - Support public listing via App Proxy: /apps/mf/courses?handle=XXX&public=1 (ou ?u=XXX)
+// - Résout handle -> customerId via tag Shopify: mf_handle:<handle>
+// - Résout ensuite email via customerId (pour vendor=email)
+// - En public=1: ne renvoie que les cours publiés + pas de quota
 
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 import { prisma } from '@/lib/prisma';
@@ -48,6 +54,35 @@ async function shopifyFetch(path: string, init?: RequestInit & { json?: any }) {
   } catch {}
 
   return { ok: res.ok, status: res.status, json, text };
+}
+
+/* ===== Public handle -> customer/email =====
+   Stratégie: customer tag "mf_handle:<handle>"
+   Exemple: mf_handle:john-doe
+*/
+async function findCustomerIdByHandle(handle: string): Promise<number | null> {
+  const h = String(handle || '').trim();
+  if (!h) return null;
+
+  // si on passe directement un ID numérique
+  const num = Number(h);
+  if (!Number.isNaN(num) && String(num) === h) return num;
+
+  const q = `tag:"mf_handle:${h}"`;
+  const r = await shopifyFetch(
+    `/customers/search.json?query=${encodeURIComponent(q)}&limit=1`,
+  );
+  if (!r.ok) return null;
+
+  const customers = (r.json as any)?.customers || [];
+  if (!customers[0]?.id) return null;
+  return Number(customers[0].id);
+}
+
+async function getCustomerEmailById(customerId: number): Promise<string> {
+  const r = await shopifyFetch(`/customers/${customerId}.json`);
+  const customer = (r.ok && (r.json as any)?.customer) || {};
+  return String(customer.email || '').trim();
 }
 
 /* ===== Labels thématiques (mêmes clés que côté front) ===== */
@@ -209,6 +244,12 @@ export async function OPTIONS(req: Request) {
    GET /api/courses
    → Liste les formations + renvoie le quota Starter
    + renvoie mf_theme / theme_label pour les blocs de thématiques
+
+   ✅ Public mode:
+   - accepte ?handle=xxx ou ?u=xxx
+   - accepte ?public=1
+   - resolve handle -> email (via tag customer mf_handle:<handle>)
+   - ne renvoie que published + pas de quota
 ===================================================================== */
 export async function GET(req: Request) {
   try {
@@ -221,8 +262,30 @@ export async function GET(req: Request) {
     }
 
     const url = new URL(req.url);
-    const email = (url.searchParams.get('email') || '').trim();
-    const vendor = email || 'unknown@vendor';
+
+    const handle =
+      (url.searchParams.get('handle') || '').trim() ||
+      (url.searchParams.get('u') || '').trim();
+
+    const isPublic = url.searchParams.get('public') === '1';
+
+    let email = (url.searchParams.get('email') || '').trim();
+
+    // ✅ PUBLIC: handle -> customerId -> email
+    if (!email && handle) {
+      const cid = await findCustomerIdByHandle(handle);
+      if (cid) email = await getCustomerEmailById(cid);
+    }
+
+    if (!email) {
+      return jsonWithCors(
+        req,
+        { ok: false, error: 'email_or_handle_required' },
+        { status: 400 },
+      );
+    }
+
+    const vendor = email;
 
     const r = await shopifyFetch(
       `/products.json?vendor=${encodeURIComponent(vendor)}&limit=250`,
@@ -237,13 +300,9 @@ export async function GET(req: Request) {
 
     const products = (r.json as any)?.products || [];
 
-    const items = await Promise.all(
+    const itemsRaw = await Promise.all(
       products.map(async (p: any) => {
-        const themeHandleRaw = await getProductMetafieldValue(
-          p.id,
-          'mfapp',
-          'theme',
-        );
+        const themeHandleRaw = await getProductMetafieldValue(p.id, 'mfapp', 'theme');
         const mf_theme = String(themeHandleRaw || '').trim();
         const theme_label =
           mf_theme && THEME_LABELS[mf_theme] ? THEME_LABELS[mf_theme] : '';
@@ -257,14 +316,18 @@ export async function GET(req: Request) {
           createdAt: p.created_at,
           mf_theme,
           theme_label,
+          url: p.handle ? `/products/${p.handle}` : '',
         };
       }),
     );
 
+    const items = isPublic ? itemsRaw.filter((x) => !!x.published) : itemsRaw;
+
     let plan: 'Starter' | 'Pro' | 'Business' | 'Unknown' = 'Unknown';
     let quota: any = null;
 
-    if (email) {
+    // ✅ Privé seulement (pas de quota en public)
+    if (!isPublic && email) {
       plan = await getPlanFromInternalSubscription(req, email);
 
       if (plan === 'Starter') {
@@ -498,24 +561,15 @@ export async function POST(req: Request) {
     try {
       const mf = (mfapp && typeof mfapp === 'object') ? mfapp : {};
 
-      const subtitleFinal =
-        cleanStr(mf.subtitle ?? subtitle, 600);
-
-      const formatFinal =
-        cleanStr(mf.format ?? '', 60);
-
-      const levelFinal =
-        cleanStr(mf.level ?? level_text ?? '', 80);
-
-      const durationFinal =
-        cleanStr(mf.duration ?? duration_text ?? '', 80);
+      const subtitleFinal = cleanStr(mf.subtitle ?? subtitle, 600);
+      const formatFinal = cleanStr(mf.format ?? '', 60);
+      const levelFinal = cleanStr(mf.level ?? level_text ?? '', 80);
+      const durationFinal = cleanStr(mf.duration ?? duration_text ?? '', 80);
 
       const learnArr = cleanList(mf.learn ?? learn, 12, 160);
       const audienceArr = cleanList(mf.audience ?? audience, 12, 160);
       const includesArr = cleanList(mf.includes ?? [], 12, 160);
       const reqArr = cleanList(requirements, 10, 160);
-
-      // modules: strings (nouvelle page) ou objets (plus tard)
       const modulesArr = cleanModules(mf.modules ?? modules, 30);
 
       if (subtitleFinal) {
@@ -558,7 +612,6 @@ export async function POST(req: Request) {
         );
       }
 
-      // si tu utilises language_text ailleurs, on le garde
       if (language_text && String(language_text).trim()) {
         await upsertProductMetafield(
           created.id,
@@ -637,7 +690,6 @@ export async function POST(req: Request) {
 
       const accessUrl = shopifyProductHandle ? `/products/${shopifyProductHandle}` : '';
 
-      // ✅ FIX: si un vrai subtitle existe, on le met, sinon on garde l’existant
       const mf = (mfapp && typeof mfapp === 'object') ? mfapp : {};
       const subtitleFinal =
         (String(mf.subtitle ?? subtitle ?? '').trim()) || (description || null);
