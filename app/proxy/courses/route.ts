@@ -6,10 +6,10 @@ import { verifyShopifyAppProxy } from "@/app/api/_lib/proxy";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function getHandleFromUrl(url: URL) {
+function pickHandle(url: URL) {
   return (
-    (url.searchParams.get("handle") || "").trim() ||
     (url.searchParams.get("u") || "").trim() ||
+    (url.searchParams.get("handle") || "").trim() ||
     ""
   );
 }
@@ -19,7 +19,7 @@ function isTrainerHandle(h: string) {
 }
 
 function digitsFromTrainerHandle(h: string) {
-  const m = String(h || "").match(/^trainer-(\d+)$/i);
+  const m = String(h || "").trim().match(/^trainer-(\d+)$/i);
   return m ? m[1] : "";
 }
 
@@ -36,70 +36,66 @@ export async function GET(req: NextRequest) {
     }
 
     const url = new URL(req.url);
-    const email = (url.searchParams.get("email") || "").trim();
-    const shopifyCustomerIdRaw = (url.searchParams.get("shopifyCustomerId") || "").trim();
-    const handle = getHandleFromUrl(url);
 
+    // Incoming params
+    const email = (url.searchParams.get("email") || "").trim();
+    const shopifyCustomerIdParam = (url.searchParams.get("shopifyCustomerId") || "").trim();
+    const handle = pickHandle(url);
+
+    // Verified logged-in customer id from App Proxy signature
     const logged = (verified.loggedInCustomerId ?? "").toString().trim();
 
-    // ✅ PRIVATE si l'utilisateur est connecté (logged) OU si email/shopifyCustomerId existent.
-    // On ne bascule PUBLIC que si on a un handle ET qu'il n'y a PAS de login.
-    const hasPrivateIdentity = !!logged || !!email || !!shopifyCustomerIdRaw;
-    const isPublic = !!handle && !hasPrivateIdentity;
+    // ✅ Public mode ONLY if explicitly requested
+    const isPublic = url.searchParams.get("public") === "1";
 
-    // ✅ Identité privée stable: on privilégie logged, sinon shopifyCustomerId
-    const shopifyCustomerId = logged || shopifyCustomerIdRaw;
+    // ✅ Choose stable private identity
+    // - Prefer verified logged id
+    // - Else allow explicit shopifyCustomerId
+    // - Else (public only) allow trainer-handle to derive numeric id
+    const derivedFromHandle = isTrainerHandle(handle) ? digitsFromTrainerHandle(handle) : "";
+    const shopifyCustomerId =
+      (logged || shopifyCustomerIdParam || (isPublic ? derivedFromHandle : "") || "").trim();
 
-    // ==========================================================
-    // MODE PRIVÉ: on exige au moins logged OU email
-    // ==========================================================
-    if (!isPublic) {
-      if (!shopifyCustomerId && !email) {
-        return NextResponse.json(
-          { ok: false, error: "MISSING_IDENTITY", reason: "NEED_LOGGED_OR_EMAIL" },
-          { status: 400 }
-        );
-      }
-
-      // mismatch check uniquement si on a les deux
-      if (shopifyCustomerIdRaw && logged && shopifyCustomerIdRaw !== logged) {
-        return NextResponse.json(
-          {
-            ok: false,
-            error: "FORBIDDEN",
-            reason: "CUSTOMER_MISMATCH",
-            logged_in_customer_id: logged,
-          },
-          { status: 403 }
-        );
-      }
+    // ✅ For private mode, if a shopifyCustomerId is provided and doesn't match logged, forbid
+    if (!isPublic && shopifyCustomerIdParam && logged && shopifyCustomerIdParam !== logged) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "FORBIDDEN",
+          reason: "CUSTOMER_MISMATCH",
+          logged_in_customer_id: logged,
+          shopifyCustomerId: shopifyCustomerIdParam,
+        },
+        { status: 403 }
+      );
     }
 
-    // Forward interne vers /api/courses
+    // ✅ Require at least one identity
+    // - Private: need logged/shopifyCustomerId or email
+    // - Public: need handle/u or derived id
+    const hasAnyIdentity = !!shopifyCustomerId || !!email || !!handle;
+    if (!hasAnyIdentity) {
+      return NextResponse.json(
+        { ok: false, error: "MISSING_IDENTITY", reason: "NEED_email_OR_shopifyCustomerId_OR_u_handle" },
+        { status: 400 }
+      );
+    }
+
+    // Forward to internal API
     const internal = new URL("/api/courses", url.origin);
 
-    if (isPublic) {
-      // ✅ Public: on envoie handle + u + shopifyCustomerId si déductible
-      const h = String(handle || "").trim();
-      internal.searchParams.set("public", "1");
-      internal.searchParams.set("handle", h);
-      internal.searchParams.set("u", h);
+    // Always forward stable ids if present
+    if (shopifyCustomerId) internal.searchParams.set("shopifyCustomerId", shopifyCustomerId);
+    if (email) internal.searchParams.set("email", email);
 
-      if (isTrainerHandle(h)) {
-        const digits = digitsFromTrainerHandle(h);
-        if (digits) internal.searchParams.set("shopifyCustomerId", digits);
-      }
-    } else {
-      // ✅ Privé: on privilégie shopifyCustomerId (stable)
-      if (shopifyCustomerId) internal.searchParams.set("shopifyCustomerId", shopifyCustomerId);
-      if (email) internal.searchParams.set("email", email);
-
-      // Tolérance si ton /api/courses sait aussi résoudre par handle/u
-      if (handle) {
-        internal.searchParams.set("handle", handle);
-        internal.searchParams.set("u", handle);
-      }
+    // Forward handle/u if present (tolerance)
+    if (handle) {
+      internal.searchParams.set("u", handle);
+      internal.searchParams.set("handle", handle);
     }
+
+    // Public flag only if explicitly asked
+    if (isPublic) internal.searchParams.set("public", "1");
 
     const r = await fetch(internal.toString(), {
       method: "GET",
@@ -108,6 +104,7 @@ export async function GET(req: NextRequest) {
     });
 
     const text = await r.text();
+
     let data: any = null;
     try {
       data = JSON.parse(text);
