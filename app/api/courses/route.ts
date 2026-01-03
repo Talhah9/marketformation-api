@@ -59,6 +59,38 @@ async function shopifyFetch(path: string, init?: RequestInit & { json?: any }) {
 /* ===== Public handle -> customer/email =====
    Stratégie legacy: customer tag "mf_handle:<handle>"
 */
+// --- AJOUTE CE HELPER À CÔTÉ DE shopifyFetch (même style) ---
+async function shopifyGraphql(query: string, variables?: any) {
+  const domain = process.env.SHOP_DOMAIN;
+  if (!domain) throw new Error('Missing env SHOP_DOMAIN');
+
+  const base = `https://${domain}/admin/api/2024-07/graphql.json`;
+  const headers: Record<string, string> = {
+    'X-Shopify-Access-Token': getAdminToken(),
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+  };
+
+  const res = await fetch(base, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ query, variables: variables || {} }),
+    cache: 'no-store',
+  });
+
+  const text = await res.text();
+  let json: any = {};
+  try { json = text ? JSON.parse(text) : {}; } catch {}
+  return { ok: res.ok, status: res.status, json, text };
+}
+
+/* ===== Public handle -> customer/email =====
+   ✅ support:
+   - trainer-<id>
+   - numeric id
+   - metafield mkt.handle (comme /api/profile)
+   - legacy tag mf_handle:<handle>
+*/
 async function findCustomerIdByHandle(handle: string): Promise<number | null> {
   const h = String(handle || '').trim();
   if (!h) return null;
@@ -67,14 +99,31 @@ async function findCustomerIdByHandle(handle: string): Promise<number | null> {
   const m = h.match(/^trainer-(\d+)$/i);
   if (m) return Number(m[1]);
 
-  // ✅ si on passe directement un ID numérique
+  // ✅ numeric id direct
   const num = Number(h);
   if (!Number.isNaN(num) && String(num) === h) return num;
 
-  // ✅ fallback: tag customer "mf_handle:<handle>"
-  const q = `tag:"mf_handle:${h}"`;
+  // ✅ NEW: GraphQL metafield mkt.handle:'<handle>'  (même logique que profile)
+  try {
+    const q = `
+      query($search: String!) {
+        customers(first: 1, query: $search) {
+          edges {
+            node { legacyResourceId }
+          }
+        }
+      }
+    `;
+    const search = `metafield:mkt.handle:'${h.replace(/'/g, "\\'")}'`;
+    const gr = await shopifyGraphql(q, { search });
+    const cid = gr.json?.data?.customers?.edges?.[0]?.node?.legacyResourceId;
+    if (cid) return Number(cid);
+  } catch {}
+
+  // ✅ legacy fallback: tag customer "mf_handle:<handle>"
+  const qTag = `tag:"mf_handle:${h}"`;
   const r = await shopifyFetch(
-    `/customers/search.json?query=${encodeURIComponent(q)}&limit=1`,
+    `/customers/search.json?query=${encodeURIComponent(qTag)}&limit=1`
   );
   if (!r.ok) return null;
 
@@ -82,6 +131,7 @@ async function findCustomerIdByHandle(handle: string): Promise<number | null> {
   if (!customers[0]?.id) return null;
   return Number(customers[0].id);
 }
+
 
 async function getCustomerEmailById(customerId: number): Promise<string> {
   const r = await shopifyFetch(`/customers/${customerId}.json`);
