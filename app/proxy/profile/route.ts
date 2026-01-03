@@ -6,6 +6,10 @@ import { verifyShopifyAppProxy } from "@/app/api/_lib/proxy";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+function pickHandle(url: URL) {
+  return (url.searchParams.get("handle") || url.searchParams.get("u") || "").trim();
+}
+
 export async function GET(req: NextRequest) {
   try {
     const sharedSecret = process.env.APP_PROXY_SHARED_SECRET;
@@ -20,16 +24,31 @@ export async function GET(req: NextRequest) {
 
     const url = new URL(req.url);
 
-    // ✅ public key
-    const handle = (url.searchParams.get("handle") || url.searchParams.get("u") || "").trim();
-
-    // ✅ private keys
+    const handle = pickHandle(url);
     const email = (url.searchParams.get("email") || "").trim();
     const shopifyCustomerId = (url.searchParams.get("shopifyCustomerId") || "").trim();
+    const isPublic = url.searchParams.get("public") === "1";
 
-    // ✅ on autorise:
-    // - public: handle
-    // - privé: email / customerId
+    const logged = (verified.loggedInCustomerId ?? "").toString().trim();
+
+    // ✅ Sécurité: en privé, si on fournit shopifyCustomerId, on vérifie mismatch
+    // (en public, on ne force pas ça)
+    if (!isPublic && shopifyCustomerId && logged && shopifyCustomerId !== logged) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "FORBIDDEN",
+          reason: "CUSTOMER_MISMATCH",
+          logged_in_customer_id: logged,
+          shopifyCustomerId,
+        },
+        { status: 403 }
+      );
+    }
+
+    // ✅ Identité minimale
+    // - public: handle (u=trainer-<id>) recommandé, mais on tolère email/customerId aussi
+    // - privé: email ou customerId
     if (!handle && !email && !shopifyCustomerId) {
       return NextResponse.json(
         { ok: false, error: "MISSING_HANDLE_OR_PRIVATE_ID" },
@@ -39,9 +58,13 @@ export async function GET(req: NextRequest) {
 
     // Forward interne vers /api/profile
     const internal = new URL("/api/profile", url.origin);
+
     if (handle) internal.searchParams.set("handle", handle);
     if (email) internal.searchParams.set("email", email);
     if (shopifyCustomerId) internal.searchParams.set("shopifyCustomerId", shopifyCustomerId);
+
+    // forward flag (future-proof)
+    if (isPublic) internal.searchParams.set("public", "1");
 
     const r = await fetch(internal.toString(), {
       method: "GET",
@@ -81,12 +104,27 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const url = new URL(req.url);
+    const logged = (verified.loggedInCustomerId ?? "").toString().trim();
 
-    // Forward interne vers /api/profile
-    const internal = new URL("/api/profile", url.origin);
-
+    const internal = new URL("/api/profile", new URL(req.url).origin);
     const body = await req.json().catch(() => ({}));
+
+    // ✅ Optionnel mais utile: si le body contient shopifyCustomerId, on bloque mismatch
+    const bodyAny: any = body?.profile && typeof body.profile === "object" ? body.profile : body;
+    const shopifyCustomerId = String(bodyAny?.shopifyCustomerId || bodyAny?.customerId || "").trim();
+
+    if (shopifyCustomerId && logged && shopifyCustomerId !== logged) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "FORBIDDEN",
+          reason: "CUSTOMER_MISMATCH",
+          logged_in_customer_id: logged,
+          shopifyCustomerId,
+        },
+        { status: 403 }
+      );
+    }
 
     const r = await fetch(internal.toString(), {
       method: "POST",

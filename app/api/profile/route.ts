@@ -135,6 +135,14 @@ function safeUrl(s: string) {
   return "https://" + v.replace(/^\/+/, "");
 }
 
+function urlOrEmpty(s: string) {
+  const v = String(s || "").trim();
+  if (!v) return "";
+  // ✅ on ne "fabrique" pas une URL pour les réseaux : on garde uniquement si déjà URL
+  if (/^https?:\/\//i.test(v)) return v;
+  return "";
+}
+
 /* ============================================================
    Shopify helpers
 ============================================================ */
@@ -234,7 +242,6 @@ async function resolveCustomerIdByHandle(handle: string): Promise<number | null>
       }
     }
   `;
-  // NOTE: Shopify search syntax may vary. This is best-effort.
   const search = `metafield:mkt.handle:'${h}'`;
   const r = await shopifyGraphql(q, { search });
   const edge = r.json?.data?.customers?.edges?.[0]?.node;
@@ -254,20 +261,15 @@ async function getCustomerMetafields(customerId: number) {
 }
 
 async function getProfileFromCustomer(customerId: number, fallbackEmail: string): Promise<Profile> {
-  // 1) customer
   const cRes = await shopifyFetch(`/customers/${customerId}.json`);
   const customer = (cRes.ok && (cRes.json as any)?.customer) || {};
 
-  // 2) metafields
   const { getVal } = await getCustomerMetafields(customerId);
 
   const first_name = customer.first_name || "";
   const last_name  = customer.last_name || "";
   const email      = customer.email || fallbackEmail;
 
-  const displayName = `${first_name} ${last_name}`.trim();
-
-  // ✅ handle: metafield or fallback trainer-id
   const savedHandle = getVal("handle");
   const handle = (savedHandle || "").trim() || `trainer-${customerId}`;
 
@@ -289,11 +291,9 @@ async function getProfileFromCustomer(customerId: number, fallbackEmail: string)
       twitter: getVal("twitter"),
     },
 
-    // private ids
     email,
     shopifyCustomerId: String(customerId),
 
-    // legacy fields for compatibility
     first_name,
     last_name,
     phone: getVal("phone"),
@@ -321,8 +321,8 @@ async function upsertCustomerMetafield(customerId: number, key: string, type: st
 async function saveProfileToCustomer(customerId: number, profile: Profile) {
   const displayName = `${profile.first_name || ""} ${profile.last_name || ""}`.trim();
 
-  // ✅ handle: if missing, generate a stable one
-  const handle = (profile.handle || "").trim() || `trainer-${customerId}`;
+  // ✅ ALWAYS stable handle
+  const handle = `trainer-${customerId}`;
 
   const entries: Array<[string, string, string]> = [
     ["handle", "single_line_text_field", handle],
@@ -335,12 +335,15 @@ async function saveProfileToCustomer(customerId: number, profile: Profile) {
     ["expertise_url", "url", profile.expertise_url || ""],
     ["phone", "single_line_text_field", profile.phone || ""],
 
+    // ✅ website: safeUrl
     ["website", "url", safeUrl(profile.links?.website || profile.website || "")],
-    ["linkedin", "url", safeUrl(profile.links?.linkedin || profile.linkedin || "")],
-    ["instagram", "url", safeUrl(profile.links?.instagram || "")],
-    ["youtube", "url", safeUrl(profile.links?.youtube || "")],
-    ["facebook", "url", safeUrl(profile.links?.facebook || "")],
-    ["twitter", "url", safeUrl(profile.links?.twitter || profile.twitter || "")],
+
+    // ✅ socials: ONLY keep if already URL (avoid https://monpseudo)
+    ["linkedin", "url", urlOrEmpty(profile.links?.linkedin || profile.linkedin || "")],
+    ["instagram", "url", urlOrEmpty(profile.links?.instagram || "")],
+    ["youtube", "url", urlOrEmpty(profile.links?.youtube || "")],
+    ["facebook", "url", urlOrEmpty(profile.links?.facebook || "")],
+    ["twitter", "url", urlOrEmpty(profile.links?.twitter || profile.twitter || "")],
   ];
 
   for (const [key, type, value] of entries) {
@@ -351,7 +354,7 @@ async function saveProfileToCustomer(customerId: number, profile: Profile) {
 /* ============================================================
    GET profil
    - privé: ?email= / ?shopifyCustomerId=
-   - public: ?handle=
+   - public: ?u=trainer-<id> (ou ?handle=)
 ============================================================ */
 export async function GET(req: Request) {
   try {
@@ -365,9 +368,7 @@ export async function GET(req: Request) {
 
     if (handle) {
       cid = await resolveCustomerIdByHandle(handle);
-      if (!cid) {
-        return json(req, { ok: false, error: "handle_not_found" }, 404);
-      }
+      if (!cid) return json(req, { ok: false, error: "handle_not_found" }, 404);
     } else {
       if (!email && !shopifyCustomerId) {
         return json(req, { ok: false, error: "email_or_customerId_required" }, 400);
@@ -382,12 +383,13 @@ export async function GET(req: Request) {
     const memKey = makeKey(profile.email, profile.shopifyCustomerId);
     const mem = MEMORY[memKey] || (profile.email ? MEMORY[profile.email] : undefined);
     if (mem) {
-      // on merge léger si Shopify vide
       if (!profile.bio && mem.bio) profile.bio = mem.bio;
       if (!profile.avatar_url && mem.avatar_url) profile.avatar_url = mem.avatar_url;
       if (!profile.headline && mem.headline) profile.headline = mem.headline;
       if (!profile.language && mem.language) profile.language = mem.language;
-      if (!profile.links?.website && mem.links?.website) profile.links = { ...(profile.links || {}), website: mem.links.website };
+      if (!profile.links?.website && mem.links?.website) {
+        profile.links = { ...(profile.links || {}), website: mem.links.website };
+      }
     }
 
     return json(req, { ok: true, profile }, 200);
@@ -413,19 +415,12 @@ export async function POST(req: Request) {
 
     const first_name = getFirst(body, ["first_name", "firstName"]);
     const last_name = getFirst(body, ["last_name", "lastName"]);
-    const display = `${first_name} ${last_name}`.trim();
-
-    // ✅ handle (si absent, on en crée un “joli” mais stable)
-    let handle = getFirst(body, ["handle", "trainerHandle", "publicHandle"]);
-    handle = (handle || "").trim();
-    if (!handle) {
-      handle = display ? slugify(display) : "";
-    }
 
     const linksFromBody = body.links && typeof body.links === "object" ? body.links : {};
 
     const profile: Profile = {
-      handle,
+      // placeholder handle (will be forced to trainer-<cid>)
+      handle: getFirst(body, ["handle", "trainerHandle", "publicHandle"]),
 
       bio: getFirst(body, ["bio", "description", "about"]),
       avatar_url: getFirst(body, ["avatar_url", "avatarUrl", "image_url", "imageUrl"]),
@@ -434,12 +429,24 @@ export async function POST(req: Request) {
       language: getFirst(body, ["language", "lang"]),
 
       links: {
-        website: getFirst(linksFromBody, ["website"]) || getFirst(body, ["website", "site", "website_url"]),
-        linkedin: getFirst(linksFromBody, ["linkedin"]) || getFirst(body, ["linkedin"]),
-        instagram: getFirst(linksFromBody, ["instagram"]) || getFirst(body, ["instagram"]),
-        youtube: getFirst(linksFromBody, ["youtube"]) || getFirst(body, ["youtube"]),
-        facebook: getFirst(linksFromBody, ["facebook"]) || getFirst(body, ["facebook"]),
-        twitter: getFirst(linksFromBody, ["twitter"]) || getFirst(body, ["twitter", "x"]),
+        website:
+          getFirst(linksFromBody, ["website"]) ||
+          getFirst(body, ["website", "site", "website_url"]),
+        linkedin:
+          getFirst(linksFromBody, ["linkedin"]) ||
+          getFirst(body, ["linkedin"]),
+        instagram:
+          getFirst(linksFromBody, ["instagram"]) ||
+          getFirst(body, ["instagram"]),
+        youtube:
+          getFirst(linksFromBody, ["youtube"]) ||
+          getFirst(body, ["youtube"]),
+        facebook:
+          getFirst(linksFromBody, ["facebook"]) ||
+          getFirst(body, ["facebook"]),
+        twitter:
+          getFirst(linksFromBody, ["twitter"]) ||
+          getFirst(body, ["twitter", "x"]),
       },
 
       email,
@@ -457,11 +464,11 @@ export async function POST(req: Request) {
     const cid = await resolveCustomerId(email, shopifyCustomerIdRaw);
     if (!cid) return json(req, { ok: false, error: "customer_not_found" }, 404);
 
-    // ✅ si handle “joli” est vide → trainer-id
-    if (!profile.handle) profile.handle = `trainer-${cid}`;
+    // ✅ FORCE stable handle ALWAYS
+    profile.handle = `trainer-${cid}`;
+    profile.shopifyCustomerId = String(cid);
 
     await saveProfileToCustomer(cid, profile);
-    profile.shopifyCustomerId = String(cid);
 
     // mémoire locale fallback
     const memKey = makeKey(email, profile.shopifyCustomerId);

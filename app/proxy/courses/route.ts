@@ -48,10 +48,15 @@ export async function GET(req: NextRequest) {
     // ✅ Public mode ONLY if explicitly requested
     const isPublic = url.searchParams.get("public") === "1";
 
-    // ✅ Choose stable private identity
-    // - Prefer verified logged id
-    // - Else allow explicit shopifyCustomerId
-    // - Else (public only) allow trainer-handle to derive numeric id
+    // ✅ En public, on veut une identité publique stable (u/handle = trainer-<id>)
+    if (isPublic && !handle) {
+      return NextResponse.json(
+        { ok: false, error: "MISSING_HANDLE", reason: "public=1 requires u/handle" },
+        { status: 400 }
+      );
+    }
+
+    // ✅ Choose stable identity
     const derivedFromHandle = isTrainerHandle(handle) ? digitsFromTrainerHandle(handle) : "";
     const shopifyCustomerId =
       (logged || shopifyCustomerIdParam || (isPublic ? derivedFromHandle : "") || "").trim();
@@ -71,12 +76,14 @@ export async function GET(req: NextRequest) {
     }
 
     // ✅ Require at least one identity
-    // - Private: need logged/shopifyCustomerId or email
-    // - Public: need handle/u or derived id
     const hasAnyIdentity = !!shopifyCustomerId || !!email || !!handle;
     if (!hasAnyIdentity) {
       return NextResponse.json(
-        { ok: false, error: "MISSING_IDENTITY", reason: "NEED_email_OR_shopifyCustomerId_OR_u_handle" },
+        {
+          ok: false,
+          error: "MISSING_IDENTITY",
+          reason: "NEED_email_OR_shopifyCustomerId_OR_u_handle",
+        },
         { status: 400 }
       );
     }
@@ -115,6 +122,7 @@ export async function GET(req: NextRequest) {
       );
     }
 
+    // ✅ Bonus: si /api/courses renvoie une erreur, on la remonte telle quelle (facile à debug)
     return NextResponse.json(data, { status: r.status });
   } catch (e: any) {
     return NextResponse.json(
