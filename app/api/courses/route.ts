@@ -6,7 +6,7 @@
 // ✅ Public listing via App Proxy:
 // - /apps/mf/courses?u=trainer-<id>&public=1
 // - /apps/mf/courses?handle=xxx&public=1 (legacy)
-// ✅ FIX: en public avec trainer-<id>, on liste par metafield produit mkt.owner_id (pas besoin read_customers)
+// - ✅ FIX: support Shopify IDs > 2^53 (NE JAMAIS Number()) via GraphQL email resolve
 // - En public=1: ne renvoie que published + pas de quota
 
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
@@ -86,6 +86,75 @@ async function shopifyGraphql(query: string, variables?: any) {
   return { ok: res.ok, status: res.status, json, text };
 }
 
+/* ===== Public handle -> email (BIGINT safe) =====
+   ✅ Support:
+   - u=trainer-<id> (id peut être > 2^53)
+   - u=<iddigits>
+   - handle=<custom> via customer metafield mkt.handle
+   - legacy tag mf_handle:<handle>
+*/
+function extractDigitsHandle(h: string) {
+  const s = String(h || '').trim();
+  if (!s) return '';
+  const m = s.match(/^trainer-(\d+)$/i);
+  if (m) return m[1];
+  if (/^\d+$/.test(s)) return s;
+  return '';
+}
+function customerGidFromIdDigits(idDigits: string) {
+  const d = String(idDigits || '').trim();
+  if (!/^\d+$/.test(d)) return '';
+  return `gid://shopify/Customer/${d}`;
+}
+
+async function resolveEmailByCustomerIdDigits(idDigits: string): Promise<string> {
+  const gid = customerGidFromIdDigits(idDigits);
+  if (!gid) return '';
+
+  const q = `
+    query($id: ID!) {
+      customer(id: $id) {
+        email
+      }
+    }
+  `;
+  const r = await shopifyGraphql(q, { id: gid });
+  const email = String(r.json?.data?.customer?.email || '').trim();
+  return email;
+}
+
+async function resolveEmailByHandle(handle: string): Promise<string> {
+  const h = String(handle || '').trim();
+  if (!h) return '';
+
+  // 1) trainer-<id> or numeric => direct customer lookup
+  const digits = extractDigitsHandle(h);
+  if (digits) {
+    const email = await resolveEmailByCustomerIdDigits(digits);
+    if (email) return email;
+  }
+
+  // 2) GraphQL search by metafield mkt.handle OR legacy tag mf_handle:<handle>
+  // Shopify query syntax allows OR
+  const safe = h.replace(/"/g, '\\"');
+  const search = `metafield:mkt.handle:"${safe}" OR tag:"mf_handle:${safe}"`;
+
+  const q = `
+    query($search: String!) {
+      customers(first: 1, query: $search) {
+        edges {
+          node {
+            email
+          }
+        }
+      }
+    }
+  `;
+  const r = await shopifyGraphql(q, { search });
+  const email = String(r.json?.data?.customers?.edges?.[0]?.node?.email || '').trim();
+  return email;
+}
+
 /* ===== Labels thématiques ===== */
 const THEME_LABELS: Record<string, string> = {
   'tech-ia': 'Tech & IA',
@@ -96,7 +165,7 @@ const THEME_LABELS: Record<string, string> = {
   'developpement-personnel-bien-etre': 'Développement perso & Bien-être',
 };
 
-/* ===== Métachamps produit ===== */
+/* ===== Métachamps ===== */
 async function getProductMetafieldValue(productId: number, namespace: string, key: string) {
   const r = await shopifyFetch(`/products/${productId}/metafields.json?limit=250`);
   if (!r.ok) return null;
@@ -188,62 +257,6 @@ async function countPublishedThisMonthByMetafield(email: string) {
   return count;
 }
 
-/* ===== Helpers handle ===== */
-function extractTrainerDigits(h: string) {
-  const s = String(h || '').trim();
-  if (!s) return '';
-  const m = s.match(/^trainer-(\d+)$/i);
-  if (m) return m[1];
-  if (/^\d+$/.test(s)) return s;
-  return '';
-}
-
-/* ===== Public list via GraphQL products (owner_id) ===== */
-async function listProductsByOwnerId(ownerIdDigits: string) {
-  const id = String(ownerIdDigits || '').trim();
-  if (!/^\d+$/.test(id)) return [];
-
-  // IMPORTANT: owner_id est stocké dans tes produits (POST) => mkt.owner_id = customerId
-  const search = `metafield:mkt.owner_id:'${id}'`;
-
-  const q = `
-    query($search: String!, $n: Int!) {
-      products(first: $n, query: $search) {
-        edges {
-          node {
-            legacyResourceId
-            title
-            handle
-            publishedAt
-            createdAt
-            featuredImage { url }
-            metafield(namespace: "mfapp", key: "theme") { value }
-          }
-        }
-      }
-    }
-  `;
-
-  const r = await shopifyGraphql(q, { search, n: 250 });
-
-  const edges = r.json?.data?.products?.edges || [];
-  return edges.map((e: any) => {
-    const p = e?.node || {};
-    return {
-      id: Number(p.legacyResourceId || 0),
-      title: p.title || '',
-      coverUrl: p.featuredImage?.url || '',
-      image_url: p.featuredImage?.url || '',
-      published: !!p.publishedAt,
-      published_at: p.publishedAt || null,
-      createdAt: p.createdAt || null,
-      mf_theme: String(p.metafield?.value || '').trim(),
-      url: p.handle ? `/products/${p.handle}` : '',
-      handle: p.handle || '',
-    };
-  });
-}
-
 /* ===== sanitize helpers for sync fields ===== */
 function cleanStr(v: any, max = 180) {
   return String(v ?? '').trim().slice(0, max);
@@ -279,15 +292,16 @@ export async function OPTIONS(req: Request) {
 
 /* =====================================================================
    GET /api/courses
+   ✅ Public:
+   - ?public=1
+   - accepte ?u=trainer-<id> OU ?shopifyCustomerId=<id> OU ?handle=<...>
+   - ✅ FIX: resolve email via GraphQL (bigint-safe)
+   - public => ONLY published + pas de quota
 ===================================================================== */
 export async function GET(req: Request) {
   try {
     if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' },
-        { status: 500 },
-      );
+      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' }, { status: 500 });
     }
 
     const url = new URL(req.url);
@@ -299,55 +313,27 @@ export async function GET(req: Request) {
     const isPublic = url.searchParams.get('public') === '1';
 
     let email = (url.searchParams.get('email') || '').trim();
+
+    // ✅ public can pass shopifyCustomerId too (can be > 2^53 => keep as string)
     const shopifyCustomerIdRaw = (url.searchParams.get('shopifyCustomerId') || '').trim();
 
-    // ✅ PUBLIC: priorité au handle trainer-<id> => list via owner_id metafield (NO EMAIL NEEDED)
-    if (isPublic) {
-      const digits =
-        extractTrainerDigits(handle) ||
-        (shopifyCustomerIdRaw && /^\d+$/.test(shopifyCustomerIdRaw) ? shopifyCustomerIdRaw : '');
-
-      if (!digits) {
-        return jsonWithCors(
-          req,
-          { ok: false, error: 'email_or_resolvable_handle_required' },
-          { status: 400 },
-        );
-      }
-
-      const itemsRaw = await listProductsByOwnerId(digits);
-
-      // label thème (best-effort)
-      const items = itemsRaw
-        .filter((x: any) => !!x.published) // published only
-        .map((x: any) => {
-          const theme_label =
-            x.mf_theme && THEME_LABELS[x.mf_theme] ? THEME_LABELS[x.mf_theme] : '';
-          return { ...x, theme_label };
-        });
-
-      return jsonWithCors(req, { ok: true, items, plan: 'Unknown', quota: null });
+    // 1) if email absent, try resolve by explicit shopifyCustomerId
+    if (!email && shopifyCustomerIdRaw) {
+      email = await resolveEmailByCustomerIdDigits(shopifyCustomerIdRaw);
     }
 
-    // ✅ PRIVATE: on garde ton ancien comportement vendor=email
-    // 1) si email direct ok
-    // 2) sinon si shopifyCustomerId fourni, on NE PEUT PAS forcément lire customer email (scope read_customers),
-    //    donc on refuse proprement en privé (ton core privé passe déjà email normalement).
-    if (!email && shopifyCustomerIdRaw) {
-      // On pourrait tenter /api/profile (qui lui a read_customers), mais tu veux un truc stable:
-      // => impose l'email en privé.
-      // (Ton compte formateur envoie déjà email.)
+    // 2) if still no email, try resolve by handle/u (trainer-<id> or metafield/tag)
+    if (!email && handle) {
+      email = await resolveEmailByHandle(handle);
     }
 
     if (!email) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'email_or_resolvable_handle_required' },
-        { status: 400 },
-      );
+      return jsonWithCors(req, { ok: false, error: 'email_or_resolvable_handle_required' }, { status: 400 });
     }
 
-    const r = await shopifyFetch(`/products.json?vendor=${encodeURIComponent(email)}&limit=250`);
+    const vendor = email;
+
+    const r = await shopifyFetch(`/products.json?vendor=${encodeURIComponent(vendor)}&limit=250`);
     if (!r.ok) {
       return jsonWithCors(
         req,
@@ -380,30 +366,36 @@ export async function GET(req: Request) {
       }),
     );
 
+    // ✅ public => ONLY published
+    const items = isPublic ? itemsRaw.filter((x) => !!x.published) : itemsRaw;
+
     let plan: 'Starter' | 'Pro' | 'Business' | 'Unknown' = 'Unknown';
     let quota: any = null;
 
-    plan = await getPlanFromInternalSubscription(req, email);
+    // ✅ Privé seulement
+    if (!isPublic && email) {
+      plan = await getPlanFromInternalSubscription(req, email);
 
-    if (plan === 'Starter') {
-      const used = await countPublishedThisMonthByMetafield(email);
-      quota = { plan: 'Starter', limit: 3, used, remaining: Math.max(0, 3 - used) };
-    } else {
-      quota = { plan, limit: null, used: null, remaining: null };
+      if (plan === 'Starter') {
+        const used = await countPublishedThisMonthByMetafield(email);
+        quota = { plan: 'Starter', limit: 3, used, remaining: Math.max(0, 3 - used) };
+      } else {
+        quota = { plan, limit: null, used: null, remaining: null };
+      }
     }
 
-    return jsonWithCors(req, { ok: true, items: itemsRaw, plan, quota });
+    return jsonWithCors(req, { ok: true, items, plan, quota });
   } catch (e: any) {
-    return jsonWithCors(
-      req,
-      { ok: false, error: e?.message || 'list_failed' },
-      { status: 500 },
-    );
+    return jsonWithCors(req, { ok: false, error: e?.message || 'list_failed' }, { status: 500 });
   }
 }
 
 /* =====================================================================
-   POST /api/courses (inchangé sur le fond)
+   POST /api/courses
+   → Création d’un produit (Course) + quota Starter
+   + enregistre la thématique (mfapp.theme)
+   + crée / met à jour la Course en base Prisma
+   + écrit les champs synchronisés pour la fiche produit
 ===================================================================== */
 export async function POST(req: Request) {
   try {
@@ -425,17 +417,22 @@ export async function POST(req: Request) {
       title,
       description,
       imageUrl,
+
       price,
+
       pdfUrl: pdfUrlRaw,
       pdf_url,
       status = 'active',
       collectionId,
       collectionHandle,
       collectionHandleOrId,
+
       theme,
       themeHandle,
       mf_theme,
+
       mfapp,
+
       subtitle,
       learn,
       modules,
@@ -463,12 +460,17 @@ export async function POST(req: Request) {
       if (used >= 3) {
         return jsonWithCors(
           req,
-          { ok: false, error: 'quota_reached', detail: 'Starter plan allows 3 published courses per month' },
+          {
+            ok: false,
+            error: 'quota_reached',
+            detail: 'Starter plan allows 3 published courses per month',
+          },
           { status: 403 },
         );
       }
     }
 
+    // normaliser prix Shopify (string "12.34")
     let priceStr = '';
     if (price !== undefined && price !== null && String(price).trim() !== '') {
       const n = Number(price);
@@ -476,6 +478,7 @@ export async function POST(req: Request) {
       else priceStr = String(price).trim();
     }
 
+    /* Création produit */
     const productPayload = {
       product: {
         title,
@@ -508,18 +511,20 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: 'create_failed_no_id' }, { status: 500 });
     }
 
-    // ✅ IMPORTANT PUBLIC LISTING: mkt.owner_id est la clé de listing public
+    /* Métachamps mkt */
     await upsertProductMetafield(created.id, 'mkt', 'owner_email', 'single_line_text_field', email);
     if (shopifyCustomerId) {
       await upsertProductMetafield(created.id, 'mkt', 'owner_id', 'single_line_text_field', String(shopifyCustomerId));
     }
     await upsertProductMetafield(created.id, 'mkt', 'pdf_url', 'url', pdfUrl);
 
+    /* Marquage quota */
     if (status === 'active') {
       const bucket = ym();
       await upsertProductMetafield(created.id, 'mfapp', 'published_YYYYMM', 'single_line_text_field', bucket);
     }
 
+    /* Assignation collection + thématique */
     const selector = collectionId ?? collectionHandleOrId ?? collectionHandle;
 
     let themeHandleFinal = (mf_theme || themeHandle || theme || '').toString().trim() || '';
@@ -542,6 +547,7 @@ export async function POST(req: Request) {
       await upsertProductMetafield(created.id, 'mfapp', 'theme', 'single_line_text_field', themeHandleFinal);
     }
 
+    // ✅ Synchro fiche produit (Udemy-like)
     try {
       const mf = mfapp && typeof mfapp === 'object' ? mfapp : {};
 
@@ -571,15 +577,26 @@ export async function POST(req: Request) {
       if (language_text && String(language_text).trim()) {
         await upsertProductMetafield(created.id, 'mfapp', 'language_text', 'single_line_text_field', cleanStr(language_text, 60));
       }
-      if (learnArr.length) await upsertProductMetafield(created.id, 'mfapp', 'learn', 'json', JSON.stringify(learnArr));
-      if (modulesArr.length) await upsertProductMetafield(created.id, 'mfapp', 'modules', 'json', JSON.stringify(modulesArr));
-      if (audienceArr.length) await upsertProductMetafield(created.id, 'mfapp', 'audience', 'json', JSON.stringify(audienceArr));
-      if (includesArr.length) await upsertProductMetafield(created.id, 'mfapp', 'includes', 'json', JSON.stringify(includesArr));
-      if (reqArr.length) await upsertProductMetafield(created.id, 'mfapp', 'requirements', 'json', JSON.stringify(reqArr));
+      if (learnArr.length) {
+        await upsertProductMetafield(created.id, 'mfapp', 'learn', 'json', JSON.stringify(learnArr));
+      }
+      if (modulesArr.length) {
+        await upsertProductMetafield(created.id, 'mfapp', 'modules', 'json', JSON.stringify(modulesArr));
+      }
+      if (audienceArr.length) {
+        await upsertProductMetafield(created.id, 'mfapp', 'audience', 'json', JSON.stringify(audienceArr));
+      }
+      if (includesArr.length) {
+        await upsertProductMetafield(created.id, 'mfapp', 'includes', 'json', JSON.stringify(includesArr));
+      }
+      if (reqArr.length) {
+        await upsertProductMetafield(created.id, 'mfapp', 'requirements', 'json', JSON.stringify(reqArr));
+      }
     } catch (e) {
       console.error('[MF] sync metafields error', e);
     }
 
+    // Prisma
     try {
       const shopifyProductId = String(created.id);
       const shopifyProductHandle = created.handle || null;
@@ -634,4 +651,21 @@ export async function POST(req: Request) {
   } catch (e: any) {
     return jsonWithCors(req, { ok: false, error: e?.message || 'create_failed' }, { status: 500 });
   }
+}
+
+// helpers legacy
+function mfText(ns: string, key: string, value?: string) {
+  const v = (value || '').trim();
+  if (!v) return null;
+  return { namespace: ns, key, type: 'single_line_text_field', value: v };
+}
+function mfUrl(ns: string, key: string, value?: string) {
+  const v = (value || '').trim();
+  if (!v) return null;
+  return { namespace: ns, key, type: 'url', value: v };
+}
+function mfJson(ns: string, key: string, value: any) {
+  if (value == null) return null;
+  if (Array.isArray(value) && value.length === 0) return null;
+  return { namespace: ns, key, type: 'json', value: JSON.stringify(value) };
 }
