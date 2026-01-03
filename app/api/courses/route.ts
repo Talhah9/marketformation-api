@@ -8,10 +8,6 @@
 // - /apps/mf/courses?handle=xxx&public=1 (legacy)
 // - Résout email via customerId (trainer-<id> ou shopifyCustomerId) OU via tag mf_handle:<handle>
 // - En public=1: ne renvoie que published + pas de quota
-//
-// ✅ FIX demandé:
-// - Support trainer-<id> dans findCustomerIdByHandle (déjà là)
-// - En public: "published" doit fonctionner même si published_at est null -> on accepte status === 'active'
 
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 import { prisma } from '@/lib/prisma';
@@ -104,11 +100,7 @@ const THEME_LABELS: Record<string, string> = {
 };
 
 /* ===== Métachamps ===== */
-async function getProductMetafieldValue(
-  productId: number,
-  namespace: string,
-  key: string,
-) {
+async function getProductMetafieldValue(productId: number, namespace: string, key: string) {
   const r = await shopifyFetch(`/products/${productId}/metafields.json?limit=250`);
   if (!r.ok) return null;
   const arr = (r.json as any)?.metafields || [];
@@ -149,14 +141,16 @@ async function resolveCollectionId(handleOrId?: string | number): Promise<number
   let r = await shopifyFetch(
     `/custom_collections.json?handle=${encodeURIComponent(handle)}&limit=1`,
   );
-  if (r.ok && (r.json as any)?.custom_collections?.[0]?.id)
+  if (r.ok && (r.json as any)?.custom_collections?.[0]?.id) {
     return Number((r.json as any).custom_collections[0].id);
+  }
 
   r = await shopifyFetch(
     `/smart_collections.json?handle=${encodeURIComponent(handle)}&limit=1`,
   );
-  if (r.ok && (r.json as any)?.smart_collections?.[0]?.id)
+  if (r.ok && (r.json as any)?.smart_collections?.[0]?.id) {
     return Number((r.json as any).smart_collections[0].id);
+  }
 
   return null;
 }
@@ -203,7 +197,7 @@ async function countPublishedThisMonthByMetafield(email: string) {
   return count;
 }
 
-/* ===== sanitize helpers ===== */
+/* ===== sanitize helpers for sync fields ===== */
 function cleanStr(v: any, max = 180) {
   return String(v ?? '').trim().slice(0, max);
 }
@@ -242,7 +236,7 @@ export async function OPTIONS(req: Request) {
    - ?public=1
    - accepte ?u=trainer-<id> OU ?shopifyCustomerId=<id> OU ?handle=<...>
    - resolve email via customerId si possible
-   ✅ FIX: "published" = (status === 'active') OR published_at
+   - public => ONLY published + pas de quota
 ===================================================================== */
 export async function GET(req: Request) {
   try {
@@ -264,7 +258,7 @@ export async function GET(req: Request) {
 
     let email = (url.searchParams.get('email') || '').trim();
 
-    // ✅ NEW: public can pass shopifyCustomerId too
+    // ✅ public can pass shopifyCustomerId too
     const shopifyCustomerIdRaw = (url.searchParams.get('shopifyCustomerId') || '').trim();
     const shopifyCustomerIdNum = shopifyCustomerIdRaw ? Number(shopifyCustomerIdRaw) : NaN;
 
@@ -306,26 +300,20 @@ export async function GET(req: Request) {
       products.map(async (p: any) => {
         const themeHandleRaw = await getProductMetafieldValue(p.id, 'mfapp', 'theme');
         const mf_theme = String(themeHandleRaw || '').trim();
-        const theme_label =
-          mf_theme && THEME_LABELS[mf_theme] ? THEME_LABELS[mf_theme] : '';
-
-        // ✅ FIX: public publish detection must work even if published_at is null
-        const isPublished = (String(p.status || '').toLowerCase() === 'active') || !!p.published_at;
+        const theme_label = mf_theme && THEME_LABELS[mf_theme] ? THEME_LABELS[mf_theme] : '';
 
         return {
           id: p.id,
           title: p.title,
           coverUrl: p.image?.src || '',
           image_url: p.image?.src || '',
-          published: isPublished,
+          published: !!p.published_at,
           published_at: p.published_at || null,
           createdAt: p.created_at,
           mf_theme,
           theme_label,
           url: p.handle ? `/products/${p.handle}` : '',
           handle: p.handle || '',
-          // keep status for debugging/front if needed (harmless)
-          status: p.status || null,
         };
       }),
     );
@@ -360,7 +348,10 @@ export async function GET(req: Request) {
 
 /* =====================================================================
    POST /api/courses
-   ✅ INCHANGÉ : je te recolle ton POST complet sans modif
+   → Création d’un produit (Course) + quota Starter
+   + enregistre la thématique (mfapp.theme)
+   + crée / met à jour la Course en base Prisma
+   + écrit les champs synchronisés pour la fiche produit
 ===================================================================== */
 export async function POST(req: Request) {
   try {
@@ -414,19 +405,11 @@ export async function POST(req: Request) {
     const pdfUrl = String(pdfUrlRaw || pdf_url || '').trim();
 
     if (!email || !title || !imageUrl || !pdfUrl) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'missing fields' },
-        { status: 400 },
-      );
+      return jsonWithCors(req, { ok: false, error: 'missing fields' }, { status: 400 });
     }
 
     if (!/^https?:\/\//i.test(pdfUrl)) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'pdfUrl must be https URL' },
-        { status: 400 },
-      );
+      return jsonWithCors(req, { ok: false, error: 'pdfUrl must be https URL' }, { status: 400 });
     }
 
     const plan = await getPlanFromInternalSubscription(req, email);
@@ -468,8 +451,6 @@ export async function POST(req: Request) {
           {
             requires_shipping: false,
             taxable: false,
-
-            // ✅ FIX: on met le prix directement sur le variant si fourni
             ...(priceStr ? { price: priceStr } : {}),
           },
         ],
@@ -487,21 +468,11 @@ export async function POST(req: Request) {
 
     const created = (createRes.json as any)?.product;
     if (!created?.id) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'create_failed_no_id' },
-        { status: 500 },
-      );
+      return jsonWithCors(req, { ok: false, error: 'create_failed_no_id' }, { status: 500 });
     }
 
     /* Métachamps mkt (comme avant) */
-    await upsertProductMetafield(
-      created.id,
-      'mkt',
-      'owner_email',
-      'single_line_text_field',
-      email,
-    );
+    await upsertProductMetafield(created.id, 'mkt', 'owner_email', 'single_line_text_field', email);
     if (shopifyCustomerId) {
       await upsertProductMetafield(
         created.id,
@@ -528,8 +499,7 @@ export async function POST(req: Request) {
     /* Assignation collection + thématique */
     const selector = collectionId ?? collectionHandleOrId ?? collectionHandle;
 
-    let themeHandleFinal =
-      (mf_theme || themeHandle || theme || '').toString().trim() || '';
+    let themeHandleFinal = (mf_theme || themeHandle || theme || '').toString().trim() || '';
 
     if (!themeHandleFinal && selector && typeof selector === 'string') {
       const isNumeric = /^[0-9]+$/.test(selector);
@@ -555,11 +525,9 @@ export async function POST(req: Request) {
       );
     }
 
-    // =====================================================
     // ✅ Synchro fiche produit (Udemy-like)
-    // =====================================================
     try {
-      const mf = (mfapp && typeof mfapp === 'object') ? mfapp : {};
+      const mf = mfapp && typeof mfapp === 'object' ? mfapp : {};
 
       const subtitleFinal = cleanStr(mf.subtitle ?? subtitle, 600);
       const formatFinal = cleanStr(mf.format ?? '', 60);
@@ -583,33 +551,15 @@ export async function POST(req: Request) {
       }
 
       if (formatFinal) {
-        await upsertProductMetafield(
-          created.id,
-          'mfapp',
-          'format',
-          'single_line_text_field',
-          formatFinal,
-        );
+        await upsertProductMetafield(created.id, 'mfapp', 'format', 'single_line_text_field', formatFinal);
       }
 
       if (durationFinal) {
-        await upsertProductMetafield(
-          created.id,
-          'mfapp',
-          'duration',
-          'single_line_text_field',
-          durationFinal,
-        );
+        await upsertProductMetafield(created.id, 'mfapp', 'duration', 'single_line_text_field', durationFinal);
       }
 
       if (levelFinal) {
-        await upsertProductMetafield(
-          created.id,
-          'mfapp',
-          'level',
-          'single_line_text_field',
-          levelFinal,
-        );
+        await upsertProductMetafield(created.id, 'mfapp', 'level', 'single_line_text_field', levelFinal);
       }
 
       if (language_text && String(language_text).trim()) {
@@ -623,43 +573,19 @@ export async function POST(req: Request) {
       }
 
       if (learnArr.length) {
-        await upsertProductMetafield(
-          created.id,
-          'mfapp',
-          'learn',
-          'json',
-          JSON.stringify(learnArr),
-        );
+        await upsertProductMetafield(created.id, 'mfapp', 'learn', 'json', JSON.stringify(learnArr));
       }
 
       if (modulesArr.length) {
-        await upsertProductMetafield(
-          created.id,
-          'mfapp',
-          'modules',
-          'json',
-          JSON.stringify(modulesArr),
-        );
+        await upsertProductMetafield(created.id, 'mfapp', 'modules', 'json', JSON.stringify(modulesArr));
       }
 
       if (audienceArr.length) {
-        await upsertProductMetafield(
-          created.id,
-          'mfapp',
-          'audience',
-          'json',
-          JSON.stringify(audienceArr),
-        );
+        await upsertProductMetafield(created.id, 'mfapp', 'audience', 'json', JSON.stringify(audienceArr));
       }
 
       if (includesArr.length) {
-        await upsertProductMetafield(
-          created.id,
-          'mfapp',
-          'includes',
-          'json',
-          JSON.stringify(includesArr),
-        );
+        await upsertProductMetafield(created.id, 'mfapp', 'includes', 'json', JSON.stringify(includesArr));
       }
 
       if (reqArr.length) {
@@ -673,26 +599,21 @@ export async function POST(req: Request) {
       }
     } catch (e) {
       console.error('[MF] sync metafields error', e);
-      // On ne bloque pas la création si un metafield sync échoue
     }
 
-    // =====================================================
-    // Prisma (on garde le comportement + améliore subtitle si fourni)
-    // =====================================================
+    // Prisma
     try {
       const shopifyProductId = String(created.id);
       const shopifyProductHandle = created.handle || null;
       const shopifyProductTitle = created.title || title;
 
       const mfThemeKey = themeHandleFinal || '';
-      const categoryLabel =
-        mfThemeKey && THEME_LABELS[mfThemeKey] ? THEME_LABELS[mfThemeKey] : null;
+      const categoryLabel = mfThemeKey && THEME_LABELS[mfThemeKey] ? THEME_LABELS[mfThemeKey] : null;
 
       const accessUrl = shopifyProductHandle ? `/products/${shopifyProductHandle}` : '';
 
-      const mf = (mfapp && typeof mfapp === 'object') ? mfapp : {};
-      const subtitleFinal =
-        (String(mf.subtitle ?? subtitle ?? '').trim()) || (description || null);
+      const mf = mfapp && typeof mfapp === 'object' ? mfapp : {};
+      const subtitleFinal = String(mf.subtitle ?? subtitle ?? '').trim() || (description || null);
 
       await (prisma as any).course.upsert({
         where: { shopifyProductId },
@@ -733,15 +654,11 @@ export async function POST(req: Request) {
       admin_url: `https://${process.env.SHOP_DOMAIN}/admin/products/${created.id}`,
     });
   } catch (e: any) {
-    return jsonWithCors(
-      req,
-      { ok: false, error: e?.message || 'create_failed' },
-      { status: 500 },
-    );
+    return jsonWithCors(req, { ok: false, error: e?.message || 'create_failed' }, { status: 500 });
   }
 }
 
-// (helpers legacy)
+// helpers legacy
 function mfText(ns: string, key: string, value?: string) {
   const v = (value || '').trim();
   if (!v) return null;
