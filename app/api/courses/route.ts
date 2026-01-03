@@ -60,6 +60,30 @@ async function shopifyFetch(path: string, init?: RequestInit & { json?: any }) {
    Stratégie legacy: customer tag "mf_handle:<handle>"
 */
 // --- AJOUTE CE HELPER À CÔTÉ DE shopifyFetch (même style) ---
+
+async function resolveEmailViaProfile(req: Request, handle: string): Promise<string> {
+  try {
+    const h = String(handle || '').trim();
+    if (!h) return '';
+
+    const u = new URL(req.url);
+    const base = `${u.protocol}//${u.host}`;
+
+    const r = await fetch(`${base}/api/profile?u=${encodeURIComponent(h)}`, {
+      method: 'GET',
+      headers: { accept: 'application/json' },
+      cache: 'no-store',
+    });
+
+    const j = await r.json().catch(() => ({}));
+    const email = String(j?.profile?.email || j?.data?.email || '').trim();
+    return email;
+  } catch {
+    return '';
+  }
+}
+
+
 async function shopifyGraphql(query: string, variables?: any) {
   const domain = process.env.SHOP_DOMAIN;
   if (!domain) throw new Error('Missing env SHOP_DOMAIN');
@@ -322,6 +346,12 @@ export async function GET(req: Request) {
       const cid = await findCustomerIdByHandle(handle);
       if (cid) email = await getCustomerEmailById(cid);
     }
+
+    // ✅ ULTIMATE FALLBACK: si profile marche, on récupère l’email via /api/profile (même logique que ta page publique)
+if (!email && handle) {
+  email = await resolveEmailViaProfile(req, handle);
+}
+
 
     if (!email) {
       return jsonWithCors(
