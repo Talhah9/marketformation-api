@@ -6,7 +6,7 @@
 // ✅ Public listing via App Proxy:
 // - /apps/mf/courses?u=trainer-<id>&public=1
 // - /apps/mf/courses?handle=xxx&public=1 (legacy)
-// - Résout email via customerId (trainer-<id> ou shopifyCustomerId) OU via handle (metafield mkt.handle / legacy tag)
+// - ✅ FIX: support Shopify IDs > 2^53 (NE JAMAIS Number()) via GraphQL email resolve
 // - En public=1: ne renvoie que published + pas de quota
 
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
@@ -29,8 +29,12 @@ function getAdminToken() {
   );
 }
 
+function getShopDomain() {
+  return process.env.SHOP_DOMAIN || '';
+}
+
 async function shopifyFetch(path: string, init?: RequestInit & { json?: any }) {
-  const domain = process.env.SHOP_DOMAIN;
+  const domain = getShopDomain();
   if (!domain) throw new Error('Missing env SHOP_DOMAIN');
 
   const base = `https://${domain}/admin/api/2024-07`;
@@ -57,19 +61,18 @@ async function shopifyFetch(path: string, init?: RequestInit & { json?: any }) {
 }
 
 async function shopifyGraphql(query: string, variables?: any) {
-  const domain = process.env.SHOP_DOMAIN;
+  const domain = getShopDomain();
   if (!domain) throw new Error('Missing env SHOP_DOMAIN');
 
   const endpoint = `https://${domain}/admin/api/2024-07/graphql.json`;
-  const headers: Record<string, string> = {
-    'X-Shopify-Access-Token': getAdminToken(),
-    'Content-Type': 'application/json',
-    Accept: 'application/json',
-  };
 
   const res = await fetch(endpoint, {
     method: 'POST',
-    headers,
+    headers: {
+      'X-Shopify-Access-Token': getAdminToken(),
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
     body: JSON.stringify({ query, variables: variables || {} }),
     cache: 'no-store',
   });
@@ -83,87 +86,73 @@ async function shopifyGraphql(query: string, variables?: any) {
   return { ok: res.ok, status: res.status, json, text };
 }
 
-/**
- * ✅ Ultimate fallback: si /api/profile résout déjà l'identité via u=,
- * on récupère l'email depuis là.
- */
-async function resolveEmailViaProfile(req: Request, handle: string): Promise<string> {
-  try {
-    const h = String(handle || '').trim();
-    if (!h) return '';
-
-    const u = new URL(req.url);
-    const base = `${u.protocol}//${u.host}`;
-
-    const r = await fetch(`${base}/api/profile?u=${encodeURIComponent(h)}`, {
-      method: 'GET',
-      headers: { accept: 'application/json' },
-      cache: 'no-store',
-    });
-
-    const j = await r.json().catch(() => ({}));
-
-    // ✅ /api/profile répond: { ok:true, profile:{...} }
-    const email = String(j?.profile?.email || '').trim();
-    return email;
-  } catch {
-    return '';
-  }
-}
-
-/* ===== Public handle -> customer/email =====
-   ✅ support:
-   - trainer-<id>
-   - numeric id
-   - metafield mkt.handle (comme /api/profile)
+/* ===== Public handle -> email (BIGINT safe) =====
+   ✅ Support:
+   - u=trainer-<id> (id peut être > 2^53)
+   - u=<iddigits>
+   - handle=<custom> via customer metafield mkt.handle
    - legacy tag mf_handle:<handle>
 */
-async function findCustomerIdByHandle(handle: string): Promise<number | null> {
+function extractDigitsHandle(h: string) {
+  const s = String(h || '').trim();
+  if (!s) return '';
+  const m = s.match(/^trainer-(\d+)$/i);
+  if (m) return m[1];
+  if (/^\d+$/.test(s)) return s;
+  return '';
+}
+function customerGidFromIdDigits(idDigits: string) {
+  const d = String(idDigits || '').trim();
+  if (!/^\d+$/.test(d)) return '';
+  return `gid://shopify/Customer/${d}`;
+}
+
+async function resolveEmailByCustomerIdDigits(idDigits: string): Promise<string> {
+  const gid = customerGidFromIdDigits(idDigits);
+  if (!gid) return '';
+
+  const q = `
+    query($id: ID!) {
+      customer(id: $id) {
+        email
+      }
+    }
+  `;
+  const r = await shopifyGraphql(q, { id: gid });
+  const email = String(r.json?.data?.customer?.email || '').trim();
+  return email;
+}
+
+async function resolveEmailByHandle(handle: string): Promise<string> {
   const h = String(handle || '').trim();
-  if (!h) return null;
+  if (!h) return '';
 
-  // ✅ support trainer-<id>
-  const m = h.match(/^trainer-(\d+)$/i);
-  if (m) return Number(m[1]);
+  // 1) trainer-<id> or numeric => direct customer lookup
+  const digits = extractDigitsHandle(h);
+  if (digits) {
+    const email = await resolveEmailByCustomerIdDigits(digits);
+    if (email) return email;
+  }
 
-  // ✅ numeric id direct
-  const num = Number(h);
-  if (!Number.isNaN(num) && String(num) === h) return num;
+  // 2) GraphQL search by metafield mkt.handle OR legacy tag mf_handle:<handle>
+  // Shopify query syntax allows OR
+  const safe = h.replace(/"/g, '\\"');
+  const search = `metafield:mkt.handle:"${safe}" OR tag:"mf_handle:${safe}"`;
 
-  // ✅ NEW: GraphQL metafield search: mkt.handle
-  try {
-    const q = `
-      query($search: String!) {
-        customers(first: 1, query: $search) {
-          edges {
-            node { legacyResourceId }
+  const q = `
+    query($search: String!) {
+      customers(first: 1, query: $search) {
+        edges {
+          node {
+            email
           }
         }
       }
-    `;
-    const safe = h.replace(/'/g, "\\'");
-    const search = `metafield:mkt.handle:'${safe}'`;
-    const gr = await shopifyGraphql(q, { search });
-    const cid = gr.json?.data?.customers?.edges?.[0]?.node?.legacyResourceId;
-    if (cid) return Number(cid);
-  } catch {}
-
-  // ✅ legacy fallback: tag customer "mf_handle:<handle>"
-  const qTag = `tag:"mf_handle:${h}"`;
-  const r = await shopifyFetch(
-    `/customers/search.json?query=${encodeURIComponent(qTag)}&limit=1`,
-  );
-  if (!r.ok) return null;
-
-  const customers = (r.json as any)?.customers || [];
-  if (!customers[0]?.id) return null;
-  return Number(customers[0].id);
-}
-
-async function getCustomerEmailById(customerId: number): Promise<string> {
-  const r = await shopifyFetch(`/customers/${customerId}.json`);
-  const customer = (r.ok && (r.json as any)?.customer) || {};
-  return String(customer.email || '').trim();
+    }
+  `;
+  const r = await shopifyGraphql(q, { search });
+  const email = String(r.json?.data?.customers?.edges?.[0]?.node?.email || '').trim();
+  return email;
 }
 
 /* ===== Labels thématiques ===== */
@@ -268,7 +257,7 @@ async function countPublishedThisMonthByMetafield(email: string) {
   return count;
 }
 
-/* ===== sanitize helpers ===== */
+/* ===== sanitize helpers for sync fields ===== */
 function cleanStr(v: any, max = 180) {
   return String(v ?? '').trim().slice(0, max);
 }
@@ -306,7 +295,8 @@ export async function OPTIONS(req: Request) {
    ✅ Public:
    - ?public=1
    - accepte ?u=trainer-<id> OU ?shopifyCustomerId=<id> OU ?handle=<...>
-   - resolve email via customerId si possible
+   - ✅ FIX: resolve email via GraphQL (bigint-safe)
+   - public => ONLY published + pas de quota
 ===================================================================== */
 export async function GET(req: Request) {
   try {
@@ -324,32 +314,32 @@ export async function GET(req: Request) {
 
     let email = (url.searchParams.get('email') || '').trim();
 
+    // ✅ public can pass shopifyCustomerId too (can be > 2^53 => keep as string)
     const shopifyCustomerIdRaw = (url.searchParams.get('shopifyCustomerId') || '').trim();
-    const shopifyCustomerIdNum = shopifyCustomerIdRaw ? Number(shopifyCustomerIdRaw) : NaN;
 
-    // 1) resolve by customerId
-    if (!email && !Number.isNaN(shopifyCustomerIdNum) && shopifyCustomerIdNum > 0) {
-      email = await getCustomerEmailById(shopifyCustomerIdNum);
+    // 1) if email absent, try resolve by explicit shopifyCustomerId
+    if (!email && shopifyCustomerIdRaw) {
+      email = await resolveEmailByCustomerIdDigits(shopifyCustomerIdRaw);
     }
 
-    // 2) resolve by handle
+    // 2) if still no email, try resolve by handle/u (trainer-<id> or metafield/tag)
     if (!email && handle) {
-      const cid = await findCustomerIdByHandle(handle);
-      if (cid) email = await getCustomerEmailById(cid);
-    }
-
-    // 3) ultimate fallback via /api/profile
-    if (!email && handle) {
-      email = await resolveEmailViaProfile(req, handle);
+      email = await resolveEmailByHandle(handle);
     }
 
     if (!email) {
       return jsonWithCors(req, { ok: false, error: 'email_or_resolvable_handle_required' }, { status: 400 });
     }
 
-    const r = await shopifyFetch(`/products.json?vendor=${encodeURIComponent(email)}&limit=250`);
+    const vendor = email;
+
+    const r = await shopifyFetch(`/products.json?vendor=${encodeURIComponent(vendor)}&limit=250`);
     if (!r.ok) {
-      return jsonWithCors(req, { ok: false, error: `Shopify ${r.status}`, detail: r.text }, { status: r.status });
+      return jsonWithCors(
+        req,
+        { ok: false, error: `Shopify ${r.status}`, detail: r.text },
+        { status: r.status },
+      );
     }
 
     const products = (r.json as any)?.products || [];
@@ -382,8 +372,8 @@ export async function GET(req: Request) {
     let plan: 'Starter' | 'Pro' | 'Business' | 'Unknown' = 'Unknown';
     let quota: any = null;
 
-    // ✅ privé seulement
-    if (!isPublic) {
+    // ✅ Privé seulement
+    if (!isPublic && email) {
       plan = await getPlanFromInternalSubscription(req, email);
 
       if (plan === 'Starter') {
@@ -402,7 +392,10 @@ export async function GET(req: Request) {
 
 /* =====================================================================
    POST /api/courses
-   → Ton POST est repris tel quel (logique identique), je n’ai pas “cassé”
+   → Création d’un produit (Course) + quota Starter
+   + enregistre la thématique (mfapp.theme)
+   + crée / met à jour la Course en base Prisma
+   + écrit les champs synchronisés pour la fiche produit
 ===================================================================== */
 export async function POST(req: Request) {
   try {
@@ -424,17 +417,22 @@ export async function POST(req: Request) {
       title,
       description,
       imageUrl,
+
       price,
+
       pdfUrl: pdfUrlRaw,
       pdf_url,
       status = 'active',
       collectionId,
       collectionHandle,
       collectionHandleOrId,
+
       theme,
       themeHandle,
       mf_theme,
+
       mfapp,
+
       subtitle,
       learn,
       modules,
@@ -462,13 +460,17 @@ export async function POST(req: Request) {
       if (used >= 3) {
         return jsonWithCors(
           req,
-          { ok: false, error: 'quota_reached', detail: 'Starter plan allows 3 published courses per month' },
+          {
+            ok: false,
+            error: 'quota_reached',
+            detail: 'Starter plan allows 3 published courses per month',
+          },
           { status: 403 },
         );
       }
     }
 
-    // normaliser prix
+    // normaliser prix Shopify (string "12.34")
     let priceStr = '';
     if (price !== undefined && price !== null && String(price).trim() !== '') {
       const n = Number(price);
@@ -476,6 +478,7 @@ export async function POST(req: Request) {
       else priceStr = String(price).trim();
     }
 
+    /* Création produit */
     const productPayload = {
       product: {
         title,
@@ -508,20 +511,20 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: 'create_failed_no_id' }, { status: 500 });
     }
 
-    // Métachamps mkt
+    /* Métachamps mkt */
     await upsertProductMetafield(created.id, 'mkt', 'owner_email', 'single_line_text_field', email);
     if (shopifyCustomerId) {
       await upsertProductMetafield(created.id, 'mkt', 'owner_id', 'single_line_text_field', String(shopifyCustomerId));
     }
     await upsertProductMetafield(created.id, 'mkt', 'pdf_url', 'url', pdfUrl);
 
-    // Quota marker si publié
+    /* Marquage quota */
     if (status === 'active') {
       const bucket = ym();
       await upsertProductMetafield(created.id, 'mfapp', 'published_YYYYMM', 'single_line_text_field', bucket);
     }
 
-    // collection + theme
+    /* Assignation collection + thématique */
     const selector = collectionId ?? collectionHandleOrId ?? collectionHandle;
 
     let themeHandleFinal = (mf_theme || themeHandle || theme || '').toString().trim() || '';
@@ -544,7 +547,7 @@ export async function POST(req: Request) {
       await upsertProductMetafield(created.id, 'mfapp', 'theme', 'single_line_text_field', themeHandleFinal);
     }
 
-    // Synchro fiche produit
+    // ✅ Synchro fiche produit (Udemy-like)
     try {
       const mf = mfapp && typeof mfapp === 'object' ? mfapp : {};
 
