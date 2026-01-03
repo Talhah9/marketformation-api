@@ -236,9 +236,7 @@ async function resolveCustomerIdByHandle(handle: string): Promise<number | null>
   const q = `
     query($search: String!) {
       customers(first: 1, query: $search) {
-        edges {
-          node { id legacyResourceId }
-        }
+        edges { node { id legacyResourceId } }
       }
     }
   `;
@@ -338,7 +336,7 @@ async function saveProfileToCustomer(customerId: number, profile: Profile) {
     // ✅ website: safeUrl
     ["website", "url", safeUrl(profile.links?.website || profile.website || "")],
 
-    // ✅ socials: ONLY keep if already URL (avoid https://monpseudo)
+    // ✅ socials: ONLY keep if already URL
     ["linkedin", "url", urlOrEmpty(profile.links?.linkedin || profile.linkedin || "")],
     ["instagram", "url", urlOrEmpty(profile.links?.instagram || "")],
     ["youtube", "url", urlOrEmpty(profile.links?.youtube || "")],
@@ -349,6 +347,38 @@ async function saveProfileToCustomer(customerId: number, profile: Profile) {
   for (const [key, type, value] of entries) {
     await upsertCustomerMetafield(customerId, key, type, value || "");
   }
+}
+
+/* ============================================================
+   ✅ NEW: ensure mf_handle:<handle> tag exists (for /api/courses public)
+============================================================ */
+async function getCustomerTags(customerId: number): Promise<string[]> {
+  const r = await shopifyFetch(`/customers/${customerId}.json`);
+  const c = (r.ok && (r.json as any)?.customer) || {};
+  const tagsStr = String(c.tags || "");
+  return tagsStr
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+async function updateCustomerTags(customerId: number, tags: string[]) {
+  const uniq = Array.from(new Set(tags.map((t) => t.trim()).filter(Boolean)));
+  return shopifyFetch(`/customers/${customerId}.json`, {
+    method: "PUT",
+    json: { customer: { id: customerId, tags: uniq.join(", ") } },
+  });
+}
+
+async function ensureCustomerTag(customerId: number, tag: string) {
+  const t = String(tag || "").trim();
+  if (!t) return;
+
+  const tags = await getCustomerTags(customerId);
+  if (tags.includes(t)) return;
+
+  tags.push(t);
+  await updateCustomerTags(customerId, tags);
 }
 
 /* ============================================================
@@ -418,9 +448,12 @@ export async function POST(req: Request) {
 
     const linksFromBody = body.links && typeof body.links === "object" ? body.links : {};
 
+    const requestedHandleRaw = getFirst(body, ["handle", "trainerHandle", "publicHandle"]);
+    const requestedHandle = slugify(requestedHandleRaw);
+
     const profile: Profile = {
       // placeholder handle (will be forced to trainer-<cid>)
-      handle: getFirst(body, ["handle", "trainerHandle", "publicHandle"]),
+      handle: requestedHandleRaw,
 
       bio: getFirst(body, ["bio", "description", "about"]),
       avatar_url: getFirst(body, ["avatar_url", "avatarUrl", "image_url", "imageUrl"]),
@@ -469,6 +502,14 @@ export async function POST(req: Request) {
     profile.shopifyCustomerId = String(cid);
 
     await saveProfileToCustomer(cid, profile);
+
+    // ✅ CRITICAL: tag for public courses resolution (mf_handle:<handle>)
+    // Stable tag
+    await ensureCustomerTag(cid, `mf_handle:${profile.handle}`);
+    // Optional vanity tag if you ever use ?u=<vanity>
+    if (requestedHandle && requestedHandle !== profile.handle) {
+      await ensureCustomerTag(cid, `mf_handle:${requestedHandle}`);
+    }
 
     // mémoire locale fallback
     const memKey = makeKey(email, profile.shopifyCustomerId);
