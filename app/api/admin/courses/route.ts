@@ -1,3 +1,4 @@
+// app/api/admin/courses/route.ts
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 
 export const runtime = 'nodejs';
@@ -15,43 +16,42 @@ function getShopDomain() {
   return process.env.SHOP_DOMAIN || '';
 }
 
-async function shopifyFetch(path: string, init?: RequestInit & { json?: any }) {
+async function shopifyGraphql(query: string, variables?: any) {
   const domain = getShopDomain();
   if (!domain) throw new Error('Missing env SHOP_DOMAIN');
 
-  const base = `https://${domain}/admin/api/2024-07`;
-  const headers: Record<string, string> = {
-    'X-Shopify-Access-Token': getAdminToken(),
-    'Content-Type': 'application/json',
-    Accept: 'application/json',
-  };
+  const endpoint = `https://${domain}/admin/api/2024-07/graphql.json`;
 
-  const res = await fetch(base + path, {
-    method: init?.method || (init?.json ? 'POST' : 'GET'),
-    headers,
-    body: init?.json ? JSON.stringify(init.json) : undefined,
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'X-Shopify-Access-Token': getAdminToken(),
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({ query, variables: variables || {} }),
     cache: 'no-store',
   });
 
   const text = await res.text();
   let json: any = {};
-  try { json = text ? JSON.parse(text) : {}; } catch {}
-  return { ok: res.ok, status: res.status, json, text };
-}
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {}
 
-async function getProductMetafieldValue(productId: number, namespace: string, key: string) {
-  const r = await shopifyFetch(`/products/${productId}/metafields.json?limit=250`);
-  if (!r.ok) return null;
-  const arr = (r.json as any)?.metafields || [];
-  const mf = arr.find((m: any) => m?.namespace === namespace && m?.key === key);
-  return mf?.value ?? null;
+  return { ok: res.ok, status: res.status, json, text };
 }
 
 // ✅ garde-fou minimal (UI + header). On renforcera via App Proxy ensuite.
 function isAdmin(req: Request) {
-  const email = String(req.headers.get('x-mf-admin-email') || '').toLowerCase();
+  const email = String(req.headers.get('x-mf-admin-email') || '').toLowerCase().trim();
   if (!email) return false;
   return email === 'talhahally974@gmail.com';
+}
+
+function numIdFromGid(gid: string) {
+  const m = String(gid || '').match(/\/Product\/(\d+)$/);
+  return m ? m[1] : '';
 }
 
 export async function OPTIONS(req: Request) {
@@ -67,38 +67,93 @@ export async function GET(req: Request) {
       return jsonWithCors(req, { ok: false, error: 'admin_required' }, { status: 403 });
     }
 
-    // tes formations ont tag "mkt-course"
-    const r = await shopifyFetch(`/products.json?limit=250&tag=mkt-course`);
+    // ✅ 1 seule requête: produits + metafields nécessaires
+    // NB: on filtre sur tag "mkt-course"
+    const q = `
+      query AdminCourses($q: String!) {
+        products(first: 250, query: $q) {
+          edges {
+            node {
+              id
+              title
+              handle
+              status
+              createdAt
+              publishedAt
+              vendor
+              featuredImage { url }
+
+              variants(first: 1) {
+                edges { node { price } }
+              }
+
+              approval: metafield(namespace:"mfapp", key:"approval_status") { value }
+              theme: metafield(namespace:"mfapp", key:"theme") { value }
+            }
+          }
+        }
+      }
+    `;
+
+    // Shopify search query
+    const search = `tag:"mkt-course"`;
+    const r = await shopifyGraphql(q, { q: search });
+
     if (!r.ok) {
-      return jsonWithCors(req, { ok: false, error: `Shopify ${r.status}`, detail: r.text }, { status: r.status });
+      return jsonWithCors(
+        req,
+        { ok: false, error: `Shopify ${r.status}`, detail: r.text },
+        { status: r.status },
+      );
     }
 
-    const products = (r.json as any)?.products || [];
+    const edges = r.json?.data?.products?.edges || [];
+    const items = edges.map((e: any) => {
+      const p = e?.node || {};
+      const gid = String(p.id || '');
+      const idDigits = numIdFromGid(gid);
 
-    const items = await Promise.all(
-      products.map(async (p: any) => {
-        const approvalRaw = await getProductMetafieldValue(p.id, 'mfapp', 'approval_status');
-        const approval_status = String(approvalRaw || 'pending').trim().toLowerCase();
+      const approval_status = String(p?.approval?.value || 'pending').trim().toLowerCase();
+      const status_label =
+        approval_status === 'approved'
+          ? 'Approuvée'
+          : approval_status === 'rejected'
+          ? 'Refusée'
+          : 'En attente';
 
-        const price = p?.variants?.[0]?.price ?? null;
+      const priceRaw = p?.variants?.edges?.[0]?.node?.price ?? null;
+      const price_eur = priceRaw != null && priceRaw !== '' ? Number(priceRaw) : null;
 
-        return {
-          product_id: `gid://shopify/Product/${p.id}`, // pour approve route
-          id: p.id,
-          title: p.title,
-          trainer_name: p.vendor || '—',
-          price_label: price != null ? `${price} €` : '—',
-          price_eur: price != null ? Number(price) : null,
-          sales_count: null,
-          approval_status,
-          status_label: approval_status === 'approved' ? 'Approuvée' : 'En attente',
-          handle: p.handle || '',
-          published: !!p.published_at,
-          published_at: p.published_at || null,
-          created_at: p.created_at || null,
-        };
-      })
-    );
+      return {
+        // ✅ IMPORTANT: ton front utilise product_id / productId / id
+        // On garde un gid pour la route approve si tu l'utilises comme ça,
+        // ET un id numérique pour display/debug.
+        product_id: gid,
+        productId: gid,
+        id: idDigits ? Number(idDigits) : gid,
+
+        title: p.title || '',
+        trainer_name: p.vendor || '—',
+
+        price_label: priceRaw != null && priceRaw !== '' ? `${priceRaw} €` : '—',
+        price_eur: Number.isFinite(price_eur as any) ? price_eur : null,
+
+        sales_count: null,
+
+        approval_status,
+        status_label,
+
+        handle: p.handle || '',
+        published: !!p.publishedAt,
+        published_at: p.publishedAt || null,
+        created_at: p.createdAt || null,
+
+        // optionnels (si un jour tu veux les afficher)
+        image_url: p?.featuredImage?.url || '',
+        mf_theme: String(p?.theme?.value || '').trim(),
+        shopify_status: p.status || null,
+      };
+    });
 
     return jsonWithCors(req, { ok: true, items });
   } catch (e: any) {
