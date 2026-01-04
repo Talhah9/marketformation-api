@@ -12,6 +12,10 @@
 // ✅ AJOUT: workflow validation admin
 // - À la création: mfapp.approval_status = "pending"
 // - Au listing: renvoie approval_status + approval_label
+//
+// ✅ IMPORTANT FIX LISTING (pour ton souci):
+// - On liste via GraphQL produits + metafields (theme + approval_status) en 1 requête
+//   => plus de "statut qui disparait" + plus d’items manquants (draft/pending).
 
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 import { prisma } from '@/lib/prisma';
@@ -19,7 +23,7 @@ import { prisma } from '@/lib/prisma';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-/* ===== Utils ===== */
+/* ===================== Utils ===================== */
 function ym(d = new Date()) {
   return String(d.getFullYear()) + String(d.getMonth() + 1).padStart(2, '0');
 }
@@ -90,13 +94,7 @@ async function shopifyGraphql(query: string, variables?: any) {
   return { ok: res.ok, status: res.status, json, text };
 }
 
-/* ===== Public handle -> email (BIGINT safe) =====
-   ✅ Support:
-   - u=trainer-<id> (id peut être > 2^53)
-   - u=<iddigits>
-   - handle=<custom> via customer metafield mkt.handle
-   - legacy tag mf_handle:<handle>
-*/
+/* ===================== Public handle -> email (BIGINT safe) ===================== */
 function extractDigitsHandle(h: string) {
   const s = String(h || '').trim();
   if (!s) return '';
@@ -105,6 +103,7 @@ function extractDigitsHandle(h: string) {
   if (/^\d+$/.test(s)) return s;
   return '';
 }
+
 function customerGidFromIdDigits(idDigits: string) {
   const d = String(idDigits || '').trim();
   if (!/^\d+$/.test(d)) return '';
@@ -117,14 +116,11 @@ async function resolveEmailByCustomerIdDigits(idDigits: string): Promise<string>
 
   const q = `
     query($id: ID!) {
-      customer(id: $id) {
-        email
-      }
+      customer(id: $id) { email }
     }
   `;
   const r = await shopifyGraphql(q, { id: gid });
-  const email = String(r.json?.data?.customer?.email || '').trim();
-  return email;
+  return String(r.json?.data?.customer?.email || '').trim();
 }
 
 async function resolveEmailByHandle(handle: string): Promise<string> {
@@ -139,27 +135,21 @@ async function resolveEmailByHandle(handle: string): Promise<string> {
   }
 
   // 2) GraphQL search by metafield mkt.handle OR legacy tag mf_handle:<handle>
-  // Shopify query syntax allows OR
   const safe = h.replace(/"/g, '\\"');
   const search = `metafield:mkt.handle:"${safe}" OR tag:"mf_handle:${safe}"`;
 
   const q = `
     query($search: String!) {
       customers(first: 1, query: $search) {
-        edges {
-          node {
-            email
-          }
-        }
+        edges { node { email } }
       }
     }
   `;
   const r = await shopifyGraphql(q, { search });
-  const email = String(r.json?.data?.customers?.edges?.[0]?.node?.email || '').trim();
-  return email;
+  return String(r.json?.data?.customers?.edges?.[0]?.node?.email || '').trim();
 }
 
-/* ===== Labels thématiques ===== */
+/* ===================== Labels thématiques ===================== */
 const THEME_LABELS: Record<string, string> = {
   'tech-ia': 'Tech & IA',
   'business-entrepreneuriat': 'Business & Entrepreneuriat',
@@ -169,15 +159,7 @@ const THEME_LABELS: Record<string, string> = {
   'developpement-personnel-bien-etre': 'Développement perso & Bien-être',
 };
 
-/* ===== Métachamps ===== */
-async function getProductMetafieldValue(productId: number, namespace: string, key: string) {
-  const r = await shopifyFetch(`/products/${productId}/metafields.json?limit=250`);
-  if (!r.ok) return null;
-  const arr = (r.json as any)?.metafields || [];
-  const mf = arr.find((m: any) => m?.namespace === namespace && m?.key === key);
-  return mf?.value ?? null;
-}
-
+/* ===================== Metafields helpers (REST upsert) ===================== */
 async function upsertProductMetafield(
   productId: number,
   namespace: string,
@@ -199,7 +181,7 @@ async function upsertProductMetafield(
   });
 }
 
-/* ===== Collection resolve ===== */
+/* ===================== Collection resolve ===================== */
 async function resolveCollectionId(handleOrId?: string | number): Promise<number | null> {
   if (!handleOrId) return null;
 
@@ -219,7 +201,7 @@ async function resolveCollectionId(handleOrId?: string | number): Promise<number
   return null;
 }
 
-/* ===== Subscription plan ===== */
+/* ===================== Subscription plan ===================== */
 async function getPlanFromInternalSubscription(req: Request, email: string) {
   try {
     const u = new URL(req.url);
@@ -244,24 +226,35 @@ async function getPlanFromInternalSubscription(req: Request, email: string) {
   }
 }
 
-/* ===== Compte des publications Starter ===== */
+/* ===================== Quota Starter (GraphQL, sans N+1) ===================== */
 async function countPublishedThisMonthByMetafield(email: string) {
-  const vendor = encodeURIComponent(email);
-  const r = await shopifyFetch(`/products.json?vendor=${vendor}&limit=250`);
-  if (!r.ok) return 0;
-
-  const products = (r.json as any)?.products || [];
   const bucket = ym();
+  const search = `vendor:"${email.replace(/"/g, '\\"')}"`;
 
+  const q = `
+    query($q: String!) {
+      products(first: 250, query: $q) {
+        edges {
+          node {
+            metafield(namespace:"mfapp", key:"published_YYYYMM") { value }
+          }
+        }
+      }
+    }
+  `;
+
+  const r = await shopifyGraphql(q, { q: search });
+  const edges = r.json?.data?.products?.edges || [];
   let count = 0;
-  for (const p of products) {
-    const val = await getProductMetafieldValue(p.id, 'mfapp', 'published_YYYYMM');
-    if (val === bucket) count++;
+
+  for (const e of edges) {
+    const v = String(e?.node?.metafield?.value || '').trim();
+    if (v === bucket) count++;
   }
   return count;
 }
 
-/* ===== sanitize helpers for sync fields ===== */
+/* ===================== sanitize helpers for sync fields ===================== */
 function cleanStr(v: any, max = 180) {
   return String(v ?? '').trim().slice(0, max);
 }
@@ -289,7 +282,7 @@ function cleanModules(arr: any, maxItems = 30) {
   return out.slice(0, maxItems);
 }
 
-/* ===== OPTIONS (CORS) ===== */
+/* ===================== OPTIONS (CORS) ===================== */
 export async function OPTIONS(req: Request) {
   return handleOptions(req);
 }
@@ -301,11 +294,17 @@ export async function OPTIONS(req: Request) {
    - accepte ?u=trainer-<id> OU ?shopifyCustomerId=<id> OU ?handle=<...>
    - ✅ FIX: resolve email via GraphQL (bigint-safe)
    - public => ONLY published + pas de quota
+   ✅ FIX LISTING:
+   - listing via GraphQL + metafields (theme + approval_status) => pas d’items manquants
 ===================================================================== */
 export async function GET(req: Request) {
   try {
     if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' }, { status: 500 });
+      return jsonWithCors(
+        req,
+        { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' },
+        { status: 500 },
+      );
     }
 
     const url = new URL(req.url);
@@ -332,12 +331,38 @@ export async function GET(req: Request) {
     }
 
     if (!email) {
-      return jsonWithCors(req, { ok: false, error: 'email_or_resolvable_handle_required' }, { status: 400 });
+      return jsonWithCors(
+        req,
+        { ok: false, error: 'email_or_resolvable_handle_required' },
+        { status: 400 },
+      );
     }
 
-    const vendor = email;
+    // ✅ GraphQL listing (inclut drafts + metafields)
+    const vendor = email.replace(/"/g, '\\"');
+    const search = `vendor:"${vendor}"`;
 
-    const r = await shopifyFetch(`/products.json?vendor=${encodeURIComponent(vendor)}&limit=250`);
+    const q = `
+      query($q: String!) {
+        products(first: 250, query: $q) {
+          edges {
+            node {
+              id
+              title
+              handle
+              status
+              createdAt
+              publishedAt
+              featuredImage { url }
+              theme: metafield(namespace:"mfapp", key:"theme") { value }
+              approval: metafield(namespace:"mfapp", key:"approval_status") { value }
+            }
+          }
+        }
+      }
+    `;
+
+    const r = await shopifyGraphql(q, { q: search });
     if (!r.ok) {
       return jsonWithCors(
         req,
@@ -346,41 +371,48 @@ export async function GET(req: Request) {
       );
     }
 
-    const products = (r.json as any)?.products || [];
+    const edges = r.json?.data?.products?.edges || [];
+    const itemsRaw = edges.map((e: any) => {
+      const p = e?.node || {};
 
-    const itemsRaw = await Promise.all(
-      products.map(async (p: any) => {
-        const themeHandleRaw = await getProductMetafieldValue(p.id, 'mfapp', 'theme');
-        const mf_theme = String(themeHandleRaw || '').trim();
-        const theme_label = mf_theme && THEME_LABELS[mf_theme] ? THEME_LABELS[mf_theme] : '';
+      const gid = String(p.id || '');
+      const idMatch = gid.match(/\/Product\/(\d+)$/);
+      const id = idMatch ? Number(idMatch[1]) : undefined;
 
-        // ✅ AJOUT: statut validation admin
-        const approvalRaw = await getProductMetafieldValue(p.id, 'mfapp', 'approval_status');
-        const approval_status = String(approvalRaw || 'pending').trim().toLowerCase();
-        const approval_label = approval_status === 'approved' ? 'Approuvée' : 'En attente';
+      const mf_theme = String(p?.theme?.value || '').trim();
+      const theme_label = mf_theme && THEME_LABELS[mf_theme] ? THEME_LABELS[mf_theme] : '';
 
-        return {
-          id: p.id,
-          title: p.title,
-          coverUrl: p.image?.src || '',
-          image_url: p.image?.src || '',
-          published: !!p.published_at,
-          published_at: p.published_at || null,
-          createdAt: p.created_at,
-          mf_theme,
-          theme_label,
-          url: p.handle ? `/products/${p.handle}` : '',
-          handle: p.handle || '',
+      const approval_status = String(p?.approval?.value || 'pending').trim().toLowerCase();
+      const approval_label =
+        approval_status === 'approved'
+          ? 'Approuvée'
+          : approval_status === 'rejected'
+          ? 'Refusée'
+          : 'En attente';
 
-          // ✅ AJOUT
-          approval_status,
-          approval_label,
-        };
-      }),
-    );
+      const published = !!p.publishedAt;
+
+      return {
+        id: id ?? gid, // on garde un id même si parse fail
+        title: p.title || '',
+        coverUrl: p?.featuredImage?.url || '',
+        image_url: p?.featuredImage?.url || '',
+        published,
+        published_at: p.publishedAt || null,
+        createdAt: p.createdAt || null,
+        mf_theme,
+        theme_label,
+        url: p.handle ? `/products/${p.handle}` : '',
+        handle: p.handle || '',
+        approval_status,
+        approval_label,
+        // utile debug
+        status: p.status || null,
+      };
+    });
 
     // ✅ public => ONLY published
-    const items = isPublic ? itemsRaw.filter((x) => !!x.published) : itemsRaw;
+    const items = isPublic ? itemsRaw.filter((x: any) => !!x.published) : itemsRaw;
 
     let plan: 'Starter' | 'Pro' | 'Business' | 'Unknown' = 'Unknown';
     let quota: any = null;
@@ -409,6 +441,7 @@ export async function GET(req: Request) {
    + enregistre la thématique (mfapp.theme)
    + crée / met à jour la Course en base Prisma
    + écrit les champs synchronisés pour la fiche produit
+   ✅ AJOUT: à la création => mfapp.approval_status = "pending"
 ===================================================================== */
 export async function POST(req: Request) {
   try {
@@ -430,22 +463,17 @@ export async function POST(req: Request) {
       title,
       description,
       imageUrl,
-
       price,
-
       pdfUrl: pdfUrlRaw,
       pdf_url,
       status = 'active',
       collectionId,
       collectionHandle,
       collectionHandleOrId,
-
       theme,
       themeHandle,
       mf_theme,
-
       mfapp,
-
       subtitle,
       learn,
       modules,
@@ -527,13 +555,24 @@ export async function POST(req: Request) {
     /* Métachamps mkt */
     await upsertProductMetafield(created.id, 'mkt', 'owner_email', 'single_line_text_field', email);
     if (shopifyCustomerId) {
-      await upsertProductMetafield(created.id, 'mkt', 'owner_id', 'single_line_text_field', String(shopifyCustomerId));
+      await upsertProductMetafield(
+        created.id,
+        'mkt',
+        'owner_id',
+        'single_line_text_field',
+        String(shopifyCustomerId),
+      );
     }
     await upsertProductMetafield(created.id, 'mkt', 'pdf_url', 'url', pdfUrl);
 
     // ✅ AJOUT: statut validation admin par défaut
-    // -> admin dashboard pourra passer à "approved"
-    await upsertProductMetafield(created.id, 'mfapp', 'approval_status', 'single_line_text_field', 'pending');
+    await upsertProductMetafield(
+      created.id,
+      'mfapp',
+      'approval_status',
+      'single_line_text_field',
+      'pending',
+    );
 
     /* Marquage quota */
     if (status === 'active') {
@@ -676,7 +715,7 @@ export async function POST(req: Request) {
   }
 }
 
-// helpers legacy
+/* helpers legacy (laissés pour compat) */
 function mfText(ns: string, key: string, value?: string) {
   const v = (value || '').trim();
   if (!v) return null;
