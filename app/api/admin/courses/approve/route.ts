@@ -3,6 +3,10 @@ import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+function ym(d = new Date()) {
+  return String(d.getFullYear()) + String(d.getMonth() + 1).padStart(2, '0');
+}
+
 function getAdminToken() {
   return (
     process.env.SHOP_ADMIN_TOKEN ||
@@ -39,13 +43,7 @@ async function shopifyFetch(path: string, init?: RequestInit & { json?: any }) {
   return { ok: res.ok, status: res.status, json, text };
 }
 
-async function upsertProductMetafield(
-  productId: number,
-  namespace: string,
-  key: string,
-  type: string,
-  value: string,
-) {
+async function upsertProductMetafield(productId: number, namespace: string, key: string, type: string, value: string) {
   return shopifyFetch(`/metafields.json`, {
     json: {
       metafield: {
@@ -60,15 +58,13 @@ async function upsertProductMetafield(
   });
 }
 
-function isAdmin(req: Request) {
-  const email = String(req.headers.get('x-mf-admin-email') || '').toLowerCase();
-  return email === 'talhahally974@gmail.com';
-}
-
-function extractNumericIdFromGid(gid: string) {
-  // gid://shopify/Product/123
-  const m = String(gid || '').match(/gid:\/\/shopify\/Product\/(\d+)/);
-  return m ? m[1] : '';
+function isAdminReq(req: Request) {
+  const email = (req.headers.get('x-mf-admin-email') || '').toLowerCase().trim();
+  const allow = (process.env.MF_ADMIN_EMAILS || 'talhahally974@gmail.com')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean);
+  return !!email && allow.includes(email);
 }
 
 export async function OPTIONS(req: Request) {
@@ -77,37 +73,37 @@ export async function OPTIONS(req: Request) {
 
 export async function POST(req: Request) {
   try {
-    if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' }, { status: 500 });
+    if (!getShopDomain() || !getAdminToken()) {
+      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or admin token' }, { status: 500 });
     }
-    if (!isAdmin(req)) {
-      return jsonWithCors(req, { ok: false, error: 'admin_required' }, { status: 403 });
+
+    if (!isAdminReq(req)) {
+      return jsonWithCors(req, { ok: false, error: 'admin_forbidden' }, { status: 403 });
     }
 
     const body = await req.json().catch(() => ({} as any));
     const productId = String(body?.productId || '').trim();
-
-    if (!productId) {
+    if (!/^\d+$/.test(productId)) {
       return jsonWithCors(req, { ok: false, error: 'productId_required' }, { status: 400 });
     }
 
-    const numeric = extractNumericIdFromGid(productId) || (productId.match(/^\d+$/) ? productId : '');
-    if (!numeric) {
-      return jsonWithCors(req, { ok: false, error: 'productId_must_be_gid_or_numeric' }, { status: 400 });
-    }
+    const pid = Number(productId);
 
-    // ✅ Approved
-    const r = await upsertProductMetafield(
-      Number(numeric),
-      'mfapp',
-      'approval_status',
-      'single_line_text_field',
-      'approved',
-    );
+    // ✅ 1) Metafield approval_status = approved
+    await upsertProductMetafield(pid, 'mfapp', 'approval_status', 'single_line_text_field', 'approved');
 
+    // ✅ 2) Publie le produit (status active)
+    const r = await shopifyFetch(`/products/${pid}.json`, {
+      method: 'PUT',
+      json: { product: { id: pid, status: 'active' } },
+    });
     if (!r.ok) {
       return jsonWithCors(req, { ok: false, error: `Shopify ${r.status}`, detail: r.text }, { status: r.status });
     }
+
+    // ✅ 3) Marque le bucket quota au moment de la vraie publication
+    const bucket = ym();
+    await upsertProductMetafield(pid, 'mfapp', 'published_YYYYMM', 'single_line_text_field', bucket);
 
     return jsonWithCors(req, { ok: true });
   } catch (e: any) {

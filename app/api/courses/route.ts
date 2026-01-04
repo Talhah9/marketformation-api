@@ -7,10 +7,11 @@
 // - /apps/mf/courses?u=trainer-<id>&public=1
 // - /apps/mf/courses?handle=xxx&public=1 (legacy)
 // - ✅ FIX: support Shopify IDs > 2^53 (NE JAMAIS Number()) via GraphQL email resolve
-// - En public=1: ne renvoie que published + pas de quota
+// - En public=1: ne renvoie que published + APPROUVÉES + pas de quota
 //
-// ✅ AJOUT: workflow validation admin
-// - À la création: mfapp.approval_status = "pending"
+// ✅ Workflow validation admin (publish gate)
+// - À la création: produit = DRAFT + mfapp.approval_status = "pending"
+// - La publication réelle + mfapp.published_YYYYMM se fait UNIQUEMENT via endpoint admin approve
 // - Au listing: renvoie approval_status + approval_label
 //
 // ✅ IMPORTANT FIX LISTING (pour ton souci):
@@ -293,7 +294,7 @@ export async function OPTIONS(req: Request) {
    - ?public=1
    - accepte ?u=trainer-<id> OU ?shopifyCustomerId=<id> OU ?handle=<...>
    - ✅ FIX: resolve email via GraphQL (bigint-safe)
-   - public => ONLY published + pas de quota
+   - public => ONLY published + APPROUVÉES + pas de quota
    ✅ FIX LISTING:
    - listing via GraphQL + metafields (theme + approval_status) => pas d’items manquants
 ===================================================================== */
@@ -411,8 +412,10 @@ export async function GET(req: Request) {
       };
     });
 
-    // ✅ public => ONLY published
-    const items = isPublic ? itemsRaw.filter((x: any) => !!x.published) : itemsRaw;
+    // ✅ public => ONLY published + approved
+    const items = isPublic
+      ? itemsRaw.filter((x: any) => !!x.published && x.approval_status === 'approved')
+      : itemsRaw;
 
     let plan: 'Starter' | 'Pro' | 'Business' | 'Unknown' = 'Unknown';
     let quota: any = null;
@@ -437,11 +440,12 @@ export async function GET(req: Request) {
 
 /* =====================================================================
    POST /api/courses
-   → Création d’un produit (Course) + quota Starter
-   + enregistre la thématique (mfapp.theme)
-   + crée / met à jour la Course en base Prisma
-   + écrit les champs synchronisés pour la fiche produit
-   ✅ AJOUT: à la création => mfapp.approval_status = "pending"
+   → Création d’un produit (Course)
+   ✅ Publish gate:
+   - On crée toujours en DRAFT
+   - mfapp.approval_status = "pending"
+   - ❌ On ne touche PAS à mfapp.published_YYYYMM ici
+   - L’admin "approve" publiera + marquera published_YYYYMM
 ===================================================================== */
 export async function POST(req: Request) {
   try {
@@ -466,14 +470,20 @@ export async function POST(req: Request) {
       price,
       pdfUrl: pdfUrlRaw,
       pdf_url,
-      status = 'active',
+
+      // status est ignoré volontairement (publish gate)
+      status: _statusIgnored,
+
       collectionId,
       collectionHandle,
       collectionHandleOrId,
+
       theme,
       themeHandle,
       mf_theme,
+
       mfapp,
+
       subtitle,
       learn,
       modules,
@@ -494,6 +504,9 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: 'pdfUrl must be https URL' }, { status: 400 });
     }
 
+    // Quota: on garde ta logique sans casser,
+    // mais elle devient un "guard" avant création (même si on crée en draft).
+    // (Tu pourras la déplacer au moment de l'approbation plus tard si tu veux.)
     const plan = await getPlanFromInternalSubscription(req, email);
 
     if (!bypass && plan === 'Starter') {
@@ -519,6 +532,9 @@ export async function POST(req: Request) {
       else priceStr = String(price).trim();
     }
 
+    // ✅ Publish gate: toujours draft à la création
+    const finalStatus: 'draft' = 'draft';
+
     /* Création produit */
     const productPayload = {
       product: {
@@ -527,7 +543,7 @@ export async function POST(req: Request) {
         vendor: email,
         images: imageUrl ? [{ src: imageUrl }] : [],
         tags: ['mkt-course'],
-        status,
+        status: finalStatus, // ✅ draft
         variants: [
           {
             requires_shipping: false,
@@ -574,11 +590,8 @@ export async function POST(req: Request) {
       'pending',
     );
 
-    /* Marquage quota */
-    if (status === 'active') {
-      const bucket = ym();
-      await upsertProductMetafield(created.id, 'mfapp', 'published_YYYYMM', 'single_line_text_field', bucket);
-    }
+    // ❌ IMPORTANT: on NE marque PAS published_YYYYMM ici.
+    // Il sera marqué dans /api/admin/courses/approve (quand publication réelle).
 
     /* Assignation collection + thématique */
     const selector = collectionId ?? collectionHandleOrId ?? collectionHandle;
@@ -658,7 +671,7 @@ export async function POST(req: Request) {
       console.error('[MF] sync metafields error', e);
     }
 
-    // Prisma
+    // Prisma (on garde ta logique, sans casser)
     try {
       const shopifyProductId = String(created.id);
       const shopifyProductHandle = created.handle || null;
@@ -709,6 +722,8 @@ export async function POST(req: Request) {
       id: created.id,
       handle: created.handle,
       admin_url: `https://${process.env.SHOP_DOMAIN}/admin/products/${created.id}`,
+      approval_status: 'pending',
+      status: finalStatus,
     });
   } catch (e: any) {
     return jsonWithCors(req, { ok: false, error: e?.message || 'create_failed' }, { status: 500 });
