@@ -1,3 +1,4 @@
+// app/api/admin/courses/approve/route.ts
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 
 export const runtime = 'nodejs';
@@ -43,6 +44,28 @@ async function shopifyFetch(path: string, init?: RequestInit & { json?: any }) {
   return { ok: res.ok, status: res.status, json, text };
 }
 
+async function shopifyGraphql(query: string, variables?: any) {
+  const domain = getShopDomain();
+  if (!domain) throw new Error('Missing env SHOP_DOMAIN');
+
+  const endpoint = `https://${domain}/admin/api/2024-07/graphql.json`;
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'X-Shopify-Access-Token': getAdminToken(),
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({ query, variables: variables || {} }),
+    cache: 'no-store',
+  });
+
+  const text = await res.text();
+  let json: any = {};
+  try { json = text ? JSON.parse(text) : {}; } catch {}
+  return { ok: res.ok, status: res.status, json, text };
+}
+
 async function upsertProductMetafield(
   productId: number,
   namespace: string,
@@ -73,6 +96,54 @@ function isAdminReq(req: Request) {
   return !!email && allow.includes(email);
 }
 
+/** accepte "123" OU "gid://shopify/Product/123" */
+function extractNumericProductId(input: string) {
+  const s = String(input || '').trim();
+  if (!s) return '';
+  if (/^\d+$/.test(s)) return s;
+  const m = s.match(/\/Product\/(\d+)$/);
+  return m ? m[1] : '';
+}
+
+/** Trouve l'ID de publication "Online Store" (ou fallback sur la 1ère) */
+async function resolveOnlineStorePublicationId(): Promise<string> {
+  // optionnel: mets-le en env pour éviter la query à chaque fois
+  if (process.env.SHOP_PUBLICATION_ID) return process.env.SHOP_PUBLICATION_ID;
+
+  const q = `
+    query {
+      publications(first: 20) {
+        edges {
+          node { id name }
+        }
+      }
+    }
+  `;
+  const r = await shopifyGraphql(q);
+  const edges = r.json?.data?.publications?.edges || [];
+  const online = edges.find((e: any) =>
+    String(e?.node?.name || '').toLowerCase().includes('online store')
+  );
+  return String((online || edges[0])?.node?.id || '').trim();
+}
+
+async function publishToOnlineStore(productGid: string) {
+  const publicationId = await resolveOnlineStorePublicationId();
+  if (!publicationId) return { ok: false, error: 'missing_publication_id' };
+
+  const m = `
+    mutation Publish($id: ID!, $pub: ID!) {
+      publishablePublish(id: $id, input: { publicationId: $pub }) {
+        userErrors { field message }
+      }
+    }
+  `;
+  const r = await shopifyGraphql(m, { id: productGid, pub: publicationId });
+  const errs = r.json?.data?.publishablePublish?.userErrors || [];
+  if (errs.length) return { ok: false, error: errs[0]?.message || 'publish_failed', detail: errs };
+  return { ok: true };
+}
+
 export async function OPTIONS(req: Request) {
   return handleOptions(req);
 }
@@ -82,40 +153,47 @@ export async function POST(req: Request) {
     if (!getShopDomain() || !getAdminToken()) {
       return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or admin token' }, { status: 500 });
     }
-
     if (!isAdminReq(req)) {
       return jsonWithCors(req, { ok: false, error: 'admin_forbidden' }, { status: 403 });
     }
 
     const body = await req.json().catch(() => ({} as any));
+    const productIdRaw = String(body?.productId || '').trim();
+    const productIdDigits = extractNumericProductId(productIdRaw);
 
-    const raw = String(body?.productId || '').trim();
-    const m = raw.match(/(\d+)$/); // ✅ accepte "123" ou "gid://shopify/Product/123"
-    const productId = m ? m[1] : '';
-
-    if (!productId) {
+    if (!productIdDigits) {
       return jsonWithCors(req, { ok: false, error: 'productId_required' }, { status: 400 });
     }
 
-    const pid = Number(productId);
+    const pid = Number(productIdDigits);
+    const productGid = `gid://shopify/Product/${productIdDigits}`;
 
-    // 1) approval_status = approved
+    // 1) Metafield approval_status = approved
     await upsertProductMetafield(pid, 'mfapp', 'approval_status', 'single_line_text_field', 'approved');
 
-    // 2) Publie le produit
+    // 2) Active + published_at (couvre REST)
+    const nowIso = new Date().toISOString();
     const r = await shopifyFetch(`/products/${pid}.json`, {
       method: 'PUT',
-      json: { product: { id: pid, status: 'active' } },
+      json: { product: { id: pid, status: 'active', published_at: nowIso } },
     });
     if (!r.ok) {
       return jsonWithCors(req, { ok: false, error: `Shopify ${r.status}`, detail: r.text }, { status: r.status });
     }
 
-    // 3) Bucket quota au moment de la vraie publication
+    // 3) Publish sur Online Store (couvre le vrai besoin visibilité)
+    const pub = await publishToOnlineStore(productGid);
+    if (!pub.ok) {
+      // on ne bloque pas si Shopify a déjà publié, mais on remonte l'info
+      // (si tu veux bloquer: return 500)
+      console.warn('[MF] publish warning', pub);
+    }
+
+    // 4) Bucket quota au moment de la vraie publication
     const bucket = ym();
     await upsertProductMetafield(pid, 'mfapp', 'published_YYYYMM', 'single_line_text_field', bucket);
 
-    return jsonWithCors(req, { ok: true });
+    return jsonWithCors(req, { ok: true, productId: productIdDigits });
   } catch (e: any) {
     return jsonWithCors(req, { ok: false, error: e?.message || 'approve_failed' }, { status: 500 });
   }
