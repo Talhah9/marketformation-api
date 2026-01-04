@@ -40,7 +40,9 @@ async function shopifyFetch(path: string, init?: RequestInit & { json?: any }) {
 
   const text = await res.text();
   let json: any = {};
-  try { json = text ? JSON.parse(text) : {}; } catch {}
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {}
   return { ok: res.ok, status: res.status, json, text };
 }
 
@@ -62,7 +64,9 @@ async function shopifyGraphql(query: string, variables?: any) {
 
   const text = await res.text();
   let json: any = {};
-  try { json = text ? JSON.parse(text) : {}; } catch {}
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {}
   return { ok: res.ok, status: res.status, json, text };
 }
 
@@ -91,7 +95,7 @@ function isAdminReq(req: Request) {
   const email = (req.headers.get('x-mf-admin-email') || '').toLowerCase().trim();
   const allow = (process.env.MF_ADMIN_EMAILS || 'talhahally974@gmail.com')
     .split(',')
-    .map(s => s.trim().toLowerCase())
+    .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
   return !!email && allow.includes(email);
 }
@@ -140,10 +144,57 @@ async function publishToOnlineStore(productGid: string) {
   `;
   const r = await shopifyGraphql(m, { id: productGid, pub: publicationId });
   const errs = r.json?.data?.publishablePublish?.userErrors || [];
-  if (errs.length) return { ok: false, error: errs[0]?.message || 'publish_failed', detail: errs };
+  if (errs.length) {
+    return {
+      ok: false,
+      error: errs[0]?.message || 'publish_failed',
+      detail: errs,
+    };
+  }
   return { ok: true };
 }
 
+/* ===================== Collection resolve + add (pour Explorer) ===================== */
+async function resolveCollectionId(handleOrId?: string | number): Promise<number | null> {
+  if (!handleOrId) return null;
+
+  const s = String(handleOrId).trim();
+  if (!s) return null;
+
+  // ID numérique direct
+  if (/^\d+$/.test(s)) return Number(s);
+
+  // custom collections
+  let r = await shopifyFetch(
+    `/custom_collections.json?handle=${encodeURIComponent(s)}&limit=1`
+  );
+  if (r.ok && (r.json as any)?.custom_collections?.[0]?.id) {
+    return Number((r.json as any).custom_collections[0].id);
+  }
+
+  // smart collections
+  r = await shopifyFetch(`/smart_collections.json?handle=${encodeURIComponent(s)}&limit=1`);
+  if (r.ok && (r.json as any)?.smart_collections?.[0]?.id) {
+    return Number((r.json as any).smart_collections[0].id);
+  }
+
+  return null;
+}
+
+async function addToCollection(productId: number, collectionHandleOrId: string) {
+  const cid = await resolveCollectionId(collectionHandleOrId);
+  if (!cid) return { ok: false, error: 'collection_not_found' };
+
+  const r = await shopifyFetch(`/collects.json`, {
+    json: { collect: { product_id: productId, collection_id: cid } },
+  });
+
+  // Si déjà dedans, Shopify peut renvoyer 422 -> on ignore
+  if (!r.ok && r.status !== 422) return { ok: false, error: `collect_${r.status}`, detail: r.text };
+  return { ok: true };
+}
+
+/* ===================== Routes ===================== */
 export async function OPTIONS(req: Request) {
   return handleOptions(req);
 }
@@ -151,7 +202,11 @@ export async function OPTIONS(req: Request) {
 export async function POST(req: Request) {
   try {
     if (!getShopDomain() || !getAdminToken()) {
-      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or admin token' }, { status: 500 });
+      return jsonWithCors(
+        req,
+        { ok: false, error: 'Missing SHOP_DOMAIN or admin token' },
+        { status: 500 }
+      );
     }
     if (!isAdminReq(req)) {
       return jsonWithCors(req, { ok: false, error: 'admin_forbidden' }, { status: 403 });
@@ -178,22 +233,40 @@ export async function POST(req: Request) {
       json: { product: { id: pid, status: 'active', published_at: nowIso } },
     });
     if (!r.ok) {
-      return jsonWithCors(req, { ok: false, error: `Shopify ${r.status}`, detail: r.text }, { status: r.status });
+      return jsonWithCors(
+        req,
+        { ok: false, error: `Shopify ${r.status}`, detail: r.text },
+        { status: r.status }
+      );
     }
 
     // 3) Publish sur Online Store (couvre le vrai besoin visibilité)
     const pub = await publishToOnlineStore(productGid);
     if (!pub.ok) {
       // on ne bloque pas si Shopify a déjà publié, mais on remonte l'info
-      // (si tu veux bloquer: return 500)
       console.warn('[MF] publish warning', pub);
+    }
+
+    // ✅ 3bis) Ajout à la collection Explorer (pour que ça apparaisse dans ta section Shopify)
+    const targetCollection = String(process.env.MF_EXPLORER_COLLECTION_HANDLE || '').trim();
+    if (targetCollection) {
+      const add = await addToCollection(pid, targetCollection);
+      if (!add.ok) {
+        // on ne bloque pas (sinon tu risques de "casser" l'approbation)
+        console.warn('[MF] addToCollection warning', add);
+      }
     }
 
     // 4) Bucket quota au moment de la vraie publication
     const bucket = ym();
     await upsertProductMetafield(pid, 'mfapp', 'published_YYYYMM', 'single_line_text_field', bucket);
 
-    return jsonWithCors(req, { ok: true, productId: productIdDigits });
+    return jsonWithCors(req, {
+      ok: true,
+      productId: productIdDigits,
+      published: true,
+      added_to_collection: !!targetCollection,
+    });
   } catch (e: any) {
     return jsonWithCors(req, { ok: false, error: e?.message || 'approve_failed' }, { status: 500 });
   }
