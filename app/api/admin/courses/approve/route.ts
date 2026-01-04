@@ -43,7 +43,13 @@ async function shopifyFetch(path: string, init?: RequestInit & { json?: any }) {
   return { ok: res.ok, status: res.status, json, text };
 }
 
-async function upsertProductMetafield(productId: number, namespace: string, key: string, type: string, value: string) {
+async function upsertProductMetafield(
+  productId: number,
+  namespace: string,
+  key: string,
+  type: string,
+  value: string
+) {
   return shopifyFetch(`/metafields.json`, {
     json: {
       metafield: {
@@ -82,17 +88,21 @@ export async function POST(req: Request) {
     }
 
     const body = await req.json().catch(() => ({} as any));
-    const productId = String(body?.productId || '').trim();
-    if (!/^\d+$/.test(productId)) {
+
+    const raw = String(body?.productId || '').trim();
+    const m = raw.match(/(\d+)$/); // ✅ accepte "123" ou "gid://shopify/Product/123"
+    const productId = m ? m[1] : '';
+
+    if (!productId) {
       return jsonWithCors(req, { ok: false, error: 'productId_required' }, { status: 400 });
     }
 
     const pid = Number(productId);
 
-    // ✅ 1) Metafield approval_status = approved
+    // 1) approval_status = approved
     await upsertProductMetafield(pid, 'mfapp', 'approval_status', 'single_line_text_field', 'approved');
 
-    // ✅ 2) Publie le produit (status active)
+    // 2) Publie le produit
     const r = await shopifyFetch(`/products/${pid}.json`, {
       method: 'PUT',
       json: { product: { id: pid, status: 'active' } },
@@ -101,7 +111,7 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: `Shopify ${r.status}`, detail: r.text }, { status: r.status });
     }
 
-    // ✅ 3) Marque le bucket quota au moment de la vraie publication
+    // 3) Bucket quota au moment de la vraie publication
     const bucket = ym();
     await upsertProductMetafield(pid, 'mfapp', 'published_YYYYMM', 'single_line_text_field', bucket);
 
