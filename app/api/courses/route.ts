@@ -8,6 +8,10 @@
 // - /apps/mf/courses?handle=xxx&public=1 (legacy)
 // - ✅ FIX: support Shopify IDs > 2^53 (NE JAMAIS Number()) via GraphQL email resolve
 // - En public=1: ne renvoie que published + pas de quota
+//
+// ✅ AJOUT: workflow validation admin
+// - À la création: mfapp.approval_status = "pending"
+// - Au listing: renvoie approval_status + approval_label
 
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 import { prisma } from '@/lib/prisma';
@@ -350,6 +354,11 @@ export async function GET(req: Request) {
         const mf_theme = String(themeHandleRaw || '').trim();
         const theme_label = mf_theme && THEME_LABELS[mf_theme] ? THEME_LABELS[mf_theme] : '';
 
+        // ✅ AJOUT: statut validation admin
+        const approvalRaw = await getProductMetafieldValue(p.id, 'mfapp', 'approval_status');
+        const approval_status = String(approvalRaw || 'pending').trim().toLowerCase();
+        const approval_label = approval_status === 'approved' ? 'Approuvée' : 'En attente';
+
         return {
           id: p.id,
           title: p.title,
@@ -362,6 +371,10 @@ export async function GET(req: Request) {
           theme_label,
           url: p.handle ? `/products/${p.handle}` : '',
           handle: p.handle || '',
+
+          // ✅ AJOUT
+          approval_status,
+          approval_label,
         };
       }),
     );
@@ -518,6 +531,10 @@ export async function POST(req: Request) {
     }
     await upsertProductMetafield(created.id, 'mkt', 'pdf_url', 'url', pdfUrl);
 
+    // ✅ AJOUT: statut validation admin par défaut
+    // -> admin dashboard pourra passer à "approved"
+    await upsertProductMetafield(created.id, 'mfapp', 'approval_status', 'single_line_text_field', 'pending');
+
     /* Marquage quota */
     if (status === 'active') {
       const bucket = ym();
@@ -575,7 +592,13 @@ export async function POST(req: Request) {
         await upsertProductMetafield(created.id, 'mfapp', 'level', 'single_line_text_field', levelFinal);
       }
       if (language_text && String(language_text).trim()) {
-        await upsertProductMetafield(created.id, 'mfapp', 'language_text', 'single_line_text_field', cleanStr(language_text, 60));
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'language_text',
+          'single_line_text_field',
+          cleanStr(language_text, 60),
+        );
       }
       if (learnArr.length) {
         await upsertProductMetafield(created.id, 'mfapp', 'learn', 'json', JSON.stringify(learnArr));
