@@ -590,6 +590,15 @@ export async function POST(req: Request) {
       'pending',
     );
 
+    // ✅ SYNC CRITIQUE POUR LA PAGE PRODUIT (utilise les URL du formateur)
+await upsertProductMetafield(created.id, 'mfapp', 'image_url', 'url', String(imageUrl).trim());
+await upsertProductMetafield(created.id, 'mfapp', 'pdf_url', 'url', String(pdfUrl).trim());
+
+// (optionnel, mais pratique si tu lis "imageUrl" côté Liquid)
+await upsertProductMetafield(created.id, 'mfapp', 'imageUrl', 'url', String(imageUrl).trim());
+await upsertProductMetafield(created.id, 'mfapp', 'pdfUrl', 'url', String(pdfUrl).trim());
+
+
     // ❌ IMPORTANT: on NE marque PAS published_YYYYMM ici.
     // Il sera marqué dans /api/admin/courses/approve (quand publication réelle).
 
@@ -628,7 +637,7 @@ export async function POST(req: Request) {
       const learnArr = cleanList(mf.learn ?? learn, 12, 160);
       const audienceArr = cleanList(mf.audience ?? audience, 12, 160);
       const includesArr = cleanList(mf.includes ?? [], 12, 160);
-      const reqArr = cleanList(requirements, 10, 160);
+      const reqArr = cleanList(mf.requirements ?? requirements, 10, 160);
       const modulesArr = cleanModules(mf.modules ?? modules, 30);
 
       if (subtitleFinal) {
