@@ -14,15 +14,13 @@
 // - La publication réelle + mfapp.published_YYYYMM se fait UNIQUEMENT via endpoint admin approve
 // - Au listing: renvoie approval_status + approval_label
 //
-// ✅ IMPORTANT FIX LISTING:
+// ✅ IMPORTANT FIX LISTING (pour ton souci):
 // - On liste via GraphQL produits + metafields (theme + approval_status) en 1 requête
-//   => plus de "statut qui disparait" + plus d’items manquants (draft/pending).
 //
 // ✅ IMPORTANT FIX COLLECTIONS (pour ton souci collections vides):
-// - Si ta collection est "automatisée/smart": on ne peut PAS "ajouter" un produit.
-//   Il faut matcher les conditions => on ajoute des TAGS robustes:
-//     mf_theme:<handle> et mf_collection:<handle>
-// - On garde quand même le GraphQL collectionAddProducts (utile si collections manuelles)
+// - On n’ajoute PLUS via collects / collectionAddProducts
+// - On met un tag Shopify standard: theme-<handle>
+// - Les collections Shopify doivent être AUTOMATIQUES via règle "tag contient theme-<handle>"
 
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 import { prisma } from '@/lib/prisma';
@@ -188,53 +186,6 @@ async function upsertProductMetafield(
   });
 }
 
-/* ===================== Collection helpers (GraphQL) ===================== */
-function productGidFromNumericId(id: number | string) {
-  const n = String(id || '').trim();
-  if (!/^\d+$/.test(n)) return '';
-  return `gid://shopify/Product/${n}`;
-}
-
-function collectionGidFromNumericId(id: number | string) {
-  const n = String(id || '').trim();
-  if (!/^\d+$/.test(n)) return '';
-  return `gid://shopify/Collection/${n}`;
-}
-
-async function resolveCollectionGidByHandle(handle: string): Promise<string> {
-  const h = String(handle || '').trim();
-  if (!h) return '';
-
-  const q = `
-    query($handle: String!) {
-      collectionByHandle(handle: $handle) { id }
-    }
-  `;
-  const r = await shopifyGraphql(q, { handle: h });
-  return String(r.json?.data?.collectionByHandle?.id || '').trim();
-}
-
-async function addProductToCollectionGql(productIdNumeric: number, collectionGid: string) {
-  const productGid = productGidFromNumericId(productIdNumeric);
-  const colGid = String(collectionGid || '').trim();
-  if (!productGid || !colGid) return { ok: false as const, error: 'missing_gid' };
-
-  const m = `
-    mutation($id: ID!, $productIds: [ID!]!) {
-      collectionAddProducts(id: $id, productIds: $productIds) {
-        userErrors { field message }
-        job { id }
-      }
-    }
-  `;
-
-  const r = await shopifyGraphql(m, { id: colGid, productIds: [productGid] });
-  const errs = r.json?.data?.collectionAddProducts?.userErrors || [];
-  if (errs.length) return { ok: false as const, error: 'collectionAddProducts_userErrors', detail: errs };
-  if (!r.ok) return { ok: false as const, error: `Shopify ${r.status}`, detail: r.text };
-  return { ok: true as const };
-}
-
 /* ===================== Subscription plan ===================== */
 async function getPlanFromInternalSubscription(req: Request, email: string) {
   try {
@@ -316,6 +267,33 @@ function cleanModules(arr: any, maxItems = 30) {
   return out.slice(0, maxItems);
 }
 
+/* ===================== theme resolve helpers ===================== */
+function normalizeThemeHandle(v: any) {
+  const s = String(v ?? '').trim();
+  if (!s) return '';
+  // autorise uniquement handle-like
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/i.test(s)) return '';
+  return s.toLowerCase();
+}
+function buildThemeTag(themeHandle: string) {
+  const h = normalizeThemeHandle(themeHandle);
+  if (!h) return '';
+  return `theme-${h}`;
+}
+function uniqTags(tags: string[]) {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const t of tags) {
+    const s = String(t || '').trim();
+    if (!s) continue;
+    const key = s.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(s);
+  }
+  return out;
+}
+
 /* ===================== OPTIONS (CORS) ===================== */
 export async function OPTIONS(req: Request) {
   return handleOptions(req);
@@ -327,21 +305,37 @@ export async function OPTIONS(req: Request) {
 export async function GET(req: Request) {
   try {
     if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' }, { status: 500 });
+      return jsonWithCors(
+        req,
+        { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' },
+        { status: 500 },
+      );
     }
 
     const url = new URL(req.url);
-    const handle = (url.searchParams.get('u') || '').trim() || (url.searchParams.get('handle') || '').trim();
+
+    const handle =
+      (url.searchParams.get('u') || '').trim() ||
+      (url.searchParams.get('handle') || '').trim();
+
     const isPublic = url.searchParams.get('public') === '1';
 
     let email = (url.searchParams.get('email') || '').trim();
     const shopifyCustomerIdRaw = (url.searchParams.get('shopifyCustomerId') || '').trim();
 
-    if (!email && shopifyCustomerIdRaw) email = await resolveEmailByCustomerIdDigits(shopifyCustomerIdRaw);
-    if (!email && handle) email = await resolveEmailByHandle(handle);
+    if (!email && shopifyCustomerIdRaw) {
+      email = await resolveEmailByCustomerIdDigits(shopifyCustomerIdRaw);
+    }
+    if (!email && handle) {
+      email = await resolveEmailByHandle(handle);
+    }
 
     if (!email) {
-      return jsonWithCors(req, { ok: false, error: 'email_or_resolvable_handle_required' }, { status: 400 });
+      return jsonWithCors(
+        req,
+        { ok: false, error: 'email_or_resolvable_handle_required' },
+        { status: 400 },
+      );
     }
 
     const vendor = email.replace(/"/g, '\\"');
@@ -369,27 +363,33 @@ export async function GET(req: Request) {
 
     const r = await shopifyGraphql(q, { q: search });
     if (!r.ok) {
-      return jsonWithCors(req, { ok: false, error: `Shopify ${r.status}`, detail: r.text }, { status: r.status });
+      return jsonWithCors(
+        req,
+        { ok: false, error: `Shopify ${r.status}`, detail: r.text },
+        { status: r.status },
+      );
     }
 
     const edges = r.json?.data?.products?.edges || [];
     const itemsRaw = edges.map((e: any) => {
       const p = e?.node || {};
       const gid = String(p.id || '');
-      const idMatch = gid.match(/\/Product\/(\d+)$/);
-      const id = idMatch ? Number(idMatch[1]) : undefined;
 
       const mf_theme = String(p?.theme?.value || '').trim();
       const theme_label = mf_theme && THEME_LABELS[mf_theme] ? THEME_LABELS[mf_theme] : '';
 
       const approval_status = String(p?.approval?.value || 'pending').trim().toLowerCase();
       const approval_label =
-        approval_status === 'approved' ? 'Approuvée' : approval_status === 'rejected' ? 'Refusée' : 'En attente';
+        approval_status === 'approved'
+          ? 'Approuvée'
+          : approval_status === 'rejected'
+            ? 'Refusée'
+            : 'En attente';
 
       const published = !!p.publishedAt;
 
       return {
-        id: id ?? gid,
+        id: gid, // BIGINT safe
         title: p.title || '',
         coverUrl: p?.featuredImage?.url || '',
         image_url: p?.featuredImage?.url || '',
@@ -406,14 +406,15 @@ export async function GET(req: Request) {
       };
     });
 
-    const items = isPublic ? itemsRaw.filter((x: any) => !!x.published && x.approval_status === 'approved') : itemsRaw;
+    const items = isPublic
+      ? itemsRaw.filter((x: any) => !!x.published && x.approval_status === 'approved')
+      : itemsRaw;
 
     let plan: 'Starter' | 'Pro' | 'Business' | 'Unknown' = 'Unknown';
     let quota: any = null;
 
     if (!isPublic && email) {
       plan = await getPlanFromInternalSubscription(req, email);
-
       if (plan === 'Starter') {
         const used = await countPublishedThisMonthByMetafield(email);
         quota = { plan: 'Starter', limit: 3, used, remaining: Math.max(0, 3 - used) };
@@ -434,7 +435,11 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
   try {
     if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' }, { status: 500 });
+      return jsonWithCors(
+        req,
+        { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' },
+        { status: 500 },
+      );
     }
 
     const url = new URL(req.url);
@@ -451,15 +456,16 @@ export async function POST(req: Request) {
       pdfUrl: pdfUrlRaw,
       pdf_url,
 
+      // status ignoré (publish gate)
       status: _statusIgnored,
 
-      collectionId,
-      collectionHandle,
-      collectionHandleOrId,
-
+      // thématique
       theme,
       themeHandle,
       mf_theme,
+      collectionHandle, // legacy: parfois ton front mettait la thématique ici
+      collectionHandleOrId,
+      collectionId,
 
       mfapp,
 
@@ -478,6 +484,7 @@ export async function POST(req: Request) {
     if (!email || !title || !imageUrl || !pdfUrl) {
       return jsonWithCors(req, { ok: false, error: 'missing fields' }, { status: 400 });
     }
+
     if (!/^https?:\/\//i.test(pdfUrl)) {
       return jsonWithCors(req, { ok: false, error: 'pdfUrl must be https URL' }, { status: 400 });
     }
@@ -495,7 +502,7 @@ export async function POST(req: Request) {
       }
     }
 
-    // normaliser prix Shopify
+    // normaliser prix Shopify (string "12.34")
     let priceStr = '';
     if (price !== undefined && price !== null && String(price).trim() !== '') {
       const n = Number(price);
@@ -503,34 +510,34 @@ export async function POST(req: Request) {
       else priceStr = String(price).trim();
     }
 
-    // ✅ selector + themeHandleFinal calculés AVANT création (pour tags + règles smart collections)
-    const selector = collectionId ?? collectionHandleOrId ?? collectionHandle;
+    // ✅ thème final (source de vérité = handle-like)
+    const themeHandleFinal =
+      normalizeThemeHandle(mf_theme) ||
+      normalizeThemeHandle(themeHandle) ||
+      normalizeThemeHandle(theme) ||
+      normalizeThemeHandle(collectionHandle) ||
+      normalizeThemeHandle(collectionHandleOrId) ||
+      normalizeThemeHandle(collectionId);
 
-    let themeHandleFinal = (mf_theme || themeHandle || theme || '').toString().trim() || '';
-    if (!themeHandleFinal && selector && typeof selector === 'string') {
-      const sel = selector.trim();
-      if (sel && !/^\d+$/.test(sel)) themeHandleFinal = sel;
-    }
+    const themeTag = buildThemeTag(themeHandleFinal);
 
-    // ✅ Tags robustes pour collections automatisées
-    const tags: string[] = ['mkt-course'];
-    if (themeHandleFinal) {
-      tags.push(`mf_theme:${themeHandleFinal}`);
-      tags.push(`mf_collection:${themeHandleFinal}`);
-      // utile si tes règles Shopify sont “Tag equals developpement-personnel-bien-etre”
-      tags.push(themeHandleFinal);
-    }
-
-    // ✅ Publish gate: toujours draft
+    // ✅ Publish gate: toujours draft à la création
     const finalStatus: 'draft' = 'draft';
 
+    /* Création produit */
     const productPayload = {
       product: {
         title,
-        body_html: description ? `<p>${description}</p>` : '',
+        body_html: description ? `<p>${String(description)}</p>` : '',
         vendor: email,
-        images: imageUrl ? [{ src: imageUrl }] : [],
-        tags,
+        images: imageUrl ? [{ src: String(imageUrl) }] : [],
+        // ✅ IMPORTANT: collections via tags automatiques Shopify
+        tags: uniqTags([
+          'mkt-course',
+          themeTag, // ✅ clé Shopify collections
+          // legacy (si tu veux garder compat / debug)
+          themeHandleFinal ? `mf_theme:${themeHandleFinal}` : '',
+        ]),
         status: finalStatus,
         variants: [
           {
@@ -544,7 +551,11 @@ export async function POST(req: Request) {
 
     const createRes = await shopifyFetch(`/products.json`, { json: productPayload });
     if (!createRes.ok) {
-      return jsonWithCors(req, { ok: false, error: `Shopify ${createRes.status}`, detail: createRes.text }, { status: createRes.status });
+      return jsonWithCors(
+        req,
+        { ok: false, error: `Shopify ${createRes.status}`, detail: createRes.text },
+        { status: createRes.status },
+      );
     }
 
     const created = (createRes.json as any)?.product;
@@ -555,54 +566,38 @@ export async function POST(req: Request) {
     /* Métachamps mkt */
     await upsertProductMetafield(created.id, 'mkt', 'owner_email', 'single_line_text_field', email);
     if (shopifyCustomerId) {
-      await upsertProductMetafield(created.id, 'mkt', 'owner_id', 'single_line_text_field', String(shopifyCustomerId));
+      await upsertProductMetafield(
+        created.id,
+        'mkt',
+        'owner_id',
+        'single_line_text_field',
+        String(shopifyCustomerId),
+      );
     }
     await upsertProductMetafield(created.id, 'mkt', 'pdf_url', 'url', pdfUrl);
 
-    /* Statut validation admin */
+    // ✅ statut validation admin par défaut
     await upsertProductMetafield(created.id, 'mfapp', 'approval_status', 'single_line_text_field', 'pending');
 
-    /* Debug/compat URLs */
-    await upsertProductMetafield(created.id, 'mfapp', 'image_url', 'url', String(imageUrl).trim());
-    await upsertProductMetafield(created.id, 'mfapp', 'pdf_url', 'url', String(pdfUrl).trim());
-    await upsertProductMetafield(created.id, 'mfapp', 'imageUrl', 'url', String(imageUrl).trim());
-    await upsertProductMetafield(created.id, 'mfapp', 'pdfUrl', 'url', String(pdfUrl).trim());
-
-    /* Thématique metafield (utile pour listing) */
+    // ✅ thème aussi en metafield (ta page produit/listing le lit)
     if (themeHandleFinal) {
       await upsertProductMetafield(created.id, 'mfapp', 'theme', 'single_line_text_field', themeHandleFinal);
     }
 
-    // ✅ Tentative d’ajout à collection (fonctionne seulement si collection manuelle)
-    if (selector) {
-      try {
-        let collectionGid = '';
-        const selStr = String(selector).trim();
-
-        if (/^\d+$/.test(selStr)) collectionGid = collectionGidFromNumericId(selStr);
-        else collectionGid = await resolveCollectionGidByHandle(selStr);
-
-        if (collectionGid) {
-          const addRes = await addProductToCollectionGql(created.id, collectionGid);
-          if (!addRes.ok) console.warn('[MF] collection add failed', addRes);
-        } else {
-          console.warn('[MF] collection not found for selector=', selector);
-        }
-      } catch (e) {
-        console.warn('[MF] collection assign error', e);
-      }
-    }
+    // ✅ SYNC CRITIQUE (pratique pour debug / autres templates)
+    await upsertProductMetafield(created.id, 'mfapp', 'image_url', 'url', String(imageUrl).trim());
+    await upsertProductMetafield(created.id, 'mfapp', 'pdf_url', 'url', String(pdfUrl).trim());
+    await upsertProductMetafield(created.id, 'mfapp', 'imageUrl', 'url', String(imageUrl).trim());
+    await upsertProductMetafield(created.id, 'mfapp', 'pdfUrl', 'url', String(pdfUrl).trim());
 
     // ✅ Synchro fiche produit (Udemy-like)
     try {
       const mf = mfapp && typeof mfapp === 'object' ? mfapp : {};
 
       const subtitleFinal = cleanStr(mf.subtitle ?? subtitle, 600);
-
       const formatFinal = cleanStr(mf.format ?? '', 60);
       const levelFinal = cleanStr(mf.level ?? level_text ?? '', 80);
 
-      // compat + clé attendue par ta section produit
       const durationTextFinal = cleanStr(mf.duration_text ?? duration_text ?? mf.duration ?? '', 80);
       const durationCompatFinal = cleanStr(mf.duration ?? mf.duration_text ?? duration_text ?? '', 80);
 
@@ -623,36 +618,88 @@ export async function POST(req: Request) {
       const reqArr = cleanList(mf.requirements ?? requirements, 10, 160);
       const modulesArr = cleanModules(mf.modules ?? modules, 30);
 
-      if (subtitleFinal) await upsertProductMetafield(created.id, 'mfapp', 'subtitle', 'multi_line_text_field', subtitleFinal);
-      if (formatFinal) await upsertProductMetafield(created.id, 'mfapp', 'format', 'single_line_text_field', formatFinal);
-
-      if (durationCompatFinal) await upsertProductMetafield(created.id, 'mfapp', 'duration', 'single_line_text_field', durationCompatFinal);
-      if (durationTextFinal) await upsertProductMetafield(created.id, 'mfapp', 'duration_text', 'single_line_text_field', durationTextFinal);
-
-      if (levelFinal) await upsertProductMetafield(created.id, 'mfapp', 'level', 'single_line_text_field', levelFinal);
-
-      if (language_text && String(language_text).trim()) {
-        await upsertProductMetafield(created.id, 'mfapp', 'language_text', 'single_line_text_field', cleanStr(language_text, 60));
+      if (subtitleFinal) {
+        await upsertProductMetafield(created.id, 'mfapp', 'subtitle', 'multi_line_text_field', subtitleFinal);
+      }
+      if (formatFinal) {
+        await upsertProductMetafield(created.id, 'mfapp', 'format', 'single_line_text_field', formatFinal);
       }
 
-      if (certificateTextFinal) await upsertProductMetafield(created.id, 'mfapp', 'certificate_text', 'single_line_text_field', certificateTextFinal);
-      if (badgeTextFinal) await upsertProductMetafield(created.id, 'mfapp', 'badge_text', 'single_line_text_field', badgeTextFinal);
-      if (pill1Final) await upsertProductMetafield(created.id, 'mfapp', 'pill_1', 'single_line_text_field', pill1Final);
-      if (pill2Final) await upsertProductMetafield(created.id, 'mfapp', 'pill_2', 'single_line_text_field', pill2Final);
+      // durée: compat + clé utilisée par ta section produit
+      if (durationCompatFinal) {
+        await upsertProductMetafield(created.id, 'mfapp', 'duration', 'single_line_text_field', durationCompatFinal);
+      }
+      if (durationTextFinal) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'duration_text',
+          'single_line_text_field',
+          durationTextFinal,
+        );
+      }
 
-      if (quickTitleFinal) await upsertProductMetafield(created.id, 'mfapp', 'quick_title', 'single_line_text_field', quickTitleFinal);
-      if (quickFormatFinal) await upsertProductMetafield(created.id, 'mfapp', 'quick_format', 'single_line_text_field', quickFormatFinal);
-      if (quickAccessFinal) await upsertProductMetafield(created.id, 'mfapp', 'quick_access', 'single_line_text_field', quickAccessFinal);
-      if (quickLevelFinal) await upsertProductMetafield(created.id, 'mfapp', 'quick_level', 'single_line_text_field', quickLevelFinal);
+      if (levelFinal) {
+        await upsertProductMetafield(created.id, 'mfapp', 'level', 'single_line_text_field', levelFinal);
+      }
+      if (language_text && String(language_text).trim()) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'language_text',
+          'single_line_text_field',
+          cleanStr(language_text, 60),
+        );
+      }
 
-      if (includesTitleFinal) await upsertProductMetafield(created.id, 'mfapp', 'includes_title', 'single_line_text_field', includesTitleFinal);
-      if (footnoteFinal) await upsertProductMetafield(created.id, 'mfapp', 'footnote', 'multi_line_text_field', footnoteFinal);
+      // champs UI produit
+      if (certificateTextFinal) {
+        await upsertProductMetafield(created.id, 'mfapp', 'certificate_text', 'single_line_text_field', certificateTextFinal);
+      }
+      if (badgeTextFinal) {
+        await upsertProductMetafield(created.id, 'mfapp', 'badge_text', 'single_line_text_field', badgeTextFinal);
+      }
+      if (pill1Final) {
+        await upsertProductMetafield(created.id, 'mfapp', 'pill_1', 'single_line_text_field', pill1Final);
+      }
+      if (pill2Final) {
+        await upsertProductMetafield(created.id, 'mfapp', 'pill_2', 'single_line_text_field', pill2Final);
+      }
+      if (quickTitleFinal) {
+        await upsertProductMetafield(created.id, 'mfapp', 'quick_title', 'single_line_text_field', quickTitleFinal);
+      }
+      if (quickFormatFinal) {
+        await upsertProductMetafield(created.id, 'mfapp', 'quick_format', 'single_line_text_field', quickFormatFinal);
+      }
+      if (quickAccessFinal) {
+        await upsertProductMetafield(created.id, 'mfapp', 'quick_access', 'single_line_text_field', quickAccessFinal);
+      }
+      if (quickLevelFinal) {
+        await upsertProductMetafield(created.id, 'mfapp', 'quick_level', 'single_line_text_field', quickLevelFinal);
+      }
+      if (includesTitleFinal) {
+        await upsertProductMetafield(created.id, 'mfapp', 'includes_title', 'single_line_text_field', includesTitleFinal);
+      }
+      if (footnoteFinal) {
+        await upsertProductMetafield(created.id, 'mfapp', 'footnote', 'multi_line_text_field', footnoteFinal);
+      }
 
-      if (learnArr.length) await upsertProductMetafield(created.id, 'mfapp', 'learn', 'json', JSON.stringify(learnArr));
-      if (modulesArr.length) await upsertProductMetafield(created.id, 'mfapp', 'modules', 'json', JSON.stringify(modulesArr));
-      if (audienceArr.length) await upsertProductMetafield(created.id, 'mfapp', 'audience', 'json', JSON.stringify(audienceArr));
-      if (includesArr.length) await upsertProductMetafield(created.id, 'mfapp', 'includes', 'json', JSON.stringify(includesArr));
-      if (reqArr.length) await upsertProductMetafield(created.id, 'mfapp', 'requirements', 'json', JSON.stringify(reqArr));
+      // listes (JSON)
+      if (learnArr.length) {
+        await upsertProductMetafield(created.id, 'mfapp', 'learn', 'json', JSON.stringify(learnArr));
+      }
+      if (modulesArr.length) {
+        await upsertProductMetafield(created.id, 'mfapp', 'modules', 'json', JSON.stringify(modulesArr));
+      }
+      if (audienceArr.length) {
+        await upsertProductMetafield(created.id, 'mfapp', 'audience', 'json', JSON.stringify(audienceArr));
+      }
+      if (includesArr.length) {
+        await upsertProductMetafield(created.id, 'mfapp', 'includes', 'json', JSON.stringify(includesArr));
+      }
+      if (reqArr.length) {
+        await upsertProductMetafield(created.id, 'mfapp', 'requirements', 'json', JSON.stringify(reqArr));
+      }
     } catch (e) {
       console.error('[MF] sync metafields error', e);
     }
@@ -665,6 +712,7 @@ export async function POST(req: Request) {
 
       const mfThemeKey = themeHandleFinal || '';
       const categoryLabel = mfThemeKey && THEME_LABELS[mfThemeKey] ? THEME_LABELS[mfThemeKey] : null;
+
       const accessUrl = shopifyProductHandle ? `/products/${shopifyProductHandle}` : '';
 
       const mf = mfapp && typeof mfapp === 'object' ? mfapp : {};
@@ -709,11 +757,8 @@ export async function POST(req: Request) {
       admin_url: `https://${process.env.SHOP_DOMAIN}/admin/products/${created.id}`,
       approval_status: 'pending',
       status: finalStatus,
-      debug: {
-        themeHandleFinal,
-        tags,
-        selector,
-      },
+      theme: themeHandleFinal || null,
+      theme_tag: themeTag || null,
     });
   } catch (e: any) {
     return jsonWithCors(req, { ok: false, error: e?.message || 'create_failed' }, { status: 500 });
