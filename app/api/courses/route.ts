@@ -17,6 +17,11 @@
 // ✅ IMPORTANT FIX LISTING (pour ton souci):
 // - On liste via GraphQL produits + metafields (theme + approval_status) en 1 requête
 //   => plus de "statut qui disparait" + plus d’items manquants (draft/pending).
+//
+// ✅ IMPORTANT FIX COLLECTIONS (pour ton souci collections vides):
+// - On n’utilise plus REST custom/smart collections + /collects.json
+// - On ajoute à la collection via GraphQL: collectionByHandle + collectionAddProducts
+//   => fonctionne pour smart/custom + handle exact, et évite les erreurs silencieuses
 
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 import { prisma } from '@/lib/prisma';
@@ -182,24 +187,51 @@ async function upsertProductMetafield(
   });
 }
 
-/* ===================== Collection resolve ===================== */
-async function resolveCollectionId(handleOrId?: string | number): Promise<number | null> {
-  if (!handleOrId) return null;
+/* ===================== Collection helpers (GraphQL robuste) ===================== */
+function productGidFromNumericId(id: number | string) {
+  const n = String(id || '').trim();
+  if (!/^\d+$/.test(n)) return '';
+  return `gid://shopify/Product/${n}`;
+}
 
-  const num = Number(handleOrId);
-  if (!Number.isNaN(num) && String(num) === String(handleOrId)) return num;
+function collectionGidFromNumericId(id: number | string) {
+  const n = String(id || '').trim();
+  if (!/^\d+$/.test(n)) return '';
+  return `gid://shopify/Collection/${n}`;
+}
 
-  const handle = String(handleOrId).trim();
+async function resolveCollectionGidByHandle(handle: string): Promise<string> {
+  const h = String(handle || '').trim();
+  if (!h) return '';
 
-  let r = await shopifyFetch(`/custom_collections.json?handle=${encodeURIComponent(handle)}&limit=1`);
-  if (r.ok && (r.json as any)?.custom_collections?.[0]?.id)
-    return Number((r.json as any).custom_collections[0].id);
+  const q = `
+    query($handle: String!) {
+      collectionByHandle(handle: $handle) { id }
+    }
+  `;
+  const r = await shopifyGraphql(q, { handle: h });
+  return String(r.json?.data?.collectionByHandle?.id || '').trim();
+}
 
-  r = await shopifyFetch(`/smart_collections.json?handle=${encodeURIComponent(handle)}&limit=1`);
-  if (r.ok && (r.json as any)?.smart_collections?.[0]?.id)
-    return Number((r.json as any).smart_collections[0].id);
+async function addProductToCollectionGql(productIdNumeric: number, collectionGid: string) {
+  const productGid = productGidFromNumericId(productIdNumeric);
+  const colGid = String(collectionGid || '').trim();
+  if (!productGid || !colGid) return { ok: false as const, error: 'missing_gid' };
 
-  return null;
+  const m = `
+    mutation($id: ID!, $productIds: [ID!]!) {
+      collectionAddProducts(id: $id, productIds: $productIds) {
+        userErrors { field message }
+        job { id }
+      }
+    }
+  `;
+
+  const r = await shopifyGraphql(m, { id: colGid, productIds: [productGid] });
+  const errs = r.json?.data?.collectionAddProducts?.userErrors || [];
+  if (errs.length) return { ok: false as const, error: 'collectionAddProducts_userErrors', detail: errs };
+  if (!r.ok) return { ok: false as const, error: `Shopify ${r.status}`, detail: r.text };
+  return { ok: true as const };
 }
 
 /* ===================== Subscription plan ===================== */
@@ -290,13 +322,6 @@ export async function OPTIONS(req: Request) {
 
 /* =====================================================================
    GET /api/courses
-   ✅ Public:
-   - ?public=1
-   - accepte ?u=trainer-<id> OU ?shopifyCustomerId=<id> OU ?handle=<...>
-   - ✅ FIX: resolve email via GraphQL (bigint-safe)
-   - public => ONLY published + APPROUVÉES + pas de quota
-   ✅ FIX LISTING:
-   - listing via GraphQL + metafields (theme + approval_status) => pas d’items manquants
 ===================================================================== */
 export async function GET(req: Request) {
   try {
@@ -388,8 +413,8 @@ export async function GET(req: Request) {
         approval_status === 'approved'
           ? 'Approuvée'
           : approval_status === 'rejected'
-          ? 'Refusée'
-          : 'En attente';
+            ? 'Refusée'
+            : 'En attente';
 
       const published = !!p.publishedAt;
 
@@ -440,12 +465,6 @@ export async function GET(req: Request) {
 
 /* =====================================================================
    POST /api/courses
-   → Création d’un produit (Course)
-   ✅ Publish gate:
-   - On crée toujours en DRAFT
-   - mfapp.approval_status = "pending"
-   - ❌ On ne touche PAS à mfapp.published_YYYYMM ici
-   - L’admin "approve" publiera + marquera published_YYYYMM
 ===================================================================== */
 export async function POST(req: Request) {
   try {
@@ -504,9 +523,7 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: 'pdfUrl must be https URL' }, { status: 400 });
     }
 
-    // Quota: on garde ta logique sans casser,
-    // mais elle devient un "guard" avant création (même si on crée en draft).
-    // (Tu pourras la déplacer au moment de l'approbation plus tard si tu veux.)
+    // Quota guard
     const plan = await getPlanFromInternalSubscription(req, email);
 
     if (!bypass && plan === 'Starter') {
@@ -581,7 +598,7 @@ export async function POST(req: Request) {
     }
     await upsertProductMetafield(created.id, 'mkt', 'pdf_url', 'url', pdfUrl);
 
-    // ✅ AJOUT: statut validation admin par défaut
+    // ✅ statut validation admin par défaut
     await upsertProductMetafield(
       created.id,
       'mfapp',
@@ -590,17 +607,14 @@ export async function POST(req: Request) {
       'pending',
     );
 
-    // ✅ SYNC CRITIQUE POUR LA PAGE PRODUIT (utilise les URL du formateur)
-await upsertProductMetafield(created.id, 'mfapp', 'image_url', 'url', String(imageUrl).trim());
-await upsertProductMetafield(created.id, 'mfapp', 'pdf_url', 'url', String(pdfUrl).trim());
-
-// (optionnel, mais pratique si tu lis "imageUrl" côté Liquid)
-await upsertProductMetafield(created.id, 'mfapp', 'imageUrl', 'url', String(imageUrl).trim());
-await upsertProductMetafield(created.id, 'mfapp', 'pdfUrl', 'url', String(pdfUrl).trim());
-
+    // ✅ SYNC CRITIQUE (pratique pour debug / autres templates)
+    // (n'empêche pas l'image Shopify featured_image)
+    await upsertProductMetafield(created.id, 'mfapp', 'image_url', 'url', String(imageUrl).trim());
+    await upsertProductMetafield(created.id, 'mfapp', 'pdf_url', 'url', String(pdfUrl).trim());
+    await upsertProductMetafield(created.id, 'mfapp', 'imageUrl', 'url', String(imageUrl).trim());
+    await upsertProductMetafield(created.id, 'mfapp', 'pdfUrl', 'url', String(pdfUrl).trim());
 
     // ❌ IMPORTANT: on NE marque PAS published_YYYYMM ici.
-    // Il sera marqué dans /api/admin/courses/approve (quand publication réelle).
 
     /* Assignation collection + thématique */
     const selector = collectionId ?? collectionHandleOrId ?? collectionHandle;
@@ -612,17 +626,41 @@ await upsertProductMetafield(created.id, 'mfapp', 'pdfUrl', 'url', String(pdfUrl
       if (!isNumeric) themeHandleFinal = selector.trim();
     }
 
+    // ✅ Assignation collection ROBUSTE (GraphQL)
     if (selector) {
-      const cid = await resolveCollectionId(selector);
-      if (cid) {
-        await shopifyFetch(`/collects.json`, {
-          json: { collect: { product_id: created.id, collection_id: cid } },
-        });
+      try {
+        let collectionGid = '';
+        const selStr = String(selector).trim();
+
+        // cas 1: ID numérique
+        if (/^\d+$/.test(selStr)) {
+          collectionGid = collectionGidFromNumericId(selStr);
+        } else {
+          // cas 2: handle exact
+          collectionGid = await resolveCollectionGidByHandle(selStr);
+        }
+
+        if (collectionGid) {
+          const addRes = await addProductToCollectionGql(created.id, collectionGid);
+          if (!addRes.ok) {
+            console.warn('[MF] collection add failed', addRes);
+          }
+        } else {
+          console.warn('[MF] collection not found for selector=', selector);
+        }
+      } catch (e) {
+        console.warn('[MF] collection assign error', e);
       }
     }
 
     if (themeHandleFinal) {
-      await upsertProductMetafield(created.id, 'mfapp', 'theme', 'single_line_text_field', themeHandleFinal);
+      await upsertProductMetafield(
+        created.id,
+        'mfapp',
+        'theme',
+        'single_line_text_field',
+        themeHandleFinal,
+      );
     }
 
     // ✅ Synchro fiche produit (Udemy-like)
@@ -630,13 +668,30 @@ await upsertProductMetafield(created.id, 'mfapp', 'pdfUrl', 'url', String(pdfUrl
       const mf = mfapp && typeof mfapp === 'object' ? mfapp : {};
 
       const subtitleFinal = cleanStr(mf.subtitle ?? subtitle, 600);
+
+      // ⚠️ ton front envoie duration_text, ton backend écrivait mfapp.duration
+      // => on garde mfapp.duration (compat) ET on ajoute mfapp.duration_text (pour ta section produit)
       const formatFinal = cleanStr(mf.format ?? '', 60);
       const levelFinal = cleanStr(mf.level ?? level_text ?? '', 80);
-      const durationFinal = cleanStr(mf.duration ?? duration_text ?? '', 80);
+
+      const durationTextFinal = cleanStr(mf.duration_text ?? duration_text ?? mf.duration ?? '', 80);
+      const durationCompatFinal = cleanStr(mf.duration ?? mf.duration_text ?? duration_text ?? '', 80);
+
+      const certificateTextFinal = cleanStr(mf.certificate_text ?? '', 160);
+      const badgeTextFinal = cleanStr(mf.badge_text ?? '', 160);
+      const pill1Final = cleanStr(mf.pill_1 ?? '', 160);
+      const pill2Final = cleanStr(mf.pill_2 ?? '', 160);
+      const quickTitleFinal = cleanStr(mf.quick_title ?? '', 160);
+      const quickFormatFinal = cleanStr(mf.quick_format ?? '', 160);
+      const quickAccessFinal = cleanStr(mf.quick_access ?? '', 160);
+      const quickLevelFinal = cleanStr(mf.quick_level ?? '', 160);
+      const includesTitleFinal = cleanStr(mf.includes_title ?? '', 160);
+      const footnoteFinal = cleanStr(mf.footnote ?? '', 300);
 
       const learnArr = cleanList(mf.learn ?? learn, 12, 160);
       const audienceArr = cleanList(mf.audience ?? audience, 12, 160);
       const includesArr = cleanList(mf.includes ?? [], 12, 160);
+
       const reqArr = cleanList(mf.requirements ?? requirements, 10, 160);
       const modulesArr = cleanModules(mf.modules ?? modules, 30);
 
@@ -646,9 +701,21 @@ await upsertProductMetafield(created.id, 'mfapp', 'pdfUrl', 'url', String(pdfUrl
       if (formatFinal) {
         await upsertProductMetafield(created.id, 'mfapp', 'format', 'single_line_text_field', formatFinal);
       }
-      if (durationFinal) {
-        await upsertProductMetafield(created.id, 'mfapp', 'duration', 'single_line_text_field', durationFinal);
+
+      // ✅ durée: les 2 clés
+      if (durationCompatFinal) {
+        await upsertProductMetafield(created.id, 'mfapp', 'duration', 'single_line_text_field', durationCompatFinal);
       }
+      if (durationTextFinal) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'duration_text',
+          'single_line_text_field',
+          durationTextFinal,
+        );
+      }
+
       if (levelFinal) {
         await upsertProductMetafield(created.id, 'mfapp', 'level', 'single_line_text_field', levelFinal);
       }
@@ -661,6 +728,76 @@ await upsertProductMetafield(created.id, 'mfapp', 'pdfUrl', 'url', String(pdfUrl
           cleanStr(language_text, 60),
         );
       }
+
+      // ✅ champs UI produit (ta section Liquid les lit)
+      if (certificateTextFinal) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'certificate_text',
+          'single_line_text_field',
+          certificateTextFinal,
+        );
+      }
+      if (badgeTextFinal) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'badge_text',
+          'single_line_text_field',
+          badgeTextFinal,
+        );
+      }
+      if (pill1Final) {
+        await upsertProductMetafield(created.id, 'mfapp', 'pill_1', 'single_line_text_field', pill1Final);
+      }
+      if (pill2Final) {
+        await upsertProductMetafield(created.id, 'mfapp', 'pill_2', 'single_line_text_field', pill2Final);
+      }
+      if (quickTitleFinal) {
+        await upsertProductMetafield(created.id, 'mfapp', 'quick_title', 'single_line_text_field', quickTitleFinal);
+      }
+      if (quickFormatFinal) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'quick_format',
+          'single_line_text_field',
+          quickFormatFinal,
+        );
+      }
+      if (quickAccessFinal) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'quick_access',
+          'single_line_text_field',
+          quickAccessFinal,
+        );
+      }
+      if (quickLevelFinal) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'quick_level',
+          'single_line_text_field',
+          quickLevelFinal,
+        );
+      }
+      if (includesTitleFinal) {
+        await upsertProductMetafield(
+          created.id,
+          'mfapp',
+          'includes_title',
+          'single_line_text_field',
+          includesTitleFinal,
+        );
+      }
+      if (footnoteFinal) {
+        await upsertProductMetafield(created.id, 'mfapp', 'footnote', 'multi_line_text_field', footnoteFinal);
+      }
+
+      // ✅ listes (JSON)
       if (learnArr.length) {
         await upsertProductMetafield(created.id, 'mfapp', 'learn', 'json', JSON.stringify(learnArr));
       }
