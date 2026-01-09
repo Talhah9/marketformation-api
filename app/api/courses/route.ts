@@ -14,14 +14,15 @@
 // - La publication réelle + mfapp.published_YYYYMM se fait UNIQUEMENT via endpoint admin approve
 // - Au listing: renvoie approval_status + approval_label
 //
-// ✅ IMPORTANT FIX LISTING (pour ton souci):
+// ✅ IMPORTANT FIX LISTING:
 // - On liste via GraphQL produits + metafields (theme + approval_status) en 1 requête
 //   => plus de "statut qui disparait" + plus d’items manquants (draft/pending).
 //
 // ✅ IMPORTANT FIX COLLECTIONS (pour ton souci collections vides):
-// - On ajoute à la collection via GraphQL: collectionByHandle + collectionAddProducts
-// - ✅ + fallback REST /collects.json si GraphQL échoue
-// - ✅ + debug retour collection_debug (pour voir pourquoi ça n’a pas marché)
+// - Si ta collection est "automatisée/smart": on ne peut PAS "ajouter" un produit.
+//   Il faut matcher les conditions => on ajoute des TAGS robustes:
+//     mf_theme:<handle> et mf_collection:<handle>
+// - On garde quand même le GraphQL collectionAddProducts (utile si collections manuelles)
 
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 import { prisma } from '@/lib/prisma';
@@ -187,37 +188,36 @@ async function upsertProductMetafield(
   });
 }
 
-/* ===================== Collection helpers (GraphQL + fallback REST + debug) ===================== */
+/* ===================== Collection helpers (GraphQL) ===================== */
 function productGidFromNumericId(id: number | string) {
   const n = String(id || '').trim();
   if (!/^\d+$/.test(n)) return '';
   return `gid://shopify/Product/${n}`;
 }
 
-async function resolveCollectionGidByHandle(handle: string) {
+function collectionGidFromNumericId(id: number | string) {
+  const n = String(id || '').trim();
+  if (!/^\d+$/.test(n)) return '';
+  return `gid://shopify/Collection/${n}`;
+}
+
+async function resolveCollectionGidByHandle(handle: string): Promise<string> {
   const h = String(handle || '').trim();
-  if (!h) return { ok: false as const, error: 'empty_handle' };
+  if (!h) return '';
 
   const q = `
     query($handle: String!) {
-      collectionByHandle(handle: $handle) { id handle title }
+      collectionByHandle(handle: $handle) { id }
     }
   `;
   const r = await shopifyGraphql(q, { handle: h });
-
-  const col = r.json?.data?.collectionByHandle || null;
-  if (!r.ok) return { ok: false as const, error: `graphql_http_${r.status}`, detail: r.text };
-  if (!col?.id) return { ok: false as const, error: 'collection_not_found_by_handle', detail: { handle: h } };
-
-  return { ok: true as const, id: String(col.id), handle: col.handle, title: col.title };
+  return String(r.json?.data?.collectionByHandle?.id || '').trim();
 }
 
-async function addProductToCollectionGql(collectionGid: string, productIdNumeric: number) {
+async function addProductToCollectionGql(productIdNumeric: number, collectionGid: string) {
   const productGid = productGidFromNumericId(productIdNumeric);
   const colGid = String(collectionGid || '').trim();
-  if (!productGid || !colGid) {
-    return { ok: false as const, error: 'missing_gid', detail: { productGid, collectionGid: colGid } };
-  }
+  if (!productGid || !colGid) return { ok: false as const, error: 'missing_gid' };
 
   const m = `
     mutation($id: ID!, $productIds: [ID!]!) {
@@ -229,37 +229,9 @@ async function addProductToCollectionGql(collectionGid: string, productIdNumeric
   `;
 
   const r = await shopifyGraphql(m, { id: colGid, productIds: [productGid] });
-  if (!r.ok) return { ok: false as const, error: `graphql_http_${r.status}`, detail: r.text };
-
   const errs = r.json?.data?.collectionAddProducts?.userErrors || [];
   if (errs.length) return { ok: false as const, error: 'collectionAddProducts_userErrors', detail: errs };
-
-  return { ok: true as const };
-}
-
-async function resolveCollectionIdRestByHandle(handle: string) {
-  const h = String(handle || '').trim();
-  if (!h) return { ok: false as const, error: 'empty_handle' };
-
-  // custom
-  let r = await shopifyFetch(`/custom_collections.json?handle=${encodeURIComponent(h)}&limit=1`);
-  const customId = (r.json as any)?.custom_collections?.[0]?.id;
-  if (r.ok && customId) return { ok: true as const, id: Number(customId), kind: 'custom' as const };
-
-  // smart
-  r = await shopifyFetch(`/smart_collections.json?handle=${encodeURIComponent(h)}&limit=1`);
-  const smartId = (r.json as any)?.smart_collections?.[0]?.id;
-  if (r.ok && smartId) return { ok: true as const, id: Number(smartId), kind: 'smart' as const };
-
-  return { ok: false as const, error: 'collection_not_found_rest', detail: { handle: h } };
-}
-
-async function addProductToCollectionRest(collectionId: number, productId: number) {
-  const r = await shopifyFetch(`/collects.json`, {
-    json: { collect: { product_id: productId, collection_id: collectionId } },
-  });
-
-  if (!r.ok) return { ok: false as const, error: `rest_http_${r.status}`, detail: r.text };
+  if (!r.ok) return { ok: false as const, error: `Shopify ${r.status}`, detail: r.text };
   return { ok: true as const };
 }
 
@@ -355,45 +327,23 @@ export async function OPTIONS(req: Request) {
 export async function GET(req: Request) {
   try {
     if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' },
-        { status: 500 },
-      );
+      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' }, { status: 500 });
     }
 
     const url = new URL(req.url);
-
-    const handle =
-      (url.searchParams.get('u') || '').trim() ||
-      (url.searchParams.get('handle') || '').trim();
-
+    const handle = (url.searchParams.get('u') || '').trim() || (url.searchParams.get('handle') || '').trim();
     const isPublic = url.searchParams.get('public') === '1';
 
     let email = (url.searchParams.get('email') || '').trim();
-
-    // ✅ public can pass shopifyCustomerId too (can be > 2^53 => keep as string)
     const shopifyCustomerIdRaw = (url.searchParams.get('shopifyCustomerId') || '').trim();
 
-    // 1) if email absent, try resolve by explicit shopifyCustomerId
-    if (!email && shopifyCustomerIdRaw) {
-      email = await resolveEmailByCustomerIdDigits(shopifyCustomerIdRaw);
-    }
-
-    // 2) if still no email, try resolve by handle/u (trainer-<id> or metafield/tag)
-    if (!email && handle) {
-      email = await resolveEmailByHandle(handle);
-    }
+    if (!email && shopifyCustomerIdRaw) email = await resolveEmailByCustomerIdDigits(shopifyCustomerIdRaw);
+    if (!email && handle) email = await resolveEmailByHandle(handle);
 
     if (!email) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'email_or_resolvable_handle_required' },
-        { status: 400 },
-      );
+      return jsonWithCors(req, { ok: false, error: 'email_or_resolvable_handle_required' }, { status: 400 });
     }
 
-    // ✅ GraphQL listing (inclut drafts + metafields)
     const vendor = email.replace(/"/g, '\\"');
     const search = `vendor:"${vendor}"`;
 
@@ -419,17 +369,12 @@ export async function GET(req: Request) {
 
     const r = await shopifyGraphql(q, { q: search });
     if (!r.ok) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: `Shopify ${r.status}`, detail: r.text },
-        { status: r.status },
-      );
+      return jsonWithCors(req, { ok: false, error: `Shopify ${r.status}`, detail: r.text }, { status: r.status });
     }
 
     const edges = r.json?.data?.products?.edges || [];
     const itemsRaw = edges.map((e: any) => {
       const p = e?.node || {};
-
       const gid = String(p.id || '');
       const idMatch = gid.match(/\/Product\/(\d+)$/);
       const id = idMatch ? Number(idMatch[1]) : undefined;
@@ -439,16 +384,12 @@ export async function GET(req: Request) {
 
       const approval_status = String(p?.approval?.value || 'pending').trim().toLowerCase();
       const approval_label =
-        approval_status === 'approved'
-          ? 'Approuvée'
-          : approval_status === 'rejected'
-            ? 'Refusée'
-            : 'En attente';
+        approval_status === 'approved' ? 'Approuvée' : approval_status === 'rejected' ? 'Refusée' : 'En attente';
 
       const published = !!p.publishedAt;
 
       return {
-        id: id ?? gid, // on garde un id même si parse fail
+        id: id ?? gid,
         title: p.title || '',
         coverUrl: p?.featuredImage?.url || '',
         image_url: p?.featuredImage?.url || '',
@@ -461,20 +402,15 @@ export async function GET(req: Request) {
         handle: p.handle || '',
         approval_status,
         approval_label,
-        // utile debug
         status: p.status || null,
       };
     });
 
-    // ✅ public => ONLY published + approved
-    const items = isPublic
-      ? itemsRaw.filter((x: any) => !!x.published && x.approval_status === 'approved')
-      : itemsRaw;
+    const items = isPublic ? itemsRaw.filter((x: any) => !!x.published && x.approval_status === 'approved') : itemsRaw;
 
     let plan: 'Starter' | 'Pro' | 'Business' | 'Unknown' = 'Unknown';
     let quota: any = null;
 
-    // ✅ Privé seulement
     if (!isPublic && email) {
       plan = await getPlanFromInternalSubscription(req, email);
 
@@ -498,11 +434,7 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
   try {
     if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' },
-        { status: 500 },
-      );
+      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' }, { status: 500 });
     }
 
     const url = new URL(req.url);
@@ -519,7 +451,6 @@ export async function POST(req: Request) {
       pdfUrl: pdfUrlRaw,
       pdf_url,
 
-      // status est ignoré volontairement (publish gate)
       status: _statusIgnored,
 
       collectionId,
@@ -547,30 +478,24 @@ export async function POST(req: Request) {
     if (!email || !title || !imageUrl || !pdfUrl) {
       return jsonWithCors(req, { ok: false, error: 'missing fields' }, { status: 400 });
     }
-
     if (!/^https?:\/\//i.test(pdfUrl)) {
       return jsonWithCors(req, { ok: false, error: 'pdfUrl must be https URL' }, { status: 400 });
     }
 
     // Quota guard
     const plan = await getPlanFromInternalSubscription(req, email);
-
     if (!bypass && plan === 'Starter') {
       const used = await countPublishedThisMonthByMetafield(email);
       if (used >= 3) {
         return jsonWithCors(
           req,
-          {
-            ok: false,
-            error: 'quota_reached',
-            detail: 'Starter plan allows 3 published courses per month',
-          },
+          { ok: false, error: 'quota_reached', detail: 'Starter plan allows 3 published courses per month' },
           { status: 403 },
         );
       }
     }
 
-    // normaliser prix Shopify (string "12.34")
+    // normaliser prix Shopify
     let priceStr = '';
     if (price !== undefined && price !== null && String(price).trim() !== '') {
       const n = Number(price);
@@ -578,18 +503,35 @@ export async function POST(req: Request) {
       else priceStr = String(price).trim();
     }
 
-    // ✅ Publish gate: toujours draft à la création
+    // ✅ selector + themeHandleFinal calculés AVANT création (pour tags + règles smart collections)
+    const selector = collectionId ?? collectionHandleOrId ?? collectionHandle;
+
+    let themeHandleFinal = (mf_theme || themeHandle || theme || '').toString().trim() || '';
+    if (!themeHandleFinal && selector && typeof selector === 'string') {
+      const sel = selector.trim();
+      if (sel && !/^\d+$/.test(sel)) themeHandleFinal = sel;
+    }
+
+    // ✅ Tags robustes pour collections automatisées
+    const tags: string[] = ['mkt-course'];
+    if (themeHandleFinal) {
+      tags.push(`mf_theme:${themeHandleFinal}`);
+      tags.push(`mf_collection:${themeHandleFinal}`);
+      // utile si tes règles Shopify sont “Tag equals developpement-personnel-bien-etre”
+      tags.push(themeHandleFinal);
+    }
+
+    // ✅ Publish gate: toujours draft
     const finalStatus: 'draft' = 'draft';
 
-    /* Création produit */
     const productPayload = {
       product: {
         title,
         body_html: description ? `<p>${description}</p>` : '',
         vendor: email,
         images: imageUrl ? [{ src: imageUrl }] : [],
-        tags: ['mkt-course'],
-        status: finalStatus, // ✅ draft
+        tags,
+        status: finalStatus,
         variants: [
           {
             requires_shipping: false,
@@ -602,11 +544,7 @@ export async function POST(req: Request) {
 
     const createRes = await shopifyFetch(`/products.json`, { json: productPayload });
     if (!createRes.ok) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: `Shopify ${createRes.status}`, detail: createRes.text },
-        { status: createRes.status },
-      );
+      return jsonWithCors(req, { ok: false, error: `Shopify ${createRes.status}`, detail: createRes.text }, { status: createRes.status });
     }
 
     const created = (createRes.json as any)?.product;
@@ -617,96 +555,42 @@ export async function POST(req: Request) {
     /* Métachamps mkt */
     await upsertProductMetafield(created.id, 'mkt', 'owner_email', 'single_line_text_field', email);
     if (shopifyCustomerId) {
-      await upsertProductMetafield(
-        created.id,
-        'mkt',
-        'owner_id',
-        'single_line_text_field',
-        String(shopifyCustomerId),
-      );
+      await upsertProductMetafield(created.id, 'mkt', 'owner_id', 'single_line_text_field', String(shopifyCustomerId));
     }
     await upsertProductMetafield(created.id, 'mkt', 'pdf_url', 'url', pdfUrl);
 
-    // ✅ statut validation admin par défaut
-    await upsertProductMetafield(
-      created.id,
-      'mfapp',
-      'approval_status',
-      'single_line_text_field',
-      'pending',
-    );
+    /* Statut validation admin */
+    await upsertProductMetafield(created.id, 'mfapp', 'approval_status', 'single_line_text_field', 'pending');
 
-    // ✅ SYNC CRITIQUE (pratique pour debug / autres templates)
+    /* Debug/compat URLs */
     await upsertProductMetafield(created.id, 'mfapp', 'image_url', 'url', String(imageUrl).trim());
     await upsertProductMetafield(created.id, 'mfapp', 'pdf_url', 'url', String(pdfUrl).trim());
     await upsertProductMetafield(created.id, 'mfapp', 'imageUrl', 'url', String(imageUrl).trim());
     await upsertProductMetafield(created.id, 'mfapp', 'pdfUrl', 'url', String(pdfUrl).trim());
 
-    // ❌ IMPORTANT: on NE marque PAS published_YYYYMM ici.
-
-    /* Assignation collection + thématique (ROBUSTE + DEBUG) */
-    const selector = collectionId ?? collectionHandleOrId ?? collectionHandle;
-
-    let themeHandleFinal = (mf_theme || themeHandle || theme || '').toString().trim() || '';
-
-    if (!themeHandleFinal && selector && typeof selector === 'string') {
-      const isNumeric = /^[0-9]+$/.test(selector);
-      if (!isNumeric) themeHandleFinal = selector.trim();
+    /* Thématique metafield (utile pour listing) */
+    if (themeHandleFinal) {
+      await upsertProductMetafield(created.id, 'mfapp', 'theme', 'single_line_text_field', themeHandleFinal);
     }
 
-    const collection_debug: any = {
-      selector: selector ?? null,
-      tried: [],
-      ok: false,
-    };
-
+    // ✅ Tentative d’ajout à collection (fonctionne seulement si collection manuelle)
     if (selector) {
       try {
+        let collectionGid = '';
         const selStr = String(selector).trim();
 
-        // 1) ID numérique direct => REST collects
-        if (/^\d+$/.test(selStr)) {
-          const cid = Number(selStr);
-          const restAdd = await addProductToCollectionRest(cid, created.id);
-          collection_debug.tried.push({ mode: 'rest_collects_by_id', cid, ...restAdd });
-          collection_debug.ok = restAdd.ok;
+        if (/^\d+$/.test(selStr)) collectionGid = collectionGidFromNumericId(selStr);
+        else collectionGid = await resolveCollectionGidByHandle(selStr);
+
+        if (collectionGid) {
+          const addRes = await addProductToCollectionGql(created.id, collectionGid);
+          if (!addRes.ok) console.warn('[MF] collection add failed', addRes);
         } else {
-          // 2) GraphQL by handle + addProducts
-          const resolved = await resolveCollectionGidByHandle(selStr);
-          collection_debug.tried.push({ mode: 'gql_collectionByHandle', ...resolved });
-
-          if (resolved.ok) {
-            const add = await addProductToCollectionGql(resolved.id, created.id);
-            collection_debug.tried.push({ mode: 'gql_collectionAddProducts', ...add });
-            collection_debug.ok = add.ok;
-          }
-
-          // 3) Fallback REST si GraphQL échoue
-          if (!collection_debug.ok) {
-            const restResolve = await resolveCollectionIdRestByHandle(selStr);
-            collection_debug.tried.push({ mode: 'rest_resolve_by_handle', ...restResolve });
-
-            if (restResolve.ok) {
-              const restAdd = await addProductToCollectionRest(restResolve.id, created.id);
-              collection_debug.tried.push({ mode: 'rest_collects_add', cid: restResolve.id, ...restAdd });
-              collection_debug.ok = restAdd.ok;
-            }
-          }
+          console.warn('[MF] collection not found for selector=', selector);
         }
-      } catch (e: any) {
-        collection_debug.tried.push({ mode: 'exception', error: e?.message || String(e) });
-        collection_debug.ok = false;
+      } catch (e) {
+        console.warn('[MF] collection assign error', e);
       }
-    }
-
-    if (themeHandleFinal) {
-      await upsertProductMetafield(
-        created.id,
-        'mfapp',
-        'theme',
-        'single_line_text_field',
-        themeHandleFinal,
-      );
     }
 
     // ✅ Synchro fiche produit (Udemy-like)
@@ -715,11 +599,10 @@ export async function POST(req: Request) {
 
       const subtitleFinal = cleanStr(mf.subtitle ?? subtitle, 600);
 
-      // ⚠️ ton front envoie duration_text, ton backend écrivait mfapp.duration
-      // => on garde mfapp.duration (compat) ET on ajoute mfapp.duration_text (pour ta section produit)
       const formatFinal = cleanStr(mf.format ?? '', 60);
       const levelFinal = cleanStr(mf.level ?? level_text ?? '', 80);
 
+      // compat + clé attendue par ta section produit
       const durationTextFinal = cleanStr(mf.duration_text ?? duration_text ?? mf.duration ?? '', 80);
       const durationCompatFinal = cleanStr(mf.duration ?? mf.duration_text ?? duration_text ?? '', 80);
 
@@ -737,128 +620,39 @@ export async function POST(req: Request) {
       const learnArr = cleanList(mf.learn ?? learn, 12, 160);
       const audienceArr = cleanList(mf.audience ?? audience, 12, 160);
       const includesArr = cleanList(mf.includes ?? [], 12, 160);
-
       const reqArr = cleanList(mf.requirements ?? requirements, 10, 160);
       const modulesArr = cleanModules(mf.modules ?? modules, 30);
 
-      if (subtitleFinal) {
-        await upsertProductMetafield(created.id, 'mfapp', 'subtitle', 'multi_line_text_field', subtitleFinal);
-      }
-      if (formatFinal) {
-        await upsertProductMetafield(created.id, 'mfapp', 'format', 'single_line_text_field', formatFinal);
-      }
+      if (subtitleFinal) await upsertProductMetafield(created.id, 'mfapp', 'subtitle', 'multi_line_text_field', subtitleFinal);
+      if (formatFinal) await upsertProductMetafield(created.id, 'mfapp', 'format', 'single_line_text_field', formatFinal);
 
-      // ✅ durée: les 2 clés
-      if (durationCompatFinal) {
-        await upsertProductMetafield(created.id, 'mfapp', 'duration', 'single_line_text_field', durationCompatFinal);
-      }
-      if (durationTextFinal) {
-        await upsertProductMetafield(
-          created.id,
-          'mfapp',
-          'duration_text',
-          'single_line_text_field',
-          durationTextFinal,
-        );
-      }
+      if (durationCompatFinal) await upsertProductMetafield(created.id, 'mfapp', 'duration', 'single_line_text_field', durationCompatFinal);
+      if (durationTextFinal) await upsertProductMetafield(created.id, 'mfapp', 'duration_text', 'single_line_text_field', durationTextFinal);
 
-      if (levelFinal) {
-        await upsertProductMetafield(created.id, 'mfapp', 'level', 'single_line_text_field', levelFinal);
-      }
+      if (levelFinal) await upsertProductMetafield(created.id, 'mfapp', 'level', 'single_line_text_field', levelFinal);
+
       if (language_text && String(language_text).trim()) {
-        await upsertProductMetafield(
-          created.id,
-          'mfapp',
-          'language_text',
-          'single_line_text_field',
-          cleanStr(language_text, 60),
-        );
+        await upsertProductMetafield(created.id, 'mfapp', 'language_text', 'single_line_text_field', cleanStr(language_text, 60));
       }
 
-      // ✅ champs UI produit (ta section Liquid les lit)
-      if (certificateTextFinal) {
-        await upsertProductMetafield(
-          created.id,
-          'mfapp',
-          'certificate_text',
-          'single_line_text_field',
-          certificateTextFinal,
-        );
-      }
-      if (badgeTextFinal) {
-        await upsertProductMetafield(
-          created.id,
-          'mfapp',
-          'badge_text',
-          'single_line_text_field',
-          badgeTextFinal,
-        );
-      }
-      if (pill1Final) {
-        await upsertProductMetafield(created.id, 'mfapp', 'pill_1', 'single_line_text_field', pill1Final);
-      }
-      if (pill2Final) {
-        await upsertProductMetafield(created.id, 'mfapp', 'pill_2', 'single_line_text_field', pill2Final);
-      }
-      if (quickTitleFinal) {
-        await upsertProductMetafield(created.id, 'mfapp', 'quick_title', 'single_line_text_field', quickTitleFinal);
-      }
-      if (quickFormatFinal) {
-        await upsertProductMetafield(
-          created.id,
-          'mfapp',
-          'quick_format',
-          'single_line_text_field',
-          quickFormatFinal,
-        );
-      }
-      if (quickAccessFinal) {
-        await upsertProductMetafield(
-          created.id,
-          'mfapp',
-          'quick_access',
-          'single_line_text_field',
-          quickAccessFinal,
-        );
-      }
-      if (quickLevelFinal) {
-        await upsertProductMetafield(
-          created.id,
-          'mfapp',
-          'quick_level',
-          'single_line_text_field',
-          quickLevelFinal,
-        );
-      }
-      if (includesTitleFinal) {
-        await upsertProductMetafield(
-          created.id,
-          'mfapp',
-          'includes_title',
-          'single_line_text_field',
-          includesTitleFinal,
-        );
-      }
-      if (footnoteFinal) {
-        await upsertProductMetafield(created.id, 'mfapp', 'footnote', 'multi_line_text_field', footnoteFinal);
-      }
+      if (certificateTextFinal) await upsertProductMetafield(created.id, 'mfapp', 'certificate_text', 'single_line_text_field', certificateTextFinal);
+      if (badgeTextFinal) await upsertProductMetafield(created.id, 'mfapp', 'badge_text', 'single_line_text_field', badgeTextFinal);
+      if (pill1Final) await upsertProductMetafield(created.id, 'mfapp', 'pill_1', 'single_line_text_field', pill1Final);
+      if (pill2Final) await upsertProductMetafield(created.id, 'mfapp', 'pill_2', 'single_line_text_field', pill2Final);
 
-      // ✅ listes (JSON)
-      if (learnArr.length) {
-        await upsertProductMetafield(created.id, 'mfapp', 'learn', 'json', JSON.stringify(learnArr));
-      }
-      if (modulesArr.length) {
-        await upsertProductMetafield(created.id, 'mfapp', 'modules', 'json', JSON.stringify(modulesArr));
-      }
-      if (audienceArr.length) {
-        await upsertProductMetafield(created.id, 'mfapp', 'audience', 'json', JSON.stringify(audienceArr));
-      }
-      if (includesArr.length) {
-        await upsertProductMetafield(created.id, 'mfapp', 'includes', 'json', JSON.stringify(includesArr));
-      }
-      if (reqArr.length) {
-        await upsertProductMetafield(created.id, 'mfapp', 'requirements', 'json', JSON.stringify(reqArr));
-      }
+      if (quickTitleFinal) await upsertProductMetafield(created.id, 'mfapp', 'quick_title', 'single_line_text_field', quickTitleFinal);
+      if (quickFormatFinal) await upsertProductMetafield(created.id, 'mfapp', 'quick_format', 'single_line_text_field', quickFormatFinal);
+      if (quickAccessFinal) await upsertProductMetafield(created.id, 'mfapp', 'quick_access', 'single_line_text_field', quickAccessFinal);
+      if (quickLevelFinal) await upsertProductMetafield(created.id, 'mfapp', 'quick_level', 'single_line_text_field', quickLevelFinal);
+
+      if (includesTitleFinal) await upsertProductMetafield(created.id, 'mfapp', 'includes_title', 'single_line_text_field', includesTitleFinal);
+      if (footnoteFinal) await upsertProductMetafield(created.id, 'mfapp', 'footnote', 'multi_line_text_field', footnoteFinal);
+
+      if (learnArr.length) await upsertProductMetafield(created.id, 'mfapp', 'learn', 'json', JSON.stringify(learnArr));
+      if (modulesArr.length) await upsertProductMetafield(created.id, 'mfapp', 'modules', 'json', JSON.stringify(modulesArr));
+      if (audienceArr.length) await upsertProductMetafield(created.id, 'mfapp', 'audience', 'json', JSON.stringify(audienceArr));
+      if (includesArr.length) await upsertProductMetafield(created.id, 'mfapp', 'includes', 'json', JSON.stringify(includesArr));
+      if (reqArr.length) await upsertProductMetafield(created.id, 'mfapp', 'requirements', 'json', JSON.stringify(reqArr));
     } catch (e) {
       console.error('[MF] sync metafields error', e);
     }
@@ -871,7 +665,6 @@ export async function POST(req: Request) {
 
       const mfThemeKey = themeHandleFinal || '';
       const categoryLabel = mfThemeKey && THEME_LABELS[mfThemeKey] ? THEME_LABELS[mfThemeKey] : null;
-
       const accessUrl = shopifyProductHandle ? `/products/${shopifyProductHandle}` : '';
 
       const mf = mfapp && typeof mfapp === 'object' ? mfapp : {};
@@ -916,7 +709,11 @@ export async function POST(req: Request) {
       admin_url: `https://${process.env.SHOP_DOMAIN}/admin/products/${created.id}`,
       approval_status: 'pending',
       status: finalStatus,
-      collection_debug, // ✅ IMPORTANT pour voir pourquoi ça n’ajoute pas
+      debug: {
+        themeHandleFinal,
+        tags,
+        selector,
+      },
     });
   } catch (e: any) {
     return jsonWithCors(req, { ok: false, error: e?.message || 'create_failed' }, { status: 500 });
