@@ -19,9 +19,9 @@
 //   => plus de "statut qui disparait" + plus d’items manquants (draft/pending).
 //
 // ✅ IMPORTANT FIX COLLECTIONS (pour ton souci collections vides):
-// - On n’utilise plus REST custom/smart collections + /collects.json
 // - On ajoute à la collection via GraphQL: collectionByHandle + collectionAddProducts
-//   => fonctionne pour smart/custom + handle exact, et évite les erreurs silencieuses
+// - ✅ + fallback REST /collects.json si GraphQL échoue
+// - ✅ + debug retour collection_debug (pour voir pourquoi ça n’a pas marché)
 
 import { handleOptions, jsonWithCors } from '@/app/api/_lib/cors';
 import { prisma } from '@/lib/prisma';
@@ -187,36 +187,37 @@ async function upsertProductMetafield(
   });
 }
 
-/* ===================== Collection helpers (GraphQL robuste) ===================== */
+/* ===================== Collection helpers (GraphQL + fallback REST + debug) ===================== */
 function productGidFromNumericId(id: number | string) {
   const n = String(id || '').trim();
   if (!/^\d+$/.test(n)) return '';
   return `gid://shopify/Product/${n}`;
 }
 
-function collectionGidFromNumericId(id: number | string) {
-  const n = String(id || '').trim();
-  if (!/^\d+$/.test(n)) return '';
-  return `gid://shopify/Collection/${n}`;
-}
-
-async function resolveCollectionGidByHandle(handle: string): Promise<string> {
+async function resolveCollectionGidByHandle(handle: string) {
   const h = String(handle || '').trim();
-  if (!h) return '';
+  if (!h) return { ok: false as const, error: 'empty_handle' };
 
   const q = `
     query($handle: String!) {
-      collectionByHandle(handle: $handle) { id }
+      collectionByHandle(handle: $handle) { id handle title }
     }
   `;
   const r = await shopifyGraphql(q, { handle: h });
-  return String(r.json?.data?.collectionByHandle?.id || '').trim();
+
+  const col = r.json?.data?.collectionByHandle || null;
+  if (!r.ok) return { ok: false as const, error: `graphql_http_${r.status}`, detail: r.text };
+  if (!col?.id) return { ok: false as const, error: 'collection_not_found_by_handle', detail: { handle: h } };
+
+  return { ok: true as const, id: String(col.id), handle: col.handle, title: col.title };
 }
 
-async function addProductToCollectionGql(productIdNumeric: number, collectionGid: string) {
+async function addProductToCollectionGql(collectionGid: string, productIdNumeric: number) {
   const productGid = productGidFromNumericId(productIdNumeric);
   const colGid = String(collectionGid || '').trim();
-  if (!productGid || !colGid) return { ok: false as const, error: 'missing_gid' };
+  if (!productGid || !colGid) {
+    return { ok: false as const, error: 'missing_gid', detail: { productGid, collectionGid: colGid } };
+  }
 
   const m = `
     mutation($id: ID!, $productIds: [ID!]!) {
@@ -228,9 +229,37 @@ async function addProductToCollectionGql(productIdNumeric: number, collectionGid
   `;
 
   const r = await shopifyGraphql(m, { id: colGid, productIds: [productGid] });
+  if (!r.ok) return { ok: false as const, error: `graphql_http_${r.status}`, detail: r.text };
+
   const errs = r.json?.data?.collectionAddProducts?.userErrors || [];
   if (errs.length) return { ok: false as const, error: 'collectionAddProducts_userErrors', detail: errs };
-  if (!r.ok) return { ok: false as const, error: `Shopify ${r.status}`, detail: r.text };
+
+  return { ok: true as const };
+}
+
+async function resolveCollectionIdRestByHandle(handle: string) {
+  const h = String(handle || '').trim();
+  if (!h) return { ok: false as const, error: 'empty_handle' };
+
+  // custom
+  let r = await shopifyFetch(`/custom_collections.json?handle=${encodeURIComponent(h)}&limit=1`);
+  const customId = (r.json as any)?.custom_collections?.[0]?.id;
+  if (r.ok && customId) return { ok: true as const, id: Number(customId), kind: 'custom' as const };
+
+  // smart
+  r = await shopifyFetch(`/smart_collections.json?handle=${encodeURIComponent(h)}&limit=1`);
+  const smartId = (r.json as any)?.smart_collections?.[0]?.id;
+  if (r.ok && smartId) return { ok: true as const, id: Number(smartId), kind: 'smart' as const };
+
+  return { ok: false as const, error: 'collection_not_found_rest', detail: { handle: h } };
+}
+
+async function addProductToCollectionRest(collectionId: number, productId: number) {
+  const r = await shopifyFetch(`/collects.json`, {
+    json: { collect: { product_id: productId, collection_id: collectionId } },
+  });
+
+  if (!r.ok) return { ok: false as const, error: `rest_http_${r.status}`, detail: r.text };
   return { ok: true as const };
 }
 
@@ -608,7 +637,6 @@ export async function POST(req: Request) {
     );
 
     // ✅ SYNC CRITIQUE (pratique pour debug / autres templates)
-    // (n'empêche pas l'image Shopify featured_image)
     await upsertProductMetafield(created.id, 'mfapp', 'image_url', 'url', String(imageUrl).trim());
     await upsertProductMetafield(created.id, 'mfapp', 'pdf_url', 'url', String(pdfUrl).trim());
     await upsertProductMetafield(created.id, 'mfapp', 'imageUrl', 'url', String(imageUrl).trim());
@@ -616,7 +644,7 @@ export async function POST(req: Request) {
 
     // ❌ IMPORTANT: on NE marque PAS published_YYYYMM ici.
 
-    /* Assignation collection + thématique */
+    /* Assignation collection + thématique (ROBUSTE + DEBUG) */
     const selector = collectionId ?? collectionHandleOrId ?? collectionHandle;
 
     let themeHandleFinal = (mf_theme || themeHandle || theme || '').toString().trim() || '';
@@ -626,30 +654,48 @@ export async function POST(req: Request) {
       if (!isNumeric) themeHandleFinal = selector.trim();
     }
 
-    // ✅ Assignation collection ROBUSTE (GraphQL)
+    const collection_debug: any = {
+      selector: selector ?? null,
+      tried: [],
+      ok: false,
+    };
+
     if (selector) {
       try {
-        let collectionGid = '';
         const selStr = String(selector).trim();
 
-        // cas 1: ID numérique
+        // 1) ID numérique direct => REST collects
         if (/^\d+$/.test(selStr)) {
-          collectionGid = collectionGidFromNumericId(selStr);
+          const cid = Number(selStr);
+          const restAdd = await addProductToCollectionRest(cid, created.id);
+          collection_debug.tried.push({ mode: 'rest_collects_by_id', cid, ...restAdd });
+          collection_debug.ok = restAdd.ok;
         } else {
-          // cas 2: handle exact
-          collectionGid = await resolveCollectionGidByHandle(selStr);
-        }
+          // 2) GraphQL by handle + addProducts
+          const resolved = await resolveCollectionGidByHandle(selStr);
+          collection_debug.tried.push({ mode: 'gql_collectionByHandle', ...resolved });
 
-        if (collectionGid) {
-          const addRes = await addProductToCollectionGql(created.id, collectionGid);
-          if (!addRes.ok) {
-            console.warn('[MF] collection add failed', addRes);
+          if (resolved.ok) {
+            const add = await addProductToCollectionGql(resolved.id, created.id);
+            collection_debug.tried.push({ mode: 'gql_collectionAddProducts', ...add });
+            collection_debug.ok = add.ok;
           }
-        } else {
-          console.warn('[MF] collection not found for selector=', selector);
+
+          // 3) Fallback REST si GraphQL échoue
+          if (!collection_debug.ok) {
+            const restResolve = await resolveCollectionIdRestByHandle(selStr);
+            collection_debug.tried.push({ mode: 'rest_resolve_by_handle', ...restResolve });
+
+            if (restResolve.ok) {
+              const restAdd = await addProductToCollectionRest(restResolve.id, created.id);
+              collection_debug.tried.push({ mode: 'rest_collects_add', cid: restResolve.id, ...restAdd });
+              collection_debug.ok = restAdd.ok;
+            }
+          }
         }
-      } catch (e) {
-        console.warn('[MF] collection assign error', e);
+      } catch (e: any) {
+        collection_debug.tried.push({ mode: 'exception', error: e?.message || String(e) });
+        collection_debug.ok = false;
       }
     }
 
@@ -870,6 +916,7 @@ export async function POST(req: Request) {
       admin_url: `https://${process.env.SHOP_DOMAIN}/admin/products/${created.id}`,
       approval_status: 'pending',
       status: finalStatus,
+      collection_debug, // ✅ IMPORTANT pour voir pourquoi ça n’ajoute pas
     });
   } catch (e: any) {
     return jsonWithCors(req, { ok: false, error: e?.message || 'create_failed' }, { status: 500 });
