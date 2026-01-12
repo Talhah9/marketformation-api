@@ -1,29 +1,30 @@
 // app/api/courses/route.ts
 // Crée un produit "Course" (vendor = email) + liste les courses.
-// Quota Starter (3 / mois) basé sur le métachamp mfapp.published_YYYYMM.
-// Retourne aussi { plan, quota: { limit, used, remaining } } pour l'abonnement.
+// Quota basé sur mfapp.published_YYYYMM (bucket YYYYMM).
 //
 // ✅ Public listing via App Proxy:
 // - /apps/mf/courses?u=trainer-<id>&public=1
 // - /apps/mf/courses?handle=xxx&public=1 (legacy)
-// - ✅ FIX: support Shopify IDs > 2^53 (NE JAMAIS Number()) via GraphQL email resolve
-// - En public=1: ne renvoie que published + APPROUVÉES + pas de quota
+// - ✅ BIGINT safe: jamais Number() sur les IDs Shopify
+// - En public=1: uniquement published + APPROUVÉES + pas de quota
 //
 // ✅ Workflow validation admin (publish gate)
 // - À la création: produit = DRAFT + mfapp.approval_status = "pending"
-// - La publication réelle + mfapp.published_YYYYMM se fait UNIQUEMENT via endpoint admin approve
+// - La publication réelle + mfapp.published_YYYYMM se fait via endpoint admin approve (hors scope ici)
 // - Au listing: renvoie approval_status + approval_label
 //
-// ✅ IMPORTANT FIX LISTING:
-// - On liste via GraphQL produits + metafields (theme + approval_status) en 1 requête
+// ✅ LISTING: GraphQL (products + metafields theme + approval_status) en 1 requête
 //
-// ✅ IMPORTANT FIX COLLECTIONS:
-// - On met un tag Shopify standard: theme-<handle>
-// - Les collections Shopify doivent être AUTOMATIQUES via règle "tag contient theme-<handle>"
+// ✅ COLLECTIONS: tag Shopify: theme-<handle>, collections = automatiques ("tag contient theme-<handle>")
+//
+// ✅ QUOTAS (nouvelle règle):
+// - Starter = 1 / mois
+// - Creator = 3 / mois
 //
 // ✅ ADMIN BYPASS QUOTA:
 // - Mets ENV: MF_ADMIN_EMAILS="ton@email.com,autre@email.com"
-// - Si email admin => quota illimité + bypass quota à la création
+// - Header côté front (uniquement admin): x-mf-admin-email: <ton email>
+// - Si admin => quota illimité + bypass quota à la création
 
 import { handleOptions, jsonWithCors } from "@/app/api/_lib/cors";
 import { prisma } from "@/lib/prisma";
@@ -49,19 +50,22 @@ function getShopDomain() {
   return process.env.SHOP_DOMAIN || "";
 }
 
-/* ===================== ADMIN EMAILS ===================== */
-function parseAdminEmails() {
-  const raw = process.env.MF_ADMIN_EMAILS || process.env.ADMIN_EMAILS || "";
-  return raw
+/* ===================== ADMIN ===================== */
+function parseCsvEnv(name: string) {
+  return String(process.env[name] || "")
     .split(",")
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
 }
-function isAdminEmail(email: string | null | undefined) {
-  const e = String(email || "").trim().toLowerCase();
-  if (!e) return false;
-  const list = parseAdminEmails();
-  return list.includes(e);
+
+function isAdminRequest(req: Request) {
+  const admins = parseCsvEnv("MF_ADMIN_EMAILS"); // ex: "gazou@gmail.com, autre@mail.com"
+  if (!admins.length) return false;
+
+  const email = String(req.headers.get("x-mf-admin-email") || "")
+    .trim()
+    .toLowerCase();
+  return !!email && admins.includes(email);
 }
 
 async function shopifyFetch(path: string, init?: RequestInit & { json?: any }) {
@@ -205,7 +209,13 @@ async function upsertProductMetafield(
 }
 
 /* ===================== Subscription plan ===================== */
-async function getPlanFromInternalSubscription(req: Request, email: string) {
+/**
+ * Aligne avec ton /api/subscription qui renvoie planKey: "starter" | "creator"
+ */
+async function getPlanFromInternalSubscription(
+  req: Request,
+  email: string
+): Promise<"Starter" | "Creator" | "Unknown"> {
   try {
     const u = new URL(req.url);
     const base = `${u.protocol}//${u.host}`;
@@ -218,24 +228,20 @@ async function getPlanFromInternalSubscription(req: Request, email: string) {
     });
 
     const data = await r.json().catch(() => ({}));
-    const raw = (data?.planKey || data?.plan || data?.tier || "").toString();
+    const raw = String(data?.planKey || data?.plan || data?.tier || "").toLowerCase();
 
-    // ⚠️ adapte si ton /api/subscription renvoie "creator"
-    if (/creator/i.test(raw)) return "Pro";
-    if (/pro/i.test(raw)) return "Pro";
-    if (/starter/i.test(raw)) return "Starter";
-    if (/business/i.test(raw)) return "Business"; // legacy
+    if (raw.includes("creator")) return "Creator";
+    if (raw.includes("starter")) return "Starter";
     return "Unknown";
   } catch {
     return "Unknown";
   }
 }
 
-/* ===================== Quota Starter (GraphQL, sans N+1) ===================== */
+/* ===================== Quota (GraphQL, sans N+1) ===================== */
 /**
- * ⚠️ Cette fonction suit TA logique actuelle:
- * - elle compte les produits dont mfapp.published_YYYYMM == bucket (ex: 202601)
- * - la mise à jour de ce metafield est censée se faire lors de l'approbation/publish admin
+ * Compte les produits dont mfapp.published_YYYYMM == bucket (ex: 202601)
+ * ⚠️ La mise à jour de ce metafield doit se faire quand tu "publies vraiment" (approve endpoint).
  */
 async function countPublishedThisMonthByMetafield(email: string) {
   const bucket = ym();
@@ -434,21 +440,22 @@ export async function GET(req: Request) {
       ? itemsRaw.filter((x: any) => !!x.published && x.approval_status === "approved")
       : itemsRaw;
 
-    let plan: "Starter" | "Pro" | "Business" | "Unknown" = "Unknown";
+    // Quota info (uniquement privé)
+    let plan: "Starter" | "Creator" | "Unknown" = "Unknown";
     let quota: any = null;
 
     if (!isPublic && email) {
-      const admin = isAdminEmail(email);
-
+      const admin = isAdminRequest(req);
       if (admin) {
-        plan = "Pro";
+        plan = "Creator"; // pour l'UI, tu peux montrer Creator mais admin=true
         quota = { plan: "Admin", limit: null, used: null, remaining: null, admin: true };
       } else {
         plan = await getPlanFromInternalSubscription(req, email);
 
-        if (plan === "Starter") {
+        const limit = plan === "Starter" ? 1 : plan === "Creator" ? 3 : 0;
+        if (limit > 0) {
           const used = await countPublishedThisMonthByMetafield(email);
-          quota = { plan: "Starter", limit: 3, used, remaining: Math.max(0, 3 - used) };
+          quota = { plan, limit, used, remaining: Math.max(0, limit - used) };
         } else {
           quota = { plan, limit: null, used: null, remaining: null };
         }
@@ -475,6 +482,7 @@ export async function POST(req: Request) {
     }
 
     const url = new URL(req.url);
+    const bypassParam = url.searchParams.get("bypassQuota") === "1";
 
     const body = await req.json().catch(() => ({} as any));
     const {
@@ -520,22 +528,23 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: "pdfUrl must be https URL" }, { status: 400 });
     }
 
-    // ✅ bypassQuota manuel + bypass admin auto
-    const bypassParam = url.searchParams.get("bypassQuota") === "1";
-    const admin = isAdminEmail(email);
+    // ✅ bypass admin auto (header) + bypass param manuel
+    const admin = isAdminRequest(req);
     const bypass = bypassParam || admin;
 
-    // Quota guard (Starter uniquement)
+    // ✅ Quota guard (Starter=1, Creator=3)
     const plan = await getPlanFromInternalSubscription(req, email);
-    if (!bypass && plan === "Starter") {
+    const limit = plan === "Starter" ? 1 : plan === "Creator" ? 3 : 0;
+
+    if (!bypass && limit > 0) {
       const used = await countPublishedThisMonthByMetafield(email);
-      if (used >= 3) {
+      if (used >= limit) {
         return jsonWithCors(
           req,
           {
             ok: false,
             error: "quota_reached",
-            detail: "Starter plan allows 3 published courses per month",
+            detail: `${plan} plan allows ${limit} published courses per month`,
           },
           { status: 403 }
         );
@@ -648,8 +657,14 @@ export async function POST(req: Request) {
       const formatFinal = cleanStr((mf as any).format ?? "", 60);
       const levelFinal = cleanStr((mf as any).level ?? level_text ?? "", 80);
 
-      const durationTextFinal = cleanStr((mf as any).duration_text ?? duration_text ?? (mf as any).duration ?? "", 80);
-      const durationCompatFinal = cleanStr((mf as any).duration ?? (mf as any).duration_text ?? duration_text ?? "", 80);
+      const durationTextFinal = cleanStr(
+        (mf as any).duration_text ?? duration_text ?? (mf as any).duration ?? "",
+        80
+      );
+      const durationCompatFinal = cleanStr(
+        (mf as any).duration ?? (mf as any).duration_text ?? duration_text ?? "",
+        80
+      );
 
       const certificateTextFinal = cleanStr((mf as any).certificate_text ?? "", 160);
       const badgeTextFinal = cleanStr((mf as any).badge_text ?? "", 160);
@@ -669,7 +684,13 @@ export async function POST(req: Request) {
       const modulesArr = cleanModules((mf as any).modules ?? modules, 30);
 
       if (subtitleFinal) {
-        await upsertProductMetafield(created.id, "mfapp", "subtitle", "multi_line_text_field", subtitleFinal);
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "subtitle",
+          "multi_line_text_field",
+          subtitleFinal
+        );
       }
       if (formatFinal) {
         await upsertProductMetafield(created.id, "mfapp", "format", "single_line_text_field", formatFinal);
@@ -679,7 +700,13 @@ export async function POST(req: Request) {
         await upsertProductMetafield(created.id, "mfapp", "duration", "single_line_text_field", durationCompatFinal);
       }
       if (durationTextFinal) {
-        await upsertProductMetafield(created.id, "mfapp", "duration_text", "single_line_text_field", durationTextFinal);
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "duration_text",
+          "single_line_text_field",
+          durationTextFinal
+        );
       }
 
       if (levelFinal) {
@@ -696,10 +723,22 @@ export async function POST(req: Request) {
       }
 
       if (certificateTextFinal) {
-        await upsertProductMetafield(created.id, "mfapp", "certificate_text", "single_line_text_field", certificateTextFinal);
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "certificate_text",
+          "single_line_text_field",
+          certificateTextFinal
+        );
       }
       if (badgeTextFinal) {
-        await upsertProductMetafield(created.id, "mfapp", "badge_text", "single_line_text_field", badgeTextFinal);
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "badge_text",
+          "single_line_text_field",
+          badgeTextFinal
+        );
       }
       if (pill1Final) {
         await upsertProductMetafield(created.id, "mfapp", "pill_1", "single_line_text_field", pill1Final);
@@ -711,19 +750,49 @@ export async function POST(req: Request) {
         await upsertProductMetafield(created.id, "mfapp", "quick_title", "single_line_text_field", quickTitleFinal);
       }
       if (quickFormatFinal) {
-        await upsertProductMetafield(created.id, "mfapp", "quick_format", "single_line_text_field", quickFormatFinal);
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "quick_format",
+          "single_line_text_field",
+          quickFormatFinal
+        );
       }
       if (quickAccessFinal) {
-        await upsertProductMetafield(created.id, "mfapp", "quick_access", "single_line_text_field", quickAccessFinal);
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "quick_access",
+          "single_line_text_field",
+          quickAccessFinal
+        );
       }
       if (quickLevelFinal) {
-        await upsertProductMetafield(created.id, "mfapp", "quick_level", "single_line_text_field", quickLevelFinal);
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "quick_level",
+          "single_line_text_field",
+          quickLevelFinal
+        );
       }
       if (includesTitleFinal) {
-        await upsertProductMetafield(created.id, "mfapp", "includes_title", "single_line_text_field", includesTitleFinal);
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "includes_title",
+          "single_line_text_field",
+          includesTitleFinal
+        );
       }
       if (footnoteFinal) {
-        await upsertProductMetafield(created.id, "mfapp", "footnote", "multi_line_text_field", footnoteFinal);
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "footnote",
+          "multi_line_text_field",
+          footnoteFinal
+        );
       }
 
       if (learnArr.length) {
@@ -801,6 +870,8 @@ export async function POST(req: Request) {
       theme: themeHandleFinal || null,
       theme_tag: themeTag || null,
       admin_bypass: admin ? true : undefined,
+      plan,
+      quota_limit: !bypass ? limit : null,
     });
   } catch (e: any) {
     return jsonWithCors(req, { ok: false, error: e?.message || "create_failed" }, { status: 500 });
