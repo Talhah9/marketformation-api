@@ -22,6 +22,7 @@ export async function POST(req: Request) {
       returnUrl,
       shopifyCustomerId,
       planKey,
+      trainerId, // ✅ NEW (optionnel)
     } = body as {
       diag?: boolean;
       priceId?: string;
@@ -29,6 +30,7 @@ export async function POST(req: Request) {
       returnUrl?: string;
       shopifyCustomerId?: string | number;
       planKey?: string;
+      trainerId?: string; // ✅ NEW
     };
 
     // --- DIAG
@@ -81,8 +83,13 @@ export async function POST(req: Request) {
       } catch {}
     }
 
-    const base =
-      returnUrl || "https://tqiccz-96.myshopify.com/pages/mon-compte-formateur";
+    const base = returnUrl || "https://tqiccz-96.myshopify.com/pages/mon-compte-formateur";
+
+    // ✅ trainer_id pour stats (utilisé par le webhook)
+    const resolvedTrainerId =
+      (trainerId && String(trainerId).trim()) ||
+      (shopifyCustomerId ? `trainer-${String(shopifyCustomerId)}` : "") ||
+      `email:${String(email).toLowerCase().trim()}`;
 
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
@@ -90,10 +97,20 @@ export async function POST(req: Request) {
       line_items: [{ price: priceId, quantity: 1 }],
       allow_promotion_codes: true,
 
-      // ✅ on stocke un indice "planKey" (optionnel)
+      // ✅ on stocke planKey + shopifyCustomerId + trainer_id (pour stats)
       metadata: {
         planKey: planKey ? String(planKey) : "",
         shopify_customer_id: shopifyCustomerId ? String(shopifyCustomerId) : "",
+        trainer_id: resolvedTrainerId, // ✅ NEW
+      },
+
+      // ✅ IMPORTANT: met aussi trainer_id sur la subscription (utile pour invoice.payment_succeeded)
+      subscription_data: {
+        metadata: {
+          planKey: planKey ? String(planKey) : "",
+          shopify_customer_id: shopifyCustomerId ? String(shopifyCustomerId) : "",
+          trainer_id: resolvedTrainerId, // ✅ NEW
+        },
       },
 
       success_url: `${base}?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
