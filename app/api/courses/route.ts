@@ -22,8 +22,8 @@
 // - Creator = 3 / mois
 //
 // ✅ ADMIN BYPASS QUOTA:
-// - Mets ENV: MF_ADMIN_EMAILS="ton@email.com,autre@email.com"
-// - Header côté front (uniquement admin): x-mf-admin-email: <ton email>
+// - ENV: MF_ADMIN_EMAILS="ton@email.com,autre@email.com"
+// - Admin reconnu par email (body) OU header x-mf-admin-email
 // - Si admin => quota illimité + bypass quota à la création
 
 import { handleOptions, jsonWithCors } from "@/app/api/_lib/cors";
@@ -58,14 +58,28 @@ function parseCsvEnv(name: string) {
     .filter(Boolean);
 }
 
-function isAdminRequest(req: Request) {
-  const admins = parseCsvEnv("MF_ADMIN_EMAILS"); // ex: "gazou@gmail.com, autre@mail.com"
+function isAdminEmail(email: string | null | undefined) {
+  const admins = parseCsvEnv("MF_ADMIN_EMAILS");
   if (!admins.length) return false;
+  const e = String(email || "").trim().toLowerCase();
+  return !!e && admins.includes(e);
+}
 
-  const email = String(req.headers.get("x-mf-admin-email") || "")
+/**
+ * Admin reconnu si:
+ * - email du body est admin
+ * - OU header x-mf-admin-email est admin
+ */
+function isAdminRequest(req: Request, emailFromBody?: string | null) {
+  if (isAdminEmail(emailFromBody)) return true;
+
+  const h = String(req.headers.get("x-mf-admin-email") || "")
     .trim()
     .toLowerCase();
-  return !!email && admins.includes(email);
+
+  if (isAdminEmail(h)) return true;
+
+  return false;
 }
 
 async function shopifyFetch(path: string, init?: RequestInit & { json?: any }) {
@@ -445,9 +459,10 @@ export async function GET(req: Request) {
     let quota: any = null;
 
     if (!isPublic && email) {
-      const admin = isAdminRequest(req);
+      const admin = isAdminRequest(req, email);
+
       if (admin) {
-        plan = "Creator"; // pour l'UI, tu peux montrer Creator mais admin=true
+        plan = "Creator"; // pour l'UI, mais admin=true
         quota = { plan: "Admin", limit: null, used: null, remaining: null, admin: true };
       } else {
         plan = await getPlanFromInternalSubscription(req, email);
@@ -528,11 +543,11 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: "pdfUrl must be https URL" }, { status: 400 });
     }
 
-    // ✅ bypass admin auto (header) + bypass param manuel
-    const admin = isAdminRequest(req);
+    // ✅ bypass admin auto (email body OU header) + bypass param manuel
+    const admin = isAdminRequest(req, email);
     const bypass = bypassParam || admin;
 
-    // ✅ Quota guard (Starter=1, Creator=3)
+    // ✅ Quota guard (Starter=1, Creator=3) — admin bypass
     const plan = await getPlanFromInternalSubscription(req, email);
     const limit = plan === "Starter" ? 1 : plan === "Creator" ? 3 : 0;
 
@@ -871,7 +886,7 @@ export async function POST(req: Request) {
       theme_tag: themeTag || null,
       admin_bypass: admin ? true : undefined,
       plan,
-      quota_limit: !bypass ? limit : null,
+      quota_limit: bypass ? null : limit,
     });
   } catch (e: any) {
     return jsonWithCors(req, { ok: false, error: e?.message || "create_failed" }, { status: 500 });
