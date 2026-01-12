@@ -1,8 +1,4 @@
 // lib/gating.ts
-// Gating publication selon l’abonnement
-// - Starter : limite mensuelle (ex: 1)
-// - Creator : limite mensuelle (ex: 3)
-
 import { NextResponse } from "next/server";
 import { PLAN_CONFIG } from "./plans";
 import { getMonthlyCount, bumpMonthlyCount } from "./usage";
@@ -14,16 +10,23 @@ function yyyymm(d = new Date()) {
   return `${d.getFullYear()}${m}`;
 }
 
-/**
- * Vérifie le droit de publier et incrémente le compteur mensuel si OK.
- * En cas de dépassement, renvoie 402.
- */
 export async function assertCanPublish(
   shopifyCustomerId: string,
-  planKey: PlanKey
+  planKey: PlanKey,
+  opts?: { isAdmin?: boolean }
 ): Promise<{ allowed: true; used: number; limit: number }> {
+  // ✅ ADMIN BYPASS
+  if (opts?.isAdmin) {
+    return { allowed: true, used: 0, limit: Infinity };
+  }
+
   const cfg = PLAN_CONFIG[planKey];
   const limit = cfg.monthlyLimit;
+
+  // illimité (Infinity)
+  if (!isFinite(limit)) {
+    return { allowed: true, used: 0, limit: Infinity };
+  }
 
   const period = yyyymm();
   const used = (await getMonthlyCount(shopifyCustomerId, period)) ?? 0;
@@ -35,8 +38,6 @@ export async function assertCanPublish(
     );
   }
 
-  // Réserver un slot de publication (incrément immédiat)
   await bumpMonthlyCount(shopifyCustomerId, period);
-
   return { allowed: true, used: used + 1, limit };
 }
