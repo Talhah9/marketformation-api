@@ -1,7 +1,5 @@
 // app/api/courses/route.ts
 // Crée un produit "Course" (vendor = email) + liste les courses.
-// Quota basé sur mfapp.published_YYYYMM (bucket YYYYMM).
-//
 // ✅ Public listing via App Proxy:
 // - /apps/mf/courses?u=trainer-<id>&public=1
 // - /apps/mf/courses?handle=xxx&public=1 (legacy)
@@ -14,12 +12,15 @@
 // - Au listing: renvoie approval_status + approval_label
 //
 // ✅ LISTING: GraphQL (products + metafields theme + approval_status) en 1 requête
-//
 // ✅ COLLECTIONS: tag Shopify: theme-<handle>, collections = automatiques ("tag contient theme-<handle>")
 //
-// ✅ QUOTAS (nouvelle règle):
+// ✅ QUOTAS (règle demandée):
 // - Starter = 1 / mois
 // - Creator = 3 / mois
+//
+// ✅ FIX CRITIQUE:
+// - Sans abonnement => bloqué (subscription_required)
+// - Quota appliqué sur créations mensuelles via Redis (fiable même si DRAFT + pending)
 //
 // ✅ ADMIN BYPASS QUOTA:
 // - ENV: MF_ADMIN_EMAILS="ton@email.com,autre@email.com"
@@ -28,6 +29,7 @@
 
 import { handleOptions, jsonWithCors } from "@/app/api/_lib/cors";
 import { prisma } from "@/lib/prisma";
+import { getRedis } from "@/lib/redis";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -252,38 +254,6 @@ async function getPlanFromInternalSubscription(
   }
 }
 
-/* ===================== Quota (GraphQL, sans N+1) ===================== */
-/**
- * Compte les produits dont mfapp.published_YYYYMM == bucket (ex: 202601)
- * ⚠️ La mise à jour de ce metafield doit se faire quand tu "publies vraiment" (approve endpoint).
- */
-async function countPublishedThisMonthByMetafield(email: string) {
-  const bucket = ym();
-  const search = `vendor:"${email.replace(/"/g, '\\"')}"`;
-
-  const q = `
-    query($q: String!) {
-      products(first: 250, query: $q) {
-        edges {
-          node {
-            metafield(namespace:"mfapp", key:"published_YYYYMM") { value }
-          }
-        }
-      }
-    }
-  `;
-
-  const r = await shopifyGraphql(q, { q: search });
-  const edges = r.json?.data?.products?.edges || [];
-  let count = 0;
-
-  for (const e of edges) {
-    const v = String(e?.node?.metafield?.value || "").trim();
-    if (v === bucket) count++;
-  }
-  return count;
-}
-
 /* ===================== sanitize helpers for sync fields ===================== */
 function cleanStr(v: any, max = 180) {
   return String(v ?? "").trim().slice(0, max);
@@ -336,6 +306,49 @@ function uniqTags(tags: string[]) {
     out.push(s);
   }
   return out;
+}
+
+/* ===================== Quota (Redis) ===================== */
+function normalizeEmail(e: any) {
+  return String(e || "").trim().toLowerCase();
+}
+
+function ownerIdForQuota(params: {
+  email: string;
+  shopifyCustomerIdRaw?: string;
+  handle?: string;
+}) {
+  // On privilégie Shopify Customer ID (stable)
+  const idDigits = String(params.shopifyCustomerIdRaw || "").trim();
+  if (idDigits && /^\d+$/.test(idDigits)) return `trainer-${idDigits}`;
+
+  // fallback: u=trainer-<digits> ou u=<digits>
+  const digitsFromHandle = extractDigitsHandle(String(params.handle || ""));
+  if (digitsFromHandle) return `trainer-${digitsFromHandle}`;
+
+  // fallback email (stable si bien normalisé)
+  return `email:${normalizeEmail(params.email)}`;
+}
+
+async function getQuotaFromRedis(args: {
+  plan: "Starter" | "Creator" | "Unknown";
+  ownerId: string;
+}) {
+  const limit = args.plan === "Starter" ? 1 : args.plan === "Creator" ? 3 : 0;
+  if (limit <= 0) return { plan: args.plan, limit: null, used: null, remaining: null };
+
+  const redis = getRedis();
+  const bucket = ym();
+  const key = `quota:created:${bucket}:${args.ownerId}`;
+  const used = Number((await redis.get(key)) || 0);
+
+  return {
+    plan: args.plan,
+    limit,
+    used,
+    remaining: Math.max(0, limit - used),
+    key,
+  };
 }
 
 /* ===================== OPTIONS (CORS) ===================== */
@@ -467,13 +480,9 @@ export async function GET(req: Request) {
       } else {
         plan = await getPlanFromInternalSubscription(req, email);
 
-        const limit = plan === "Starter" ? 1 : plan === "Creator" ? 3 : 0;
-        if (limit > 0) {
-          const used = await countPublishedThisMonthByMetafield(email);
-          quota = { plan, limit, used, remaining: Math.max(0, limit - used) };
-        } else {
-          quota = { plan, limit: null, used: null, remaining: null };
-        }
+        // ✅ Quota aligné sur le vrai blocage (Redis, créations du mois)
+        const ownerId = ownerIdForQuota({ email, shopifyCustomerIdRaw, handle });
+        quota = await getQuotaFromRedis({ plan, ownerId });
       }
     }
 
@@ -547,23 +556,49 @@ export async function POST(req: Request) {
     const admin = isAdminRequest(req, email);
     const bypass = bypassParam || admin;
 
-    // ✅ Quota guard (Starter=1, Creator=3) — admin bypass
+    // ✅ Abonnement requis (sauf admin/bypass)
     const plan = await getPlanFromInternalSubscription(req, email);
-    const limit = plan === "Starter" ? 1 : plan === "Creator" ? 3 : 0;
+    if (!bypass && plan === "Unknown") {
+      return jsonWithCors(
+        req,
+        {
+          ok: false,
+          error: "subscription_required",
+          message: "Choisir un abonnement pour commencer à publier des formations.",
+        },
+        { status: 402 }
+      );
+    }
 
-    if (!bypass && limit > 0) {
-      const used = await countPublishedThisMonthByMetafield(email);
-      if (used >= limit) {
-        return jsonWithCors(
-          req,
-          {
-            ok: false,
-            error: "quota_reached",
-            detail: `${plan} plan allows ${limit} published courses per month`,
-          },
-          { status: 403 }
-        );
-      }
+    // ✅ Quota (Starter=1, Creator=3) basé sur créations du mois via Redis
+    const ownerId = ownerIdForQuota({
+      email: String(email),
+      shopifyCustomerIdRaw: shopifyCustomerId ? String(shopifyCustomerId) : "",
+      handle: "",
+    });
+
+    const quotaInfo = bypass
+      ? { plan, limit: null, used: null, remaining: null, key: null as any }
+      : await getQuotaFromRedis({ plan, ownerId });
+
+    if (!bypass && quotaInfo?.limit && quotaInfo.used != null && quotaInfo.used >= quotaInfo.limit) {
+      const msg =
+        plan === "Starter"
+          ? "Quota atteint : 1 formation ce mois-ci (Starter)."
+          : "Quota atteint : 3 formations ce mois-ci (Creator).";
+
+      return jsonWithCors(
+        req,
+        {
+          ok: false,
+          error: "quota_reached",
+          message: msg,
+          plan,
+          limit: quotaInfo.limit,
+          used: quotaInfo.used,
+        },
+        { status: 403 }
+      );
     }
 
     // normaliser prix Shopify (string "12.34")
@@ -875,6 +910,16 @@ export async function POST(req: Request) {
       console.error("[MF] prisma.course upsert error", e);
     }
 
+    // ✅ Incr quota (créations du mois) après succès Shopify+metafields
+    try {
+      if (!bypass && quotaInfo?.key) {
+        const redis = getRedis();
+        await redis.incr(String(quotaInfo.key));
+      }
+    } catch (e) {
+      console.error("[MF] quota incr error", e);
+    }
+
     return jsonWithCors(req, {
       ok: true,
       id: created.id,
@@ -886,7 +931,9 @@ export async function POST(req: Request) {
       theme_tag: themeTag || null,
       admin_bypass: admin ? true : undefined,
       plan,
-      quota_limit: bypass ? null : limit,
+      quota_limit: bypass ? null : (quotaInfo?.limit ?? null),
+      quota_used: bypass ? null : (quotaInfo?.used ?? null),
+      quota_remaining: bypass ? null : (quotaInfo?.remaining ?? null),
     });
   } catch (e: any) {
     return jsonWithCors(req, { ok: false, error: e?.message || "create_failed" }, { status: 500 });
