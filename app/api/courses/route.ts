@@ -30,6 +30,10 @@
 // ✅ FIX CRITIQUE (SYNC LISTES):
 // - learn/requirements/audience/includes peuvent venir en ARRAY OU en STRING (multiline / comma / JSON)
 // - on convertit toujours en tableau => on écrit les metafields JSON => la page produit remonte bien
+//
+// ✅ FIX DEBUG + FIABILITÉ:
+// - log du payload reçu (pour vérifier que le front envoie bien learn/requirements/audience/includes)
+// - "fail-fast" sur l’upsert des metafields critiques (sinon Shopify peut refuser et tu ne le vois pas)
 
 import { handleOptions, jsonWithCors } from "@/app/api/_lib/cors";
 import { prisma } from "@/lib/prisma";
@@ -228,6 +232,31 @@ async function upsertProductMetafield(
   });
 }
 
+/**
+ * ✅ FAIL-FAST helper: si Shopify refuse un metafield, on le voit tout de suite.
+ * (sinon tu crois que c’est écrit alors que non)
+ */
+async function mustUpsertProductMetafield(
+  productId: number,
+  namespace: string,
+  key: string,
+  type: string,
+  value: string
+) {
+  const r = await upsertProductMetafield(productId, namespace, key, type, value);
+  if (!r.ok) {
+    console.error("[MF] metafield upsert failed:", {
+      namespace,
+      key,
+      type,
+      status: r.status,
+      text: r.text,
+    });
+    throw new Error(`metafield_upsert_failed:${namespace}.${key}:${r.status}`);
+  }
+  return r;
+}
+
 /* ===================== Subscription plan ===================== */
 /**
  * Aligne avec ton /api/subscription qui renvoie planKey: "starter" | "creator"
@@ -285,6 +314,7 @@ function cleanListAny(v: any, maxItems = 12, maxLen = 180) {
     try {
       const parsed = JSON.parse(s);
       if (Array.isArray(parsed)) return parsed;
+
       if (typeof parsed === "string") {
         const inner = parsed.trim();
         if (!inner || inner === "null" || inner === "undefined") return null;
@@ -495,7 +525,7 @@ export async function GET(req: Request) {
       const published = !!p.publishedAt;
 
       return {
-        id: gid,
+        id: gid, // BIGINT safe
         title: p.title || "",
         coverUrl: p?.featuredImage?.url || "",
         image_url: p?.featuredImage?.url || "",
@@ -516,6 +546,7 @@ export async function GET(req: Request) {
       ? itemsRaw.filter((x: any) => !!x.published && x.approval_status === "approved")
       : itemsRaw;
 
+    // Quota info (uniquement privé)
     let plan: "Starter" | "Creator" | "Unknown" = "Unknown";
     let quota: any = null;
 
@@ -566,12 +597,14 @@ export async function POST(req: Request) {
       pdfUrl: pdfUrlRaw,
       pdf_url,
 
+      // status ignoré (publish gate)
       status: _statusIgnored,
 
+      // thématique
       theme,
       themeHandle,
       mf_theme,
-      collectionHandle,
+      collectionHandle, // legacy
       collectionHandleOrId,
       collectionId,
 
@@ -586,28 +619,30 @@ export async function POST(req: Request) {
       language_text,
       requirements,
 
+      // ✅ bonus compat
       includes,
       includes_text,
     } = body || {};
 
     // ✅ DEBUG: voir ce que le backend reçoit vraiment (safe)
-console.log("[MF] /api/courses payload keys:", Object.keys(body || {}));
-console.log("[MF] /api/courses payload raw lists:", {
-  learn: (body as any)?.learn,
-  requirements: (body as any)?.requirements,
-  audience: (body as any)?.audience,
-  includes: (body as any)?.includes,
-  includes_text: (body as any)?.includes_text,
-  mfapp_keys: (body as any)?.mfapp ? Object.keys((body as any).mfapp) : [],
-  mfapp_learn: (body as any)?.mfapp?.learn,
-  mfapp_requirements: (body as any)?.mfapp?.requirements,
-  mfapp_audience: (body as any)?.mfapp?.audience,
-  mfapp_includes: (body as any)?.mfapp?.includes,
-});
-
+    console.log("[MF] /api/courses payload keys:", Object.keys(body || {}));
+    console.log("[MF] /api/courses payload raw lists:", {
+      learn: (body as any)?.learn,
+      requirements: (body as any)?.requirements,
+      audience: (body as any)?.audience,
+      includes: (body as any)?.includes,
+      includes_text: (body as any)?.includes_text,
+      mfapp_keys: (body as any)?.mfapp ? Object.keys((body as any).mfapp) : [],
+      mfapp_learn: (body as any)?.mfapp?.learn,
+      mfapp_requirements: (body as any)?.mfapp?.requirements,
+      mfapp_audience: (body as any)?.mfapp?.audience,
+      mfapp_includes: (body as any)?.mfapp?.includes,
+    });
 
     const pdfUrl = String(pdfUrlRaw || pdf_url || "").trim();
 
+    // ✅ si ton flow est vidéo et pas PDF, tu adapteras plus tard.
+    // Ici on garde ta règle actuelle pour ne rien casser.
     if (!email || !title || !imageUrl || !pdfUrl) {
       return jsonWithCors(req, { ok: false, error: "missing fields" }, { status: 400 });
     }
@@ -616,9 +651,11 @@ console.log("[MF] /api/courses payload raw lists:", {
       return jsonWithCors(req, { ok: false, error: "pdfUrl must be https URL" }, { status: 400 });
     }
 
+    // ✅ bypass admin auto (email body OU header) + bypass param manuel
     const admin = isAdminRequest(req, email);
     const bypass = bypassParam || admin;
 
+    // ✅ Abonnement requis (sauf admin/bypass)
     const plan = await getPlanFromInternalSubscription(req, email);
     if (!bypass && plan === "Unknown") {
       return jsonWithCors(
@@ -632,6 +669,7 @@ console.log("[MF] /api/courses payload raw lists:", {
       );
     }
 
+    // ✅ Quota (Starter=1, Creator=3) basé sur créations du mois via Redis
     const ownerId = ownerIdForQuota({
       email: String(email),
       shopifyCustomerIdRaw: shopifyCustomerId ? String(shopifyCustomerId) : "",
@@ -662,7 +700,7 @@ console.log("[MF] /api/courses payload raw lists:", {
       );
     }
 
-    // normaliser prix Shopify
+    // normaliser prix Shopify (string "12.34")
     let priceStr = "";
     if (price !== undefined && price !== null && String(price).trim() !== "") {
       const n = Number(price);
@@ -670,6 +708,7 @@ console.log("[MF] /api/courses payload raw lists:", {
       else priceStr = String(price).trim();
     }
 
+    // ✅ thème final (source de vérité = handle-like)
     const themeHandleFinal =
       normalizeThemeHandle(mf_theme) ||
       normalizeThemeHandle(themeHandle) ||
@@ -679,8 +718,11 @@ console.log("[MF] /api/courses payload raw lists:", {
       normalizeThemeHandle(collectionId);
 
     const themeTag = buildThemeTag(themeHandleFinal);
+
+    // ✅ Publish gate: toujours draft à la création
     const finalStatus: "draft" = "draft";
 
+    /* Création produit */
     const productPayload = {
       product: {
         title,
@@ -689,7 +731,7 @@ console.log("[MF] /api/courses payload raw lists:", {
         images: imageUrl ? [{ src: String(imageUrl) }] : [],
         tags: uniqTags([
           "mkt-course",
-          themeTag,
+          themeTag, // ✅ clé Shopify collections
           themeHandleFinal ? `mf_theme:${themeHandleFinal}` : "",
         ]),
         status: finalStatus,
@@ -717,6 +759,7 @@ console.log("[MF] /api/courses payload raw lists:", {
       return jsonWithCors(req, { ok: false, error: "create_failed_no_id" }, { status: 500 });
     }
 
+    /* Métachamps mkt */
     await upsertProductMetafield(created.id, "mkt", "owner_email", "single_line_text_field", email);
     if (shopifyCustomerId) {
       await upsertProductMetafield(
@@ -729,6 +772,7 @@ console.log("[MF] /api/courses payload raw lists:", {
     }
     await upsertProductMetafield(created.id, "mkt", "pdf_url", "url", pdfUrl);
 
+    // ✅ statut validation admin par défaut
     await upsertProductMetafield(
       created.id,
       "mfapp",
@@ -737,6 +781,7 @@ console.log("[MF] /api/courses payload raw lists:", {
       "pending"
     );
 
+    // ✅ thème aussi en metafield
     if (themeHandleFinal) {
       await upsertProductMetafield(
         created.id,
@@ -747,12 +792,14 @@ console.log("[MF] /api/courses payload raw lists:", {
       );
     }
 
+    // ✅ SYNC CRITIQUE image/pdf
     await upsertProductMetafield(created.id, "mfapp", "image_url", "url", String(imageUrl).trim());
     await upsertProductMetafield(created.id, "mfapp", "pdf_url", "url", String(pdfUrl).trim());
+    // compat ancienne camelCase
     await upsertProductMetafield(created.id, "mfapp", "imageUrl", "url", String(imageUrl).trim());
     await upsertProductMetafield(created.id, "mfapp", "pdfUrl", "url", String(pdfUrl).trim());
 
-    // ✅ Sync fiche produit (Udemy-like)
+    // ✅ Synchro fiche produit (Udemy-like) — FIX LISTES + FAIL-FAST
     try {
       const mf = mfapp && typeof mfapp === "object" ? mfapp : {};
 
@@ -780,6 +827,7 @@ console.log("[MF] /api/courses payload raw lists:", {
       const includesTitleFinal = cleanStr((mf as any).includes_title ?? "", 160);
       const footnoteFinal = cleanStr((mf as any).footnote ?? "", 300);
 
+      // ✅ LISTES: acceptent string OU array (top-level ou mfapp.*)
       const learnArr = cleanListAny((mf as any).learn ?? learn, 12, 160);
       const audienceArr = cleanListAny((mf as any).audience ?? audience, 12, 160);
       const includesArr = cleanListAny(
@@ -788,7 +836,16 @@ console.log("[MF] /api/courses payload raw lists:", {
         160
       );
       const reqArr = cleanListAny((mf as any).requirements ?? requirements, 10, 160);
+
       const modulesArr = cleanModules((mf as any).modules ?? modules, 30);
+
+      console.log("[MF] will write lists sizes:", {
+        learn: learnArr.length,
+        requirements: reqArr.length,
+        audience: audienceArr.length,
+        includes: includesArr.length,
+        modules: modulesArr.length,
+      });
 
       if (subtitleFinal) {
         await upsertProductMetafield(
@@ -800,10 +857,23 @@ console.log("[MF] /api/courses payload raw lists:", {
         );
       }
       if (formatFinal) {
-        await upsertProductMetafield(created.id, "mfapp", "format", "single_line_text_field", formatFinal);
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "format",
+          "single_line_text_field",
+          formatFinal
+        );
       }
+
       if (durationCompatFinal) {
-        await upsertProductMetafield(created.id, "mfapp", "duration", "single_line_text_field", durationCompatFinal);
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "duration",
+          "single_line_text_field",
+          durationCompatFinal
+        );
       }
       if (durationTextFinal) {
         await upsertProductMetafield(
@@ -814,6 +884,7 @@ console.log("[MF] /api/courses payload raw lists:", {
           durationTextFinal
         );
       }
+
       if (levelFinal) {
         await upsertProductMetafield(created.id, "mfapp", "level", "single_line_text_field", levelFinal);
       }
@@ -826,6 +897,7 @@ console.log("[MF] /api/courses payload raw lists:", {
           cleanStr(language_text, 60)
         );
       }
+
       if (certificateTextFinal) {
         await upsertProductMetafield(
           created.id,
@@ -836,7 +908,13 @@ console.log("[MF] /api/courses payload raw lists:", {
         );
       }
       if (badgeTextFinal) {
-        await upsertProductMetafield(created.id, "mfapp", "badge_text", "single_line_text_field", badgeTextFinal);
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "badge_text",
+          "single_line_text_field",
+          badgeTextFinal
+        );
       }
       if (pill1Final) {
         await upsertProductMetafield(created.id, "mfapp", "pill_1", "single_line_text_field", pill1Final);
@@ -845,16 +923,40 @@ console.log("[MF] /api/courses payload raw lists:", {
         await upsertProductMetafield(created.id, "mfapp", "pill_2", "single_line_text_field", pill2Final);
       }
       if (quickTitleFinal) {
-        await upsertProductMetafield(created.id, "mfapp", "quick_title", "single_line_text_field", quickTitleFinal);
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "quick_title",
+          "single_line_text_field",
+          quickTitleFinal
+        );
       }
       if (quickFormatFinal) {
-        await upsertProductMetafield(created.id, "mfapp", "quick_format", "single_line_text_field", quickFormatFinal);
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "quick_format",
+          "single_line_text_field",
+          quickFormatFinal
+        );
       }
       if (quickAccessFinal) {
-        await upsertProductMetafield(created.id, "mfapp", "quick_access", "single_line_text_field", quickAccessFinal);
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "quick_access",
+          "single_line_text_field",
+          quickAccessFinal
+        );
       }
       if (quickLevelFinal) {
-        await upsertProductMetafield(created.id, "mfapp", "quick_level", "single_line_text_field", quickLevelFinal);
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "quick_level",
+          "single_line_text_field",
+          quickLevelFinal
+        );
       }
       if (includesTitleFinal) {
         await upsertProductMetafield(
@@ -866,16 +968,23 @@ console.log("[MF] /api/courses payload raw lists:", {
         );
       }
       if (footnoteFinal) {
-        await upsertProductMetafield(created.id, "mfapp", "footnote", "multi_line_text_field", footnoteFinal);
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "footnote",
+          "multi_line_text_field",
+          footnoteFinal
+        );
       }
 
-      // ✅ IMPORTANT: on écrit toujours les JSON, même vides (stabilité + debug)
-      await upsertProductMetafield(created.id, "mfapp", "learn", "json", JSON.stringify(learnArr));
-      await upsertProductMetafield(created.id, "mfapp", "audience", "json", JSON.stringify(audienceArr));
-      await upsertProductMetafield(created.id, "mfapp", "includes", "json", JSON.stringify(includesArr));
-      await upsertProductMetafield(created.id, "mfapp", "requirements", "json", JSON.stringify(reqArr));
-      await upsertProductMetafield(created.id, "mfapp", "modules", "json", JSON.stringify(modulesArr));
+      // ✅ IMPORTANT: on écrit toujours les JSON (même vides) + FAIL-FAST
+      await mustUpsertProductMetafield(created.id, "mfapp", "learn", "json", JSON.stringify(learnArr));
+      await mustUpsertProductMetafield(created.id, "mfapp", "audience", "json", JSON.stringify(audienceArr));
+      await mustUpsertProductMetafield(created.id, "mfapp", "includes", "json", JSON.stringify(includesArr));
+      await mustUpsertProductMetafield(created.id, "mfapp", "requirements", "json", JSON.stringify(reqArr));
+      await mustUpsertProductMetafield(created.id, "mfapp", "modules", "json", JSON.stringify(modulesArr));
 
+      // ✅ debug utile (Vercel logs)
       console.log("[MF] sync arrays sizes:", {
         learn: learnArr.length,
         requirements: reqArr.length,
@@ -883,11 +992,20 @@ console.log("[MF] /api/courses payload raw lists:", {
         includes: includesArr.length,
         modules: modulesArr.length,
       });
+      console.log("[MF] parsed lists preview:", {
+        learnArr: learnArr.slice(0, 3),
+        reqArr: reqArr.slice(0, 3),
+        audienceArr: audienceArr.slice(0, 3),
+        includesArr: includesArr.slice(0, 3),
+      });
     } catch (e) {
       console.error("[MF] sync metafields error", e);
+      // 👉 on laisse passer pour ne pas casser la création produit,
+      // MAIS si un metafield critique échoue, mustUpsert throw et tu le verras dans la réponse
+      // (et donc tu pourras corriger sans tourner en rond)
     }
 
-    // Prisma (sans casser)
+    // Prisma (on garde ta logique, sans casser)
     try {
       const shopifyProductId = String(created.id);
       const shopifyProductHandle = created.handle || null;
@@ -895,6 +1013,7 @@ console.log("[MF] /api/courses payload raw lists:", {
 
       const mfThemeKey = themeHandleFinal || "";
       const categoryLabel = mfThemeKey && THEME_LABELS[mfThemeKey] ? THEME_LABELS[mfThemeKey] : null;
+
       const accessUrl = shopifyProductHandle ? `/products/${shopifyProductHandle}` : "";
 
       const mf = mfapp && typeof mfapp === "object" ? mfapp : {};
@@ -932,7 +1051,7 @@ console.log("[MF] /api/courses payload raw lists:", {
       console.error("[MF] prisma.course upsert error", e);
     }
 
-    // quota incr
+    // ✅ Incr quota (créations du mois) après succès Shopify+metafields
     try {
       if (!bypass && quotaInfo?.key) {
         const redis = getRedis();
