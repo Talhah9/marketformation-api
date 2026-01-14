@@ -27,9 +27,9 @@
 // - Admin reconnu par email (body) OU header x-mf-admin-email
 // - Si admin => quota illimité + bypass quota à la création
 //
-// ✅ FIX SYNC METAFIELDS:
-// - On écrit les metafields produit via GraphQL metafieldsSet (fiable) au lieu de REST /metafields.json
-//   => corrige le cas où Liquid voit "" pour learn/requirements/audience/includes/subtitle...
+// ✅ FIX CRITIQUE (SYNC LISTES):
+// - learn/requirements/audience/includes peuvent venir en ARRAY OU en STRING (multiline / comma)
+// - on convertit toujours en tableau => on écrit les metafields JSON => la page produit remonte bien
 
 import { handleOptions, jsonWithCors } from "@/app/api/_lib/cors";
 import { prisma } from "@/lib/prisma";
@@ -141,40 +141,6 @@ async function shopifyGraphql(query: string, variables?: any) {
   return { ok: res.ok, status: res.status, json, text };
 }
 
-/* ===================== Metafields helpers (GraphQL set - ROBUST) ===================== */
-async function setProductMetafieldsGQL(
-  productGid: string,
-  fields: Array<{ namespace: string; key: string; type: string; value: string }>
-) {
-  const mutation = `
-    mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
-      metafieldsSet(metafields: $metafields) {
-        metafields { namespace key type value }
-        userErrors { field message code }
-      }
-    }
-  `;
-
-  const variables = {
-    metafields: fields.map((f) => ({
-      ownerId: productGid,
-      namespace: f.namespace,
-      key: f.key,
-      type: f.type,
-      value: f.value,
-    })),
-  };
-
-  const r = await shopifyGraphql(mutation, variables);
-
-  const errs = r.json?.data?.metafieldsSet?.userErrors || [];
-  if (!r.ok || (Array.isArray(errs) && errs.length)) {
-    console.error("[MF] metafieldsSet errors:", errs, "status:", r.status, "text:", r.text);
-  }
-
-  return r;
-}
-
 /* ===================== Public handle -> email (BIGINT safe) ===================== */
 function extractDigitsHandle(h: string) {
   const s = String(h || "").trim();
@@ -240,6 +206,28 @@ const THEME_LABELS: Record<string, string> = {
   "developpement-personnel-bien-etre": "Développement perso & Bien-être",
 };
 
+/* ===================== Metafields helpers (REST upsert) ===================== */
+async function upsertProductMetafield(
+  productId: number,
+  namespace: string,
+  key: string,
+  type: string,
+  value: string
+) {
+  return shopifyFetch(`/metafields.json`, {
+    json: {
+      metafield: {
+        namespace,
+        key,
+        type,
+        value,
+        owner_resource: "product",
+        owner_id: productId,
+      },
+    },
+  });
+}
+
 /* ===================== Subscription plan ===================== */
 /**
  * Aligne avec ton /api/subscription qui renvoie planKey: "starter" | "creator"
@@ -274,11 +262,35 @@ async function getPlanFromInternalSubscription(
 function cleanStr(v: any, max = 180) {
   return String(v ?? "").trim().slice(0, max);
 }
-function cleanList(arr: any, maxItems = 12, maxLen = 180) {
-  if (!Array.isArray(arr)) return [];
-  const out = arr.map((x) => cleanStr(x, maxLen)).filter(Boolean);
-  return out.slice(0, maxItems);
+
+/**
+ * ✅ IMPORTANT: accepte ARRAY ou STRING
+ * - "a\nb\nc" => ["a","b","c"]
+ * - "a, b, c" => ["a","b","c"]
+ */
+function cleanListAny(v: any, maxItems = 12, maxLen = 180) {
+  if (Array.isArray(v)) {
+    return v
+      .map((x) => cleanStr(x, maxLen))
+      .filter(Boolean)
+      .slice(0, maxItems);
+  }
+
+  const s = String(v ?? "").trim();
+  if (!s || s === "null" || s === "undefined") return [];
+
+  const parts = s.includes("\n")
+    ? s.split("\n")
+    : s.includes(",")
+    ? s.split(",")
+    : [s];
+
+  return parts
+    .map((x) => cleanStr(x, maxLen))
+    .filter((x) => x && x !== "null" && x !== "undefined")
+    .slice(0, maxItems);
 }
+
 function cleanModules(arr: any, maxItems = 30) {
   if (!Array.isArray(arr)) return [];
   const out: Array<{ title: string; meta?: string; desc?: string }> = [];
@@ -329,7 +341,11 @@ function normalizeEmail(e: any) {
   return String(e || "").trim().toLowerCase();
 }
 
-function ownerIdForQuota(params: { email: string; shopifyCustomerIdRaw?: string; handle?: string }) {
+function ownerIdForQuota(params: {
+  email: string;
+  shopifyCustomerIdRaw?: string;
+  handle?: string;
+}) {
   // On privilégie Shopify Customer ID (stable)
   const idDigits = String(params.shopifyCustomerIdRaw || "").trim();
   if (idDigits && /^\d+$/.test(idDigits)) return `trainer-${idDigits}`;
@@ -342,7 +358,10 @@ function ownerIdForQuota(params: { email: string; shopifyCustomerIdRaw?: string;
   return `email:${normalizeEmail(params.email)}`;
 }
 
-async function getQuotaFromRedis(args: { plan: "Starter" | "Creator" | "Unknown"; ownerId: string }) {
+async function getQuotaFromRedis(args: {
+  plan: "Starter" | "Creator" | "Unknown";
+  ownerId: string;
+}) {
   const limit = args.plan === "Starter" ? 1 : args.plan === "Creator" ? 3 : 0;
   if (limit <= 0) return { plan: args.plan, limit: null, used: null, remaining: null };
 
@@ -371,13 +390,18 @@ export async function OPTIONS(req: Request) {
 export async function GET(req: Request) {
   try {
     if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(req, { ok: false, error: "Missing SHOP_DOMAIN or Admin token" }, { status: 500 });
+      return jsonWithCors(
+        req,
+        { ok: false, error: "Missing SHOP_DOMAIN or Admin token" },
+        { status: 500 }
+      );
     }
 
     const url = new URL(req.url);
 
     const handle =
-      (url.searchParams.get("u") || "").trim() || (url.searchParams.get("handle") || "").trim();
+      (url.searchParams.get("u") || "").trim() ||
+      (url.searchParams.get("handle") || "").trim();
 
     const isPublic = url.searchParams.get("public") === "1";
 
@@ -392,7 +416,11 @@ export async function GET(req: Request) {
     }
 
     if (!email) {
-      return jsonWithCors(req, { ok: false, error: "email_or_resolvable_handle_required" }, { status: 400 });
+      return jsonWithCors(
+        req,
+        { ok: false, error: "email_or_resolvable_handle_required" },
+        { status: 400 }
+      );
     }
 
     const vendor = email.replace(/"/g, '\\"');
@@ -437,7 +465,11 @@ export async function GET(req: Request) {
 
       const approval_status = String(p?.approval?.value || "pending").trim().toLowerCase();
       const approval_label =
-        approval_status === "approved" ? "Approuvée" : approval_status === "rejected" ? "Refusée" : "En attente";
+        approval_status === "approved"
+          ? "Approuvée"
+          : approval_status === "rejected"
+          ? "Refusée"
+          : "En attente";
 
       const published = !!p.publishedAt;
 
@@ -459,7 +491,9 @@ export async function GET(req: Request) {
       };
     });
 
-    const items = isPublic ? itemsRaw.filter((x: any) => !!x.published && x.approval_status === "approved") : itemsRaw;
+    const items = isPublic
+      ? itemsRaw.filter((x: any) => !!x.published && x.approval_status === "approved")
+      : itemsRaw;
 
     // Quota info (uniquement privé)
     let plan: "Starter" | "Creator" | "Unknown" = "Unknown";
@@ -492,7 +526,11 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
   try {
     if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(req, { ok: false, error: "Missing SHOP_DOMAIN or Admin token" }, { status: 500 });
+      return jsonWithCors(
+        req,
+        { ok: false, error: "Missing SHOP_DOMAIN or Admin token" },
+        { status: 500 }
+      );
     }
 
     const url = new URL(req.url);
@@ -530,10 +568,16 @@ export async function POST(req: Request) {
       level_text,
       language_text,
       requirements,
+
+      // ✅ bonus compat: certains fronts envoient includes au top-level
+      includes,
+      includes_text,
     } = body || {};
 
     const pdfUrl = String(pdfUrlRaw || pdf_url || "").trim();
 
+    // ✅ si ton flow est vidéo et pas PDF, tu adapteras plus tard.
+    // Ici on garde ta règle actuelle pour ne rien casser.
     if (!email || !title || !imageUrl || !pdfUrl) {
       return jsonWithCors(req, { ok: false, error: "missing fields" }, { status: 400 });
     }
@@ -579,7 +623,14 @@ export async function POST(req: Request) {
 
       return jsonWithCors(
         req,
-        { ok: false, error: "quota_reached", message: msg, plan, limit: quotaInfo.limit, used: quotaInfo.used },
+        {
+          ok: false,
+          error: "quota_reached",
+          message: msg,
+          plan,
+          limit: quotaInfo.limit,
+          used: quotaInfo.used,
+        },
         { status: 403 }
       );
     }
@@ -613,7 +664,11 @@ export async function POST(req: Request) {
         body_html: description ? `<p>${String(description)}</p>` : "",
         vendor: email,
         images: imageUrl ? [{ src: String(imageUrl) }] : [],
-        tags: uniqTags(["mkt-course", themeTag, themeHandleFinal ? `mf_theme:${themeHandleFinal}` : ""]),
+        tags: uniqTags([
+          "mkt-course",
+          themeTag, // ✅ clé Shopify collections
+          themeHandleFinal ? `mf_theme:${themeHandleFinal}` : "",
+        ]),
         status: finalStatus,
         variants: [
           {
@@ -639,15 +694,52 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: "create_failed_no_id" }, { status: 500 });
     }
 
-    const productGid = `gid://shopify/Product/${created.id}`;
+    /* Métachamps mkt */
+    await upsertProductMetafield(created.id, "mkt", "owner_email", "single_line_text_field", email);
+    if (shopifyCustomerId) {
+      await upsertProductMetafield(
+        created.id,
+        "mkt",
+        "owner_id",
+        "single_line_text_field",
+        String(shopifyCustomerId)
+      );
+    }
+    await upsertProductMetafield(created.id, "mkt", "pdf_url", "url", pdfUrl);
 
-    // ✅ Metafields (ROBUST) via GraphQL
+    // ✅ statut validation admin par défaut
+    await upsertProductMetafield(
+      created.id,
+      "mfapp",
+      "approval_status",
+      "single_line_text_field",
+      "pending"
+    );
+
+    // ✅ thème aussi en metafield
+    if (themeHandleFinal) {
+      await upsertProductMetafield(
+        created.id,
+        "mfapp",
+        "theme",
+        "single_line_text_field",
+        themeHandleFinal
+      );
+    }
+
+    // ✅ SYNC CRITIQUE image/pdf
+    await upsertProductMetafield(created.id, "mfapp", "image_url", "url", String(imageUrl).trim());
+    await upsertProductMetafield(created.id, "mfapp", "pdf_url", "url", String(pdfUrl).trim());
+    // compat ancienne camelCase
+    await upsertProductMetafield(created.id, "mfapp", "imageUrl", "url", String(imageUrl).trim());
+    await upsertProductMetafield(created.id, "mfapp", "pdfUrl", "url", String(pdfUrl).trim());
+
+    // ✅ Synchro fiche produit (Udemy-like) — FIX LISTES
     try {
       const mf = mfapp && typeof mfapp === "object" ? mfapp : {};
 
       const subtitleFinal = cleanStr((mf as any).subtitle ?? subtitle, 600);
-
-      const formatFinal = cleanStr((mf as any).format ?? "", 60);
+      const formatFinal = cleanStr((mf as any).format ?? (mf as any).type ?? "", 60);
       const levelFinal = cleanStr((mf as any).level ?? level_text ?? "", 80);
 
       const durationTextFinal = cleanStr(
@@ -670,75 +762,157 @@ export async function POST(req: Request) {
       const includesTitleFinal = cleanStr((mf as any).includes_title ?? "", 160);
       const footnoteFinal = cleanStr((mf as any).footnote ?? "", 300);
 
-      const learnArr = cleanList((mf as any).learn ?? learn, 12, 160);
-      const audienceArr = cleanList((mf as any).audience ?? audience, 12, 160);
-      const includesArr = cleanList((mf as any).includes ?? [], 12, 160);
-      const reqArr = cleanList((mf as any).requirements ?? requirements, 10, 160);
+      // ✅ LISTES: acceptent string OU array (top-level ou mfapp.*)
+      const learnArr = cleanListAny((mf as any).learn ?? learn, 12, 160);
+      const audienceArr = cleanListAny((mf as any).audience ?? audience, 12, 160);
+      const includesArr = cleanListAny(
+        (mf as any).includes ?? includes ?? (mf as any).includes_text ?? includes_text ?? [],
+        12,
+        160
+      );
+      const reqArr = cleanListAny((mf as any).requirements ?? requirements, 10, 160);
+
       const modulesArr = cleanModules((mf as any).modules ?? modules, 30);
 
-      const fields: Array<{ namespace: string; key: string; type: string; value: string }> = [];
-
-      // ---- mkt namespace (utilisé ailleurs)
-      fields.push({ namespace: "mkt", key: "owner_email", type: "single_line_text_field", value: String(email).trim() });
-      if (shopifyCustomerId) {
-        fields.push({
-          namespace: "mkt",
-          key: "owner_id",
-          type: "single_line_text_field",
-          value: String(shopifyCustomerId),
-        });
+      if (subtitleFinal) {
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "subtitle",
+          "multi_line_text_field",
+          subtitleFinal
+        );
       }
-      fields.push({ namespace: "mkt", key: "pdf_url", type: "url", value: String(pdfUrl).trim() });
-
-      // ---- mfapp: gate + theme
-      fields.push({ namespace: "mfapp", key: "approval_status", type: "single_line_text_field", value: "pending" });
-      if (themeHandleFinal) {
-        fields.push({ namespace: "mfapp", key: "theme", type: "single_line_text_field", value: themeHandleFinal });
+      if (formatFinal) {
+        await upsertProductMetafield(created.id, "mfapp", "format", "single_line_text_field", formatFinal);
       }
 
-      // ---- mfapp: urls (source de vérité page produit)
-      fields.push({ namespace: "mfapp", key: "image_url", type: "url", value: String(imageUrl).trim() });
-      fields.push({ namespace: "mfapp", key: "pdf_url", type: "url", value: String(pdfUrl).trim() });
+      if (durationCompatFinal) {
+        await upsertProductMetafield(created.id, "mfapp", "duration", "single_line_text_field", durationCompatFinal);
+      }
+      if (durationTextFinal) {
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "duration_text",
+          "single_line_text_field",
+          durationTextFinal
+        );
+      }
 
-      // compat (si ton front les utilise encore)
-      fields.push({ namespace: "mfapp", key: "imageUrl", type: "url", value: String(imageUrl).trim() });
-      fields.push({ namespace: "mfapp", key: "pdfUrl", type: "url", value: String(pdfUrl).trim() });
-
-      // ---- mfapp: texte
-      if (subtitleFinal) fields.push({ namespace: "mfapp", key: "subtitle", type: "multi_line_text_field", value: subtitleFinal });
-      if (formatFinal) fields.push({ namespace: "mfapp", key: "format", type: "single_line_text_field", value: formatFinal });
-      if (levelFinal) fields.push({ namespace: "mfapp", key: "level", type: "single_line_text_field", value: levelFinal });
-
-      if (durationCompatFinal) fields.push({ namespace: "mfapp", key: "duration", type: "single_line_text_field", value: durationCompatFinal });
-      if (durationTextFinal) fields.push({ namespace: "mfapp", key: "duration_text", type: "single_line_text_field", value: durationTextFinal });
-
+      if (levelFinal) {
+        await upsertProductMetafield(created.id, "mfapp", "level", "single_line_text_field", levelFinal);
+      }
       if (language_text && String(language_text).trim()) {
-        fields.push({ namespace: "mfapp", key: "language_text", type: "single_line_text_field", value: cleanStr(language_text, 60) });
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "language_text",
+          "single_line_text_field",
+          cleanStr(language_text, 60)
+        );
       }
 
-      if (certificateTextFinal) fields.push({ namespace: "mfapp", key: "certificate_text", type: "single_line_text_field", value: certificateTextFinal });
-      if (badgeTextFinal) fields.push({ namespace: "mfapp", key: "badge_text", type: "single_line_text_field", value: badgeTextFinal });
-      if (pill1Final) fields.push({ namespace: "mfapp", key: "pill_1", type: "single_line_text_field", value: pill1Final });
-      if (pill2Final) fields.push({ namespace: "mfapp", key: "pill_2", type: "single_line_text_field", value: pill2Final });
+      if (certificateTextFinal) {
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "certificate_text",
+          "single_line_text_field",
+          certificateTextFinal
+        );
+      }
+      if (badgeTextFinal) {
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "badge_text",
+          "single_line_text_field",
+          badgeTextFinal
+        );
+      }
+      if (pill1Final) {
+        await upsertProductMetafield(created.id, "mfapp", "pill_1", "single_line_text_field", pill1Final);
+      }
+      if (pill2Final) {
+        await upsertProductMetafield(created.id, "mfapp", "pill_2", "single_line_text_field", pill2Final);
+      }
+      if (quickTitleFinal) {
+        await upsertProductMetafield(created.id, "mfapp", "quick_title", "single_line_text_field", quickTitleFinal);
+      }
+      if (quickFormatFinal) {
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "quick_format",
+          "single_line_text_field",
+          quickFormatFinal
+        );
+      }
+      if (quickAccessFinal) {
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "quick_access",
+          "single_line_text_field",
+          quickAccessFinal
+        );
+      }
+      if (quickLevelFinal) {
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "quick_level",
+          "single_line_text_field",
+          quickLevelFinal
+        );
+      }
+      if (includesTitleFinal) {
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "includes_title",
+          "single_line_text_field",
+          includesTitleFinal
+        );
+      }
+      if (footnoteFinal) {
+        await upsertProductMetafield(
+          created.id,
+          "mfapp",
+          "footnote",
+          "multi_line_text_field",
+          footnoteFinal
+        );
+      }
 
-      if (quickTitleFinal) fields.push({ namespace: "mfapp", key: "quick_title", type: "single_line_text_field", value: quickTitleFinal });
-      if (quickFormatFinal) fields.push({ namespace: "mfapp", key: "quick_format", type: "single_line_text_field", value: quickFormatFinal });
-      if (quickAccessFinal) fields.push({ namespace: "mfapp", key: "quick_access", type: "single_line_text_field", value: quickAccessFinal });
-      if (quickLevelFinal) fields.push({ namespace: "mfapp", key: "quick_level", type: "single_line_text_field", value: quickLevelFinal });
+      // ✅ ÉCRITURE JSON même si input venait en string (après conversion)
+      if (learnArr.length) {
+        await upsertProductMetafield(created.id, "mfapp", "learn", "json", JSON.stringify(learnArr));
+      }
+      if (modulesArr.length) {
+        await upsertProductMetafield(created.id, "mfapp", "modules", "json", JSON.stringify(modulesArr));
+      }
+      if (audienceArr.length) {
+        await upsertProductMetafield(created.id, "mfapp", "audience", "json", JSON.stringify(audienceArr));
+      }
+      if (includesArr.length) {
+        await upsertProductMetafield(created.id, "mfapp", "includes", "json", JSON.stringify(includesArr));
+      }
+      if (reqArr.length) {
+        await upsertProductMetafield(created.id, "mfapp", "requirements", "json", JSON.stringify(reqArr));
+      }
 
-      if (includesTitleFinal) fields.push({ namespace: "mfapp", key: "includes_title", type: "single_line_text_field", value: includesTitleFinal });
-      if (footnoteFinal) fields.push({ namespace: "mfapp", key: "footnote", type: "multi_line_text_field", value: footnoteFinal });
-
-      // ---- mfapp: JSON lists (LE point critique)
-      if (learnArr.length) fields.push({ namespace: "mfapp", key: "learn", type: "json", value: JSON.stringify(learnArr) });
-      if (modulesArr.length) fields.push({ namespace: "mfapp", key: "modules", type: "json", value: JSON.stringify(modulesArr) });
-      if (audienceArr.length) fields.push({ namespace: "mfapp", key: "audience", type: "json", value: JSON.stringify(audienceArr) });
-      if (includesArr.length) fields.push({ namespace: "mfapp", key: "includes", type: "json", value: JSON.stringify(includesArr) });
-      if (reqArr.length) fields.push({ namespace: "mfapp", key: "requirements", type: "json", value: JSON.stringify(reqArr) });
-
-      await setProductMetafieldsGQL(productGid, fields);
+      // ✅ debug utile (Vercel logs) — tu peux laisser, c’est safe
+      console.log("[MF] sync arrays sizes:", {
+        learn: learnArr.length,
+        requirements: reqArr.length,
+        audience: audienceArr.length,
+        includes: includesArr.length,
+        modules: modulesArr.length,
+      });
     } catch (e) {
-      console.error("[MF] sync metafields (GQL) error", e);
+      console.error("[MF] sync metafields error", e);
     }
 
     // Prisma (on garde ta logique, sans casser)
