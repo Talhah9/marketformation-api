@@ -14,26 +14,24 @@
 // ✅ LISTING: GraphQL (products + metafields theme + approval_status) en 1 requête
 // ✅ COLLECTIONS: tag Shopify: theme-<handle>, collections = automatiques ("tag contient theme-<handle>")
 //
-// ✅ QUOTAS (règle demandée):
+// ✅ QUOTAS:
 // - Starter = 1 / mois
 // - Creator = 3 / mois
 //
 // ✅ FIX CRITIQUE:
 // - Sans abonnement => bloqué (subscription_required)
-// - Quota appliqué sur créations mensuelles via Redis (fiable même si DRAFT + pending)
+// - Quota appliqué sur créations mensuelles via Redis
 //
 // ✅ ADMIN BYPASS QUOTA:
 // - ENV: MF_ADMIN_EMAILS="ton@email.com,autre@email.com"
 // - Admin reconnu par email (body) OU header x-mf-admin-email
-// - Si admin => quota illimité + bypass quota à la création
 //
 // ✅ FIX CRITIQUE (SYNC LISTES):
-// - learn/requirements/audience/includes peuvent venir en ARRAY OU en STRING (multiline / comma / JSON)
-// - on convertit toujours en tableau => on écrit les metafields JSON => la page produit remonte bien
-//
-// ✅ FIX DEBUG + FIABILITÉ:
-// - log du payload reçu (pour vérifier que le front envoie bien learn/requirements/audience/includes)
-// - "fail-fast" sur l’upsert des metafields critiques (sinon Shopify peut refuser et tu ne le vois pas)
+// - learn/requirements/audience/includes peuvent venir en ARRAY OU en STRING
+// - on convertit toujours en tableau
+// - on essaye d’écrire JSON
+// - si Shopify refuse (type déjà défini en single_line_text_field), fallback en single_line_text_field
+//   en stockant la valeur JSON en string (parse côté Liquid/JS)
 
 import { handleOptions, jsonWithCors } from "@/app/api/_lib/cors";
 import { prisma } from "@/lib/prisma";
@@ -75,11 +73,6 @@ function isAdminEmail(email: string | null | undefined) {
   return !!e && admins.includes(e);
 }
 
-/**
- * Admin reconnu si:
- * - email du body est admin
- * - OU header x-mf-admin-email est admin
- */
 function isAdminRequest(req: Request, emailFromBody?: string | null) {
   if (isAdminEmail(emailFromBody)) return true;
 
@@ -178,14 +171,12 @@ async function resolveEmailByHandle(handle: string): Promise<string> {
   const h = String(handle || "").trim();
   if (!h) return "";
 
-  // 1) trainer-<id> or numeric => direct customer lookup
   const digits = extractDigitsHandle(h);
   if (digits) {
     const email = await resolveEmailByCustomerIdDigits(digits);
     if (email) return email;
   }
 
-  // 2) GraphQL search by metafield mkt.handle OR legacy tag mf_handle:<handle>
   const safe = h.replace(/"/g, '\\"');
   const search = `metafield:mkt.handle:"${safe}" OR tag:"mf_handle:${safe}"`;
 
@@ -233,34 +224,65 @@ async function upsertProductMetafield(
 }
 
 /**
- * ✅ FAIL-FAST helper: si Shopify refuse un metafield, on le voit tout de suite.
- * (sinon tu crois que c’est écrit alors que non)
+ * ✅ Upsert "smart":
+ * - tente d’écrire avec le type voulu
+ * - si Shopify refuse parce que la définition impose un autre type (422),
+ *   fallback en single_line_text_field (en gardant la valeur JSON stringify)
  */
-async function mustUpsertProductMetafield(
+async function upsertProductMetafieldSmart(
   productId: number,
   namespace: string,
   key: string,
-  type: string,
+  preferredType: string,
   value: string
 ) {
-  const r = await upsertProductMetafield(productId, namespace, key, type, value);
-  if (!r.ok) {
-    console.error("[MF] metafield upsert failed:", {
+  const r1 = await upsertProductMetafield(productId, namespace, key, preferredType, value);
+
+  if (r1.ok) return r1;
+
+  // cas exact que tu as : 422 type mismatch
+  const msg = String(r1.text || "");
+  const typeMismatch =
+    r1.status === 422 &&
+    (msg.includes("must be consistent with the definition's type") ||
+      msg.includes("definition's type"));
+
+  if (typeMismatch && preferredType === "json") {
+    // fallback SURTOUT PAS multi_line si Shopify a défini single_line (sinon re-422)
+    const fallbackType = "single_line_text_field";
+    const r2 = await upsertProductMetafield(productId, namespace, key, fallbackType, value);
+
+    if (!r2.ok) {
+      console.error("[MF] metafield fallback upsert failed:", {
+        namespace,
+        key,
+        preferredType,
+        fallbackType,
+        status: r2.status,
+        text: r2.text,
+      });
+      throw new Error(`metafield_upsert_failed:${namespace}.${key}:${r2.status}`);
+    }
+
+    console.warn("[MF] metafield type mismatch => fallback to single_line_text_field:", {
       namespace,
       key,
-      type,
-      status: r.status,
-      text: r.text,
     });
-    throw new Error(`metafield_upsert_failed:${namespace}.${key}:${r.status}`);
+
+    return r2;
   }
-  return r;
+
+  console.error("[MF] metafield upsert failed:", {
+    namespace,
+    key,
+    type: preferredType,
+    status: r1.status,
+    text: r1.text,
+  });
+  throw new Error(`metafield_upsert_failed:${namespace}.${key}:${r1.status}`);
 }
 
 /* ===================== Subscription plan ===================== */
-/**
- * Aligne avec ton /api/subscription qui renvoie planKey: "starter" | "creator"
- */
 async function getPlanFromInternalSubscription(
   req: Request,
   email: string
@@ -292,13 +314,6 @@ function cleanStr(v: any, max = 180) {
   return String(v ?? "").trim().slice(0, max);
 }
 
-/**
- * ✅ IMPORTANT: accepte ARRAY ou STRING
- * - "a\nb\nc" => ["a","b","c"]
- * - "a, b, c" => ["a","b","c"]
- * - '["a","b"]' => ["a","b"]                 ✅
- * - '"[\"a\",\"b\"]"' => ["a","b"]           ✅ (double encodage)
- */
 function cleanListAny(v: any, maxItems = 12, maxLen = 180) {
   if (Array.isArray(v)) {
     return v
@@ -314,7 +329,6 @@ function cleanListAny(v: any, maxItems = 12, maxLen = 180) {
     try {
       const parsed = JSON.parse(s);
       if (Array.isArray(parsed)) return parsed;
-
       if (typeof parsed === "string") {
         const inner = parsed.trim();
         if (!inner || inner === "null" || inner === "undefined") return null;
@@ -525,7 +539,7 @@ export async function GET(req: Request) {
       const published = !!p.publishedAt;
 
       return {
-        id: gid, // BIGINT safe
+        id: gid,
         title: p.title || "",
         coverUrl: p?.featuredImage?.url || "",
         image_url: p?.featuredImage?.url || "",
@@ -546,7 +560,6 @@ export async function GET(req: Request) {
       ? itemsRaw.filter((x: any) => !!x.published && x.approval_status === "approved")
       : itemsRaw;
 
-    // Quota info (uniquement privé)
     let plan: "Starter" | "Creator" | "Unknown" = "Unknown";
     let quota: any = null;
 
@@ -597,14 +610,12 @@ export async function POST(req: Request) {
       pdfUrl: pdfUrlRaw,
       pdf_url,
 
-      // status ignoré (publish gate)
       status: _statusIgnored,
 
-      // thématique
       theme,
       themeHandle,
       mf_theme,
-      collectionHandle, // legacy
+      collectionHandle,
       collectionHandleOrId,
       collectionId,
 
@@ -619,12 +630,11 @@ export async function POST(req: Request) {
       language_text,
       requirements,
 
-      // ✅ bonus compat
       includes,
       includes_text,
     } = body || {};
 
-    // ✅ DEBUG: voir ce que le backend reçoit vraiment (safe)
+    // DEBUG: prouver ce que le front envoie
     console.log("[MF] /api/courses payload keys:", Object.keys(body || {}));
     console.log("[MF] /api/courses payload raw lists:", {
       learn: (body as any)?.learn,
@@ -641,8 +651,6 @@ export async function POST(req: Request) {
 
     const pdfUrl = String(pdfUrlRaw || pdf_url || "").trim();
 
-    // ✅ si ton flow est vidéo et pas PDF, tu adapteras plus tard.
-    // Ici on garde ta règle actuelle pour ne rien casser.
     if (!email || !title || !imageUrl || !pdfUrl) {
       return jsonWithCors(req, { ok: false, error: "missing fields" }, { status: 400 });
     }
@@ -651,11 +659,9 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: "pdfUrl must be https URL" }, { status: 400 });
     }
 
-    // ✅ bypass admin auto (email body OU header) + bypass param manuel
     const admin = isAdminRequest(req, email);
     const bypass = bypassParam || admin;
 
-    // ✅ Abonnement requis (sauf admin/bypass)
     const plan = await getPlanFromInternalSubscription(req, email);
     if (!bypass && plan === "Unknown") {
       return jsonWithCors(
@@ -669,7 +675,6 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ Quota (Starter=1, Creator=3) basé sur créations du mois via Redis
     const ownerId = ownerIdForQuota({
       email: String(email),
       shopifyCustomerIdRaw: shopifyCustomerId ? String(shopifyCustomerId) : "",
@@ -700,7 +705,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // normaliser prix Shopify (string "12.34")
+    // normaliser prix Shopify
     let priceStr = "";
     if (price !== undefined && price !== null && String(price).trim() !== "") {
       const n = Number(price);
@@ -708,7 +713,6 @@ export async function POST(req: Request) {
       else priceStr = String(price).trim();
     }
 
-    // ✅ thème final (source de vérité = handle-like)
     const themeHandleFinal =
       normalizeThemeHandle(mf_theme) ||
       normalizeThemeHandle(themeHandle) ||
@@ -719,10 +723,8 @@ export async function POST(req: Request) {
 
     const themeTag = buildThemeTag(themeHandleFinal);
 
-    // ✅ Publish gate: toujours draft à la création
     const finalStatus: "draft" = "draft";
 
-    /* Création produit */
     const productPayload = {
       product: {
         title,
@@ -731,7 +733,7 @@ export async function POST(req: Request) {
         images: imageUrl ? [{ src: String(imageUrl) }] : [],
         tags: uniqTags([
           "mkt-course",
-          themeTag, // ✅ clé Shopify collections
+          themeTag,
           themeHandleFinal ? `mf_theme:${themeHandleFinal}` : "",
         ]),
         status: finalStatus,
@@ -759,47 +761,26 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: "create_failed_no_id" }, { status: 500 });
     }
 
-    /* Métachamps mkt */
+    // mkt
     await upsertProductMetafield(created.id, "mkt", "owner_email", "single_line_text_field", email);
     if (shopifyCustomerId) {
-      await upsertProductMetafield(
-        created.id,
-        "mkt",
-        "owner_id",
-        "single_line_text_field",
-        String(shopifyCustomerId)
-      );
+      await upsertProductMetafield(created.id, "mkt", "owner_id", "single_line_text_field", String(shopifyCustomerId));
     }
     await upsertProductMetafield(created.id, "mkt", "pdf_url", "url", pdfUrl);
 
-    // ✅ statut validation admin par défaut
-    await upsertProductMetafield(
-      created.id,
-      "mfapp",
-      "approval_status",
-      "single_line_text_field",
-      "pending"
-    );
-
-    // ✅ thème aussi en metafield
+    // approval + theme
+    await upsertProductMetafield(created.id, "mfapp", "approval_status", "single_line_text_field", "pending");
     if (themeHandleFinal) {
-      await upsertProductMetafield(
-        created.id,
-        "mfapp",
-        "theme",
-        "single_line_text_field",
-        themeHandleFinal
-      );
+      await upsertProductMetafield(created.id, "mfapp", "theme", "single_line_text_field", themeHandleFinal);
     }
 
-    // ✅ SYNC CRITIQUE image/pdf
+    // image/pdf
     await upsertProductMetafield(created.id, "mfapp", "image_url", "url", String(imageUrl).trim());
     await upsertProductMetafield(created.id, "mfapp", "pdf_url", "url", String(pdfUrl).trim());
-    // compat ancienne camelCase
     await upsertProductMetafield(created.id, "mfapp", "imageUrl", "url", String(imageUrl).trim());
     await upsertProductMetafield(created.id, "mfapp", "pdfUrl", "url", String(pdfUrl).trim());
 
-    // ✅ Synchro fiche produit (Udemy-like) — FIX LISTES + FAIL-FAST
+    // ✅ Sync fiche produit (Udemy-like)
     try {
       const mf = mfapp && typeof mfapp === "object" ? mfapp : {};
 
@@ -827,7 +808,6 @@ export async function POST(req: Request) {
       const includesTitleFinal = cleanStr((mf as any).includes_title ?? "", 160);
       const footnoteFinal = cleanStr((mf as any).footnote ?? "", 300);
 
-      // ✅ LISTES: acceptent string OU array (top-level ou mfapp.*)
       const learnArr = cleanListAny((mf as any).learn ?? learn, 12, 160);
       const audienceArr = cleanListAny((mf as any).audience ?? audience, 12, 160);
       const includesArr = cleanListAny(
@@ -836,7 +816,6 @@ export async function POST(req: Request) {
         160
       );
       const reqArr = cleanListAny((mf as any).requirements ?? requirements, 10, 160);
-
       const modulesArr = cleanModules((mf as any).modules ?? modules, 30);
 
       console.log("[MF] will write lists sizes:", {
@@ -848,43 +827,17 @@ export async function POST(req: Request) {
       });
 
       if (subtitleFinal) {
-        await upsertProductMetafield(
-          created.id,
-          "mfapp",
-          "subtitle",
-          "multi_line_text_field",
-          subtitleFinal
-        );
+        await upsertProductMetafield(created.id, "mfapp", "subtitle", "multi_line_text_field", subtitleFinal);
       }
       if (formatFinal) {
-        await upsertProductMetafield(
-          created.id,
-          "mfapp",
-          "format",
-          "single_line_text_field",
-          formatFinal
-        );
+        await upsertProductMetafield(created.id, "mfapp", "format", "single_line_text_field", formatFinal);
       }
-
       if (durationCompatFinal) {
-        await upsertProductMetafield(
-          created.id,
-          "mfapp",
-          "duration",
-          "single_line_text_field",
-          durationCompatFinal
-        );
+        await upsertProductMetafield(created.id, "mfapp", "duration", "single_line_text_field", durationCompatFinal);
       }
       if (durationTextFinal) {
-        await upsertProductMetafield(
-          created.id,
-          "mfapp",
-          "duration_text",
-          "single_line_text_field",
-          durationTextFinal
-        );
+        await upsertProductMetafield(created.id, "mfapp", "duration_text", "single_line_text_field", durationTextFinal);
       }
-
       if (levelFinal) {
         await upsertProductMetafield(created.id, "mfapp", "level", "single_line_text_field", levelFinal);
       }
@@ -897,24 +850,11 @@ export async function POST(req: Request) {
           cleanStr(language_text, 60)
         );
       }
-
       if (certificateTextFinal) {
-        await upsertProductMetafield(
-          created.id,
-          "mfapp",
-          "certificate_text",
-          "single_line_text_field",
-          certificateTextFinal
-        );
+        await upsertProductMetafield(created.id, "mfapp", "certificate_text", "single_line_text_field", certificateTextFinal);
       }
       if (badgeTextFinal) {
-        await upsertProductMetafield(
-          created.id,
-          "mfapp",
-          "badge_text",
-          "single_line_text_field",
-          badgeTextFinal
-        );
+        await upsertProductMetafield(created.id, "mfapp", "badge_text", "single_line_text_field", badgeTextFinal);
       }
       if (pill1Final) {
         await upsertProductMetafield(created.id, "mfapp", "pill_1", "single_line_text_field", pill1Final);
@@ -923,75 +863,31 @@ export async function POST(req: Request) {
         await upsertProductMetafield(created.id, "mfapp", "pill_2", "single_line_text_field", pill2Final);
       }
       if (quickTitleFinal) {
-        await upsertProductMetafield(
-          created.id,
-          "mfapp",
-          "quick_title",
-          "single_line_text_field",
-          quickTitleFinal
-        );
+        await upsertProductMetafield(created.id, "mfapp", "quick_title", "single_line_text_field", quickTitleFinal);
       }
       if (quickFormatFinal) {
-        await upsertProductMetafield(
-          created.id,
-          "mfapp",
-          "quick_format",
-          "single_line_text_field",
-          quickFormatFinal
-        );
+        await upsertProductMetafield(created.id, "mfapp", "quick_format", "single_line_text_field", quickFormatFinal);
       }
       if (quickAccessFinal) {
-        await upsertProductMetafield(
-          created.id,
-          "mfapp",
-          "quick_access",
-          "single_line_text_field",
-          quickAccessFinal
-        );
+        await upsertProductMetafield(created.id, "mfapp", "quick_access", "single_line_text_field", quickAccessFinal);
       }
       if (quickLevelFinal) {
-        await upsertProductMetafield(
-          created.id,
-          "mfapp",
-          "quick_level",
-          "single_line_text_field",
-          quickLevelFinal
-        );
+        await upsertProductMetafield(created.id, "mfapp", "quick_level", "single_line_text_field", quickLevelFinal);
       }
       if (includesTitleFinal) {
-        await upsertProductMetafield(
-          created.id,
-          "mfapp",
-          "includes_title",
-          "single_line_text_field",
-          includesTitleFinal
-        );
+        await upsertProductMetafield(created.id, "mfapp", "includes_title", "single_line_text_field", includesTitleFinal);
       }
       if (footnoteFinal) {
-        await upsertProductMetafield(
-          created.id,
-          "mfapp",
-          "footnote",
-          "multi_line_text_field",
-          footnoteFinal
-        );
+        await upsertProductMetafield(created.id, "mfapp", "footnote", "multi_line_text_field", footnoteFinal);
       }
 
-      // ✅ IMPORTANT: on écrit toujours les JSON (même vides) + FAIL-FAST
-      await mustUpsertProductMetafield(created.id, "mfapp", "learn", "json", JSON.stringify(learnArr));
-      await mustUpsertProductMetafield(created.id, "mfapp", "audience", "json", JSON.stringify(audienceArr));
-      await mustUpsertProductMetafield(created.id, "mfapp", "includes", "json", JSON.stringify(includesArr));
-      await mustUpsertProductMetafield(created.id, "mfapp", "requirements", "json", JSON.stringify(reqArr));
-      await mustUpsertProductMetafield(created.id, "mfapp", "modules", "json", JSON.stringify(modulesArr));
+      // ✅ ÉCRITURE "SMART": JSON si possible, sinon fallback single_line_text_field (JSON string)
+      await upsertProductMetafieldSmart(created.id, "mfapp", "learn", "json", JSON.stringify(learnArr));
+      await upsertProductMetafieldSmart(created.id, "mfapp", "requirements", "json", JSON.stringify(reqArr));
+      await upsertProductMetafieldSmart(created.id, "mfapp", "audience", "json", JSON.stringify(audienceArr));
+      await upsertProductMetafieldSmart(created.id, "mfapp", "includes", "json", JSON.stringify(includesArr));
+      await upsertProductMetafieldSmart(created.id, "mfapp", "modules", "json", JSON.stringify(modulesArr));
 
-      // ✅ debug utile (Vercel logs)
-      console.log("[MF] sync arrays sizes:", {
-        learn: learnArr.length,
-        requirements: reqArr.length,
-        audience: audienceArr.length,
-        includes: includesArr.length,
-        modules: modulesArr.length,
-      });
       console.log("[MF] parsed lists preview:", {
         learnArr: learnArr.slice(0, 3),
         reqArr: reqArr.slice(0, 3),
@@ -1000,12 +896,10 @@ export async function POST(req: Request) {
       });
     } catch (e) {
       console.error("[MF] sync metafields error", e);
-      // 👉 on laisse passer pour ne pas casser la création produit,
-      // MAIS si un metafield critique échoue, mustUpsert throw et tu le verras dans la réponse
-      // (et donc tu pourras corriger sans tourner en rond)
+      // on ne bloque pas la création produit, mais tu vois l’erreur dans les logs
     }
 
-    // Prisma (on garde ta logique, sans casser)
+    // Prisma (sans casser)
     try {
       const shopifyProductId = String(created.id);
       const shopifyProductHandle = created.handle || null;
@@ -1051,7 +945,7 @@ export async function POST(req: Request) {
       console.error("[MF] prisma.course upsert error", e);
     }
 
-    // ✅ Incr quota (créations du mois) après succès Shopify+metafields
+    // quota incr
     try {
       if (!bypass && quotaInfo?.key) {
         const redis = getRedis();
