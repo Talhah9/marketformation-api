@@ -590,6 +590,22 @@ export async function POST(req: Request) {
       includes_text,
     } = body || {};
 
+    // ✅ DEBUG: voir ce que le backend reçoit vraiment (safe)
+console.log("[MF] /api/courses payload keys:", Object.keys(body || {}));
+console.log("[MF] /api/courses payload raw lists:", {
+  learn: (body as any)?.learn,
+  requirements: (body as any)?.requirements,
+  audience: (body as any)?.audience,
+  includes: (body as any)?.includes,
+  includes_text: (body as any)?.includes_text,
+  mfapp_keys: (body as any)?.mfapp ? Object.keys((body as any).mfapp) : [],
+  mfapp_learn: (body as any)?.mfapp?.learn,
+  mfapp_requirements: (body as any)?.mfapp?.requirements,
+  mfapp_audience: (body as any)?.mfapp?.audience,
+  mfapp_includes: (body as any)?.mfapp?.includes,
+});
+
+
     const pdfUrl = String(pdfUrlRaw || pdf_url || "").trim();
 
     if (!email || !title || !imageUrl || !pdfUrl) {
