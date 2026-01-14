@@ -28,7 +28,7 @@
 // - Si admin => quota illimité + bypass quota à la création
 //
 // ✅ FIX CRITIQUE (SYNC LISTES):
-// - learn/requirements/audience/includes peuvent venir en ARRAY OU en STRING (multiline / comma)
+// - learn/requirements/audience/includes peuvent venir en ARRAY OU en STRING (multiline / comma / JSON)
 // - on convertit toujours en tableau => on écrit les metafields JSON => la page produit remonte bien
 
 import { handleOptions, jsonWithCors } from "@/app/api/_lib/cors";
@@ -267,6 +267,8 @@ function cleanStr(v: any, max = 180) {
  * ✅ IMPORTANT: accepte ARRAY ou STRING
  * - "a\nb\nc" => ["a","b","c"]
  * - "a, b, c" => ["a","b","c"]
+ * - '["a","b"]' => ["a","b"]                 ✅
+ * - '"[\"a\",\"b\"]"' => ["a","b"]           ✅ (double encodage)
  */
 function cleanListAny(v: any, maxItems = 12, maxLen = 180) {
   if (Array.isArray(v)) {
@@ -276,14 +278,36 @@ function cleanListAny(v: any, maxItems = 12, maxLen = 180) {
       .slice(0, maxItems);
   }
 
-  const s = String(v ?? "").trim();
-  if (!s || s === "null" || s === "undefined") return [];
+  const s0 = String(v ?? "").trim();
+  if (!s0 || s0 === "null" || s0 === "undefined") return [];
 
-  const parts = s.includes("\n")
-    ? s.split("\n")
-    : s.includes(",")
-    ? s.split(",")
-    : [s];
+  const tryJsonToArray = (s: string): any[] | null => {
+    try {
+      const parsed = JSON.parse(s);
+      if (Array.isArray(parsed)) return parsed;
+      if (typeof parsed === "string") {
+        const inner = parsed.trim();
+        if (!inner || inner === "null" || inner === "undefined") return null;
+        const parsed2 = JSON.parse(inner);
+        if (Array.isArray(parsed2)) return parsed2;
+      }
+    } catch {}
+    return null;
+  };
+
+  const parsedArr = tryJsonToArray(s0);
+  if (parsedArr) {
+    return parsedArr
+      .map((x) => cleanStr(x, maxLen))
+      .filter(Boolean)
+      .slice(0, maxItems);
+  }
+
+  const parts = s0.includes("\n")
+    ? s0.split("\n")
+    : s0.includes(",")
+    ? s0.split(",")
+    : [s0];
 
   return parts
     .map((x) => cleanStr(x, maxLen))
@@ -346,15 +370,12 @@ function ownerIdForQuota(params: {
   shopifyCustomerIdRaw?: string;
   handle?: string;
 }) {
-  // On privilégie Shopify Customer ID (stable)
   const idDigits = String(params.shopifyCustomerIdRaw || "").trim();
   if (idDigits && /^\d+$/.test(idDigits)) return `trainer-${idDigits}`;
 
-  // fallback: u=trainer-<digits> ou u=<digits>
   const digitsFromHandle = extractDigitsHandle(String(params.handle || ""));
   if (digitsFromHandle) return `trainer-${digitsFromHandle}`;
 
-  // fallback email (stable si bien normalisé)
   return `email:${normalizeEmail(params.email)}`;
 }
 
@@ -474,7 +495,7 @@ export async function GET(req: Request) {
       const published = !!p.publishedAt;
 
       return {
-        id: gid, // BIGINT safe
+        id: gid,
         title: p.title || "",
         coverUrl: p?.featuredImage?.url || "",
         image_url: p?.featuredImage?.url || "",
@@ -495,7 +516,6 @@ export async function GET(req: Request) {
       ? itemsRaw.filter((x: any) => !!x.published && x.approval_status === "approved")
       : itemsRaw;
 
-    // Quota info (uniquement privé)
     let plan: "Starter" | "Creator" | "Unknown" = "Unknown";
     let quota: any = null;
 
@@ -503,12 +523,11 @@ export async function GET(req: Request) {
       const admin = isAdminRequest(req, email);
 
       if (admin) {
-        plan = "Creator"; // pour l'UI, mais admin=true
+        plan = "Creator";
         quota = { plan: "Admin", limit: null, used: null, remaining: null, admin: true };
       } else {
         plan = await getPlanFromInternalSubscription(req, email);
 
-        // ✅ Quota aligné sur le vrai blocage (Redis, créations du mois)
         const ownerId = ownerIdForQuota({ email, shopifyCustomerIdRaw, handle });
         quota = await getQuotaFromRedis({ plan, ownerId });
       }
@@ -547,14 +566,12 @@ export async function POST(req: Request) {
       pdfUrl: pdfUrlRaw,
       pdf_url,
 
-      // status ignoré (publish gate)
       status: _statusIgnored,
 
-      // thématique
       theme,
       themeHandle,
       mf_theme,
-      collectionHandle, // legacy
+      collectionHandle,
       collectionHandleOrId,
       collectionId,
 
@@ -569,15 +586,12 @@ export async function POST(req: Request) {
       language_text,
       requirements,
 
-      // ✅ bonus compat: certains fronts envoient includes au top-level
       includes,
       includes_text,
     } = body || {};
 
     const pdfUrl = String(pdfUrlRaw || pdf_url || "").trim();
 
-    // ✅ si ton flow est vidéo et pas PDF, tu adapteras plus tard.
-    // Ici on garde ta règle actuelle pour ne rien casser.
     if (!email || !title || !imageUrl || !pdfUrl) {
       return jsonWithCors(req, { ok: false, error: "missing fields" }, { status: 400 });
     }
@@ -586,11 +600,9 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: "pdfUrl must be https URL" }, { status: 400 });
     }
 
-    // ✅ bypass admin auto (email body OU header) + bypass param manuel
     const admin = isAdminRequest(req, email);
     const bypass = bypassParam || admin;
 
-    // ✅ Abonnement requis (sauf admin/bypass)
     const plan = await getPlanFromInternalSubscription(req, email);
     if (!bypass && plan === "Unknown") {
       return jsonWithCors(
@@ -604,7 +616,6 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ Quota (Starter=1, Creator=3) basé sur créations du mois via Redis
     const ownerId = ownerIdForQuota({
       email: String(email),
       shopifyCustomerIdRaw: shopifyCustomerId ? String(shopifyCustomerId) : "",
@@ -635,7 +646,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // normaliser prix Shopify (string "12.34")
+    // normaliser prix Shopify
     let priceStr = "";
     if (price !== undefined && price !== null && String(price).trim() !== "") {
       const n = Number(price);
@@ -643,7 +654,6 @@ export async function POST(req: Request) {
       else priceStr = String(price).trim();
     }
 
-    // ✅ thème final (source de vérité = handle-like)
     const themeHandleFinal =
       normalizeThemeHandle(mf_theme) ||
       normalizeThemeHandle(themeHandle) ||
@@ -653,11 +663,8 @@ export async function POST(req: Request) {
       normalizeThemeHandle(collectionId);
 
     const themeTag = buildThemeTag(themeHandleFinal);
-
-    // ✅ Publish gate: toujours draft à la création
     const finalStatus: "draft" = "draft";
 
-    /* Création produit */
     const productPayload = {
       product: {
         title,
@@ -666,7 +673,7 @@ export async function POST(req: Request) {
         images: imageUrl ? [{ src: String(imageUrl) }] : [],
         tags: uniqTags([
           "mkt-course",
-          themeTag, // ✅ clé Shopify collections
+          themeTag,
           themeHandleFinal ? `mf_theme:${themeHandleFinal}` : "",
         ]),
         status: finalStatus,
@@ -694,7 +701,6 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: "create_failed_no_id" }, { status: 500 });
     }
 
-    /* Métachamps mkt */
     await upsertProductMetafield(created.id, "mkt", "owner_email", "single_line_text_field", email);
     if (shopifyCustomerId) {
       await upsertProductMetafield(
@@ -707,7 +713,6 @@ export async function POST(req: Request) {
     }
     await upsertProductMetafield(created.id, "mkt", "pdf_url", "url", pdfUrl);
 
-    // ✅ statut validation admin par défaut
     await upsertProductMetafield(
       created.id,
       "mfapp",
@@ -716,7 +721,6 @@ export async function POST(req: Request) {
       "pending"
     );
 
-    // ✅ thème aussi en metafield
     if (themeHandleFinal) {
       await upsertProductMetafield(
         created.id,
@@ -727,14 +731,12 @@ export async function POST(req: Request) {
       );
     }
 
-    // ✅ SYNC CRITIQUE image/pdf
     await upsertProductMetafield(created.id, "mfapp", "image_url", "url", String(imageUrl).trim());
     await upsertProductMetafield(created.id, "mfapp", "pdf_url", "url", String(pdfUrl).trim());
-    // compat ancienne camelCase
     await upsertProductMetafield(created.id, "mfapp", "imageUrl", "url", String(imageUrl).trim());
     await upsertProductMetafield(created.id, "mfapp", "pdfUrl", "url", String(pdfUrl).trim());
 
-    // ✅ Synchro fiche produit (Udemy-like) — FIX LISTES
+    // ✅ Sync fiche produit (Udemy-like)
     try {
       const mf = mfapp && typeof mfapp === "object" ? mfapp : {};
 
@@ -762,7 +764,6 @@ export async function POST(req: Request) {
       const includesTitleFinal = cleanStr((mf as any).includes_title ?? "", 160);
       const footnoteFinal = cleanStr((mf as any).footnote ?? "", 300);
 
-      // ✅ LISTES: acceptent string OU array (top-level ou mfapp.*)
       const learnArr = cleanListAny((mf as any).learn ?? learn, 12, 160);
       const audienceArr = cleanListAny((mf as any).audience ?? audience, 12, 160);
       const includesArr = cleanListAny(
@@ -771,7 +772,6 @@ export async function POST(req: Request) {
         160
       );
       const reqArr = cleanListAny((mf as any).requirements ?? requirements, 10, 160);
-
       const modulesArr = cleanModules((mf as any).modules ?? modules, 30);
 
       if (subtitleFinal) {
@@ -786,7 +786,6 @@ export async function POST(req: Request) {
       if (formatFinal) {
         await upsertProductMetafield(created.id, "mfapp", "format", "single_line_text_field", formatFinal);
       }
-
       if (durationCompatFinal) {
         await upsertProductMetafield(created.id, "mfapp", "duration", "single_line_text_field", durationCompatFinal);
       }
@@ -799,7 +798,6 @@ export async function POST(req: Request) {
           durationTextFinal
         );
       }
-
       if (levelFinal) {
         await upsertProductMetafield(created.id, "mfapp", "level", "single_line_text_field", levelFinal);
       }
@@ -812,7 +810,6 @@ export async function POST(req: Request) {
           cleanStr(language_text, 60)
         );
       }
-
       if (certificateTextFinal) {
         await upsertProductMetafield(
           created.id,
@@ -823,13 +820,7 @@ export async function POST(req: Request) {
         );
       }
       if (badgeTextFinal) {
-        await upsertProductMetafield(
-          created.id,
-          "mfapp",
-          "badge_text",
-          "single_line_text_field",
-          badgeTextFinal
-        );
+        await upsertProductMetafield(created.id, "mfapp", "badge_text", "single_line_text_field", badgeTextFinal);
       }
       if (pill1Final) {
         await upsertProductMetafield(created.id, "mfapp", "pill_1", "single_line_text_field", pill1Final);
@@ -841,31 +832,13 @@ export async function POST(req: Request) {
         await upsertProductMetafield(created.id, "mfapp", "quick_title", "single_line_text_field", quickTitleFinal);
       }
       if (quickFormatFinal) {
-        await upsertProductMetafield(
-          created.id,
-          "mfapp",
-          "quick_format",
-          "single_line_text_field",
-          quickFormatFinal
-        );
+        await upsertProductMetafield(created.id, "mfapp", "quick_format", "single_line_text_field", quickFormatFinal);
       }
       if (quickAccessFinal) {
-        await upsertProductMetafield(
-          created.id,
-          "mfapp",
-          "quick_access",
-          "single_line_text_field",
-          quickAccessFinal
-        );
+        await upsertProductMetafield(created.id, "mfapp", "quick_access", "single_line_text_field", quickAccessFinal);
       }
       if (quickLevelFinal) {
-        await upsertProductMetafield(
-          created.id,
-          "mfapp",
-          "quick_level",
-          "single_line_text_field",
-          quickLevelFinal
-        );
+        await upsertProductMetafield(created.id, "mfapp", "quick_level", "single_line_text_field", quickLevelFinal);
       }
       if (includesTitleFinal) {
         await upsertProductMetafield(
@@ -877,33 +850,16 @@ export async function POST(req: Request) {
         );
       }
       if (footnoteFinal) {
-        await upsertProductMetafield(
-          created.id,
-          "mfapp",
-          "footnote",
-          "multi_line_text_field",
-          footnoteFinal
-        );
+        await upsertProductMetafield(created.id, "mfapp", "footnote", "multi_line_text_field", footnoteFinal);
       }
 
-      // ✅ ÉCRITURE JSON même si input venait en string (après conversion)
-      if (learnArr.length) {
-        await upsertProductMetafield(created.id, "mfapp", "learn", "json", JSON.stringify(learnArr));
-      }
-      if (modulesArr.length) {
-        await upsertProductMetafield(created.id, "mfapp", "modules", "json", JSON.stringify(modulesArr));
-      }
-      if (audienceArr.length) {
-        await upsertProductMetafield(created.id, "mfapp", "audience", "json", JSON.stringify(audienceArr));
-      }
-      if (includesArr.length) {
-        await upsertProductMetafield(created.id, "mfapp", "includes", "json", JSON.stringify(includesArr));
-      }
-      if (reqArr.length) {
-        await upsertProductMetafield(created.id, "mfapp", "requirements", "json", JSON.stringify(reqArr));
-      }
+      // ✅ IMPORTANT: on écrit toujours les JSON, même vides (stabilité + debug)
+      await upsertProductMetafield(created.id, "mfapp", "learn", "json", JSON.stringify(learnArr));
+      await upsertProductMetafield(created.id, "mfapp", "audience", "json", JSON.stringify(audienceArr));
+      await upsertProductMetafield(created.id, "mfapp", "includes", "json", JSON.stringify(includesArr));
+      await upsertProductMetafield(created.id, "mfapp", "requirements", "json", JSON.stringify(reqArr));
+      await upsertProductMetafield(created.id, "mfapp", "modules", "json", JSON.stringify(modulesArr));
 
-      // ✅ debug utile (Vercel logs) — tu peux laisser, c’est safe
       console.log("[MF] sync arrays sizes:", {
         learn: learnArr.length,
         requirements: reqArr.length,
@@ -915,7 +871,7 @@ export async function POST(req: Request) {
       console.error("[MF] sync metafields error", e);
     }
 
-    // Prisma (on garde ta logique, sans casser)
+    // Prisma (sans casser)
     try {
       const shopifyProductId = String(created.id);
       const shopifyProductHandle = created.handle || null;
@@ -923,7 +879,6 @@ export async function POST(req: Request) {
 
       const mfThemeKey = themeHandleFinal || "";
       const categoryLabel = mfThemeKey && THEME_LABELS[mfThemeKey] ? THEME_LABELS[mfThemeKey] : null;
-
       const accessUrl = shopifyProductHandle ? `/products/${shopifyProductHandle}` : "";
 
       const mf = mfapp && typeof mfapp === "object" ? mfapp : {};
@@ -961,7 +916,7 @@ export async function POST(req: Request) {
       console.error("[MF] prisma.course upsert error", e);
     }
 
-    // ✅ Incr quota (créations du mois) après succès Shopify+metafields
+    // quota incr
     try {
       if (!bypass && quotaInfo?.key) {
         const redis = getRedis();
