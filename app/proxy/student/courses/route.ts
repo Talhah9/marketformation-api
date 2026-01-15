@@ -3,6 +3,7 @@
 // ✅ Vérifie signature App Proxy
 // ✅ Réutilise la même logique que app/api/student/courses (Prisma)
 // ✅ Retourne items compatibles UI (cards + modal)
+// ✅ PDF SECURE: renvoie viewUrl = /apps/mf/content/pdf?courseId=... (stream contrôlé)
 
 import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
@@ -40,6 +41,7 @@ function verifyAppProxySignature(req: NextRequest) {
     .update(message)
     .digest("hex");
 
+  // ✅ timingSafeEqual sur Uint8Array (évite l'erreur Buffer/ArrayBufferView)
   const a = Uint8Array.from(Buffer.from(computed, "utf8"));
   const b = Uint8Array.from(Buffer.from(signature, "utf8"));
   const match = a.length === b.length && crypto.timingSafeEqual(a, b);
@@ -80,7 +82,7 @@ export async function GET(req: NextRequest) {
 
     const { searchParams } = new URL(req.url);
 
-    const email = (searchParams.get("email") || "").trim() || null;
+    const email = (searchParams.get("email") || "").trim().toLowerCase() || null;
     const customerId = (searchParams.get("shopifyCustomerId") || "").trim() || null;
 
     // même règle que ta route API
@@ -121,13 +123,8 @@ export async function GET(req: NextRequest) {
       const purchaseISO = sc?.purchaseDate ?? null;
       const lastAccessISO = sc?.lastAccessAt ?? sc?.last_access_at ?? null;
 
-      const purchasedAt = purchaseISO
-        ? new Date(purchaseISO).toLocaleDateString("fr-FR")
-        : "—";
-
-      const lastActivity = lastAccessISO
-        ? new Date(lastAccessISO).toLocaleDateString("fr-FR")
-        : "—";
+      const purchasedAt = purchaseISO ? new Date(purchaseISO).toLocaleDateString("fr-FR") : "—";
+      const lastActivity = lastAccessISO ? new Date(lastAccessISO).toLocaleDateString("fr-FR") : "—";
 
       // Progression (si tu l’as dans DB plus tard, remplace ici)
       const progressPct =
@@ -138,13 +135,10 @@ export async function GET(req: NextRequest) {
       // Accès contenu (page interne / route)
       const accessUrl = sc?.course?.accessUrl ?? sc?.course?.access_url ?? null;
 
-      // ✅ IMPORTANT: URL PDF réelle stockée en DB (Prisma Course.pdfUrl)
-      const pdfUrl = sc?.course?.pdfUrl ?? sc?.course?.pdf_url ?? null;
-
       // IMPORTANT: on garde aussi ton format ancien (compat)
       const base: any = {
-        id: sc?.course?.id, // ton id interne
-        product_id, // ✅ pour /apps/mf/download si tu utilises encore
+        id: sc?.course?.id, // ✅ id interne Course (sert pour content/pdf)
+        product_id, // ✅ pour compat si tu en as besoin ailleurs
         title,
         subtitle,
         category_label: sc?.course?.categoryLabel ?? "",
@@ -155,12 +149,12 @@ export async function GET(req: NextRequest) {
         purchase_date: purchaseISO,
         last_access_at: lastAccessISO,
 
-        // on garde access_url pour compat
+        // compat ancien
         access_url: accessUrl,
 
         cta_label: type === "video" ? "Commencer la formation" : "Lire la formation",
 
-        // ✅ champs attendus par la nouvelle UI
+        // champs attendus par la nouvelle UI
         type,
         cover,
         purchasedAt,
@@ -169,14 +163,17 @@ export async function GET(req: NextRequest) {
       };
 
       if (type === "pdf") {
-        // ✅ FIX: on privilégie le vrai PDF (pdfUrl). accessUrl en fallback.
-        const viewUrl = (pdfUrl || accessUrl || "");
+        // ✅ PDF sécurisé (stream via App Proxy)
+        // Le front ajoutera email + shopifyCustomerId via withUserQuery()
+        const courseId = String(sc?.course?.id || "");
+        const viewUrl = courseId
+          ? `/apps/mf/content/pdf?courseId=${encodeURIComponent(courseId)}`
+          : "";
 
         base.pdf = {
           pages: sc?.course?.pdfPages ?? "—",
           viewUrl,
-          // optionnel mais pratique côté UI (download button)
-          downloadUrl: viewUrl,
+          downloadUrl: viewUrl ? viewUrl + "&download=1" : "",
         };
       } else {
         base.video = {
