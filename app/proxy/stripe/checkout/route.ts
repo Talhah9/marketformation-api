@@ -41,6 +41,7 @@ function ensureProxy(req: NextRequest) {
 }
 
 function buildReturnUrls(returnUrl: string) {
+  // returnUrl = page produit
   const success = new URL(returnUrl);
   success.searchParams.set("paid", "1");
 
@@ -50,7 +51,13 @@ function buildReturnUrls(returnUrl: string) {
   return { success: success.toString(), cancel: cancel.toString() };
 }
 
-async function createCheckoutFromVariant(variantIdRaw: string, quantity: number, returnUrl: string) {
+async function createCheckoutOrFreeRedirect(opts: {
+  variantIdRaw: string;
+  quantity: number;
+  returnUrl: string;
+}) {
+  const { variantIdRaw, quantity, returnUrl } = opts;
+
   const gid = variantIdRaw.startsWith("gid://")
     ? variantIdRaw
     : `gid://shopify/ProductVariant/${variantIdRaw}`;
@@ -71,19 +78,31 @@ async function createCheckoutFromVariant(variantIdRaw: string, quantity: number,
   );
 
   const v = data?.productVariant;
-  if (!v?.price) {
+  if (!v?.price && v?.price !== "0.00") {
     return NextResponse.json({ ok: false, error: "variant_not_found_or_no_price" }, { status: 404 });
   }
 
   const currency = String(data?.shop?.currencyCode || "EUR").toLowerCase();
   const unit_amount = toCents(v.price);
 
-  if (!unit_amount || unit_amount < 50) {
+  // ✅ GRATUIT (0€) -> pas Stripe -> on "valide" et on renvoie vers la page produit
+  // (Important: pour un vrai accès sécurisé, tu dois enregistrer l’accès côté DB.
+  // Ici on fait volontairement minimal pour ne rien casser.)
+  if (unit_amount === 0) {
+    const { success } = buildReturnUrls(returnUrl);
+    const successUrl = new URL(success);
+    successUrl.searchParams.set("free", "1");
+    successUrl.searchParams.set("variant", String(variantIdRaw));
+    return NextResponse.redirect(successUrl.toString(), 303);
+  }
+
+  // ✅ Stripe refuse les montants trop faibles (ex: < 0,50€)
+  if (unit_amount > 0 && unit_amount < 50) {
     return NextResponse.json(
       {
         ok: false,
         error: "invalid_amount",
-        hint: "Prix de variante invalide (0 ou < 0,50€). Vérifie le prix Shopify de la variante sélectionnée.",
+        hint: "Montant trop faible pour Stripe (< 0,50€). Mets un prix >= 0,50€ ou 0€ (gratuit).",
         debug: { variantId: variantIdRaw, shopifyPrice: v.price, unit_amount, currency },
       },
       { status: 400 }
@@ -122,6 +141,7 @@ async function createCheckoutFromVariant(variantIdRaw: string, quantity: number,
   return NextResponse.redirect(session.url!, 303);
 }
 
+// ✅ GET (App Proxy friendly)
 export async function GET(req: NextRequest) {
   try {
     if (!ensureProxy(req)) {
@@ -137,14 +157,14 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ ok: false, error: "missing_variantId" }, { status: 400 });
     }
 
-    return await createCheckoutFromVariant(variantId, quantity, returnUrl);
+    return await createCheckoutOrFreeRedirect({ variantIdRaw: variantId, quantity, returnUrl });
   } catch (err: any) {
     console.error("[MF] /proxy/stripe/checkout GET error", err);
     return NextResponse.json({ ok: false, error: err?.message || "server_error" }, { status: 500 });
   }
 }
 
-// ✅ On accepte POST aussi pour éviter les 405 si un vieux front traîne
+// ✅ POST aussi, pour éviter les 405 si un ancien front envoie encore du POST
 export async function POST(req: NextRequest) {
   try {
     if (!ensureProxy(req)) {
@@ -164,7 +184,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: "missing_variantId" }, { status: 400 });
     }
 
-    return await createCheckoutFromVariant(variantId, quantity, returnUrl);
+    return await createCheckoutOrFreeRedirect({ variantIdRaw: variantId, quantity, returnUrl });
   } catch (err: any) {
     console.error("[MF] /proxy/stripe/checkout POST error", err);
     return NextResponse.json({ ok: false, error: err?.message || "server_error" }, { status: 500 });
