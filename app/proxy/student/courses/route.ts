@@ -41,8 +41,8 @@ function verifyAppProxySignature(req: NextRequest) {
     .digest("hex");
 
   const a = Uint8Array.from(Buffer.from(computed, "utf8"));
-const b = Uint8Array.from(Buffer.from(signature, "utf8"));
-const match = a.length === b.length && crypto.timingSafeEqual(a, b);
+  const b = Uint8Array.from(Buffer.from(signature, "utf8"));
+  const match = a.length === b.length && crypto.timingSafeEqual(a, b);
 
   return match ? { ok: true } : { ok: false, error: "invalid_signature" };
 }
@@ -135,8 +135,11 @@ export async function GET(req: NextRequest) {
           ? Math.max(0, Math.min(100, sc.progressPct))
           : 0;
 
-      // Accès contenu
+      // Accès contenu (page interne / route)
       const accessUrl = sc?.course?.accessUrl ?? sc?.course?.access_url ?? null;
+
+      // ✅ IMPORTANT: URL PDF réelle stockée en DB (Prisma Course.pdfUrl)
+      const pdfUrl = sc?.course?.pdfUrl ?? sc?.course?.pdf_url ?? null;
 
       // IMPORTANT: on garde aussi ton format ancien (compat)
       const base: any = {
@@ -151,7 +154,10 @@ export async function GET(req: NextRequest) {
         image_url: sc?.course?.imageUrl ?? null,
         purchase_date: purchaseISO,
         last_access_at: lastAccessISO,
+
+        // on garde access_url pour compat
         access_url: accessUrl,
+
         cta_label: type === "video" ? "Commencer la formation" : "Lire la formation",
 
         // ✅ champs attendus par la nouvelle UI
@@ -163,9 +169,14 @@ export async function GET(req: NextRequest) {
       };
 
       if (type === "pdf") {
+        // ✅ FIX: on privilégie le vrai PDF (pdfUrl). accessUrl en fallback.
+        const viewUrl = (pdfUrl || accessUrl || "");
+
         base.pdf = {
           pages: sc?.course?.pdfPages ?? "—",
-          viewUrl: accessUrl || "",
+          viewUrl,
+          // optionnel mais pratique côté UI (download button)
+          downloadUrl: viewUrl,
         };
       } else {
         base.video = {
