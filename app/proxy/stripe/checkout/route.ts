@@ -1,3 +1,4 @@
+// app/proxy/stripe/checkout/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
 import { verifyShopifyAppProxy } from "@/app/api/_lib/proxy";
@@ -40,23 +41,22 @@ function ensureProxy(req: NextRequest) {
   return verifyShopifyAppProxy(req, secret);
 }
 
-function buildReturnUrls(returnUrl: string) {
-  // returnUrl = page produit
-  const success = new URL(returnUrl);
-  success.searchParams.set("paid", "1");
-
-  const cancel = new URL(returnUrl);
-  cancel.searchParams.set("canceled", "1");
-
-  return { success: success.toString(), cancel: cancel.toString() };
+function publicBase(req: NextRequest) {
+  const envBase = (process.env.PUBLIC_BASE_URL || "").trim();
+  if (envBase) return envBase.replace(/\/+$/, "");
+  return req.nextUrl.origin;
 }
 
-async function createCheckoutOrFreeRedirect(opts: {
-  variantIdRaw: string;
-  quantity: number;
-  returnUrl: string;
-}) {
-  const { variantIdRaw, quantity, returnUrl } = opts;
+// ✅ Après paiement, on veut TOUJOURS /pages/mes-formations
+function buildReturnUrls(req: NextRequest) {
+  const base = publicBase(req);
+  const success = `${base}/pages/mes-formations?paid=1&session_id={CHECKOUT_SESSION_ID}`;
+  const cancel = `${base}/pages/mes-formations?canceled=1`;
+  return { success, cancel };
+}
+
+async function createCheckout(req: NextRequest, opts: { variantIdRaw: string; quantity: number }) {
+  const { variantIdRaw, quantity } = opts;
 
   const gid = variantIdRaw.startsWith("gid://")
     ? variantIdRaw
@@ -69,7 +69,8 @@ async function createCheckoutOrFreeRedirect(opts: {
         id
         title
         price
-        product { title handle }
+        legacyResourceId
+        product { title handle legacyResourceId }
       }
       shop { currencyCode }
     }
@@ -78,42 +79,52 @@ async function createCheckoutOrFreeRedirect(opts: {
   );
 
   const v = data?.productVariant;
-  if (!v?.price && v?.price !== "0.00") {
+  if (!v || v.price == null) {
     return NextResponse.json({ ok: false, error: "variant_not_found_or_no_price" }, { status: 404 });
   }
 
   const currency = String(data?.shop?.currencyCode || "EUR").toLowerCase();
   const unit_amount = toCents(v.price);
 
-  // ✅ GRATUIT (0€) -> pas Stripe -> on "valide" et on renvoie vers la page produit
-  // (Important: pour un vrai accès sécurisé, tu dois enregistrer l’accès côté DB.
-  // Ici on fait volontairement minimal pour ne rien casser.)
-  if (unit_amount === 0) {
-    const { success } = buildReturnUrls(returnUrl);
-    const successUrl = new URL(success);
-    successUrl.searchParams.set("free", "1");
-    successUrl.searchParams.set("variant", String(variantIdRaw));
-    return NextResponse.redirect(successUrl.toString(), 303);
-  }
-
-  // ✅ Stripe refuse les montants trop faibles (ex: < 0,50€)
-  if (unit_amount > 0 && unit_amount < 50) {
+  // ✅ PRIX MINIMUM = 1,00€
+  if (unit_amount < 100) {
     return NextResponse.json(
       {
         ok: false,
-        error: "invalid_amount",
-        hint: "Montant trop faible pour Stripe (< 0,50€). Mets un prix >= 0,50€ ou 0€ (gratuit).",
+        error: "min_price_required",
+        hint: "Prix minimum requis : 1,00€. Modifie le prix de cette variante (>= 1,00€) puis réessaie.",
         debug: { variantId: variantIdRaw, shopifyPrice: v.price, unit_amount, currency },
       },
       { status: 400 }
     );
   }
 
+  const shopifyProductId = String(v?.product?.legacyResourceId || "").trim();
+  const shopifyVariantId = String(v?.legacyResourceId || "").trim();
+
+  if (!shopifyProductId) {
+    return NextResponse.json(
+      { ok: false, error: "missing_shopify_product_id", hint: "Impossible de résoudre le productId Shopify." },
+      { status: 500 }
+    );
+  }
+
+  const { success, cancel } = buildReturnUrls(req);
+
+  // ✅ Optionnel: récupère acheteur depuis query (si tu le passes côté Liquid)
+  const qp = req.nextUrl.searchParams;
+  const buyerEmail = (qp.get("email") || qp.get("buyerEmail") || "").trim() || undefined;
+  const buyerShopifyCustomerId =
+    (qp.get("shopifyCustomerId") || qp.get("customerId") || qp.get("buyerId") || "").trim() || undefined;
+
   const name = `${v.product?.title || "Formation"} — ${v.title || "Variante"}`;
-  const { success, cancel } = buildReturnUrls(returnUrl);
 
   const session = await stripe.checkout.sessions.create({
     mode: "payment",
+
+    // ✅ Reçus Stripe si activés + email dispo
+    customer_email: buyerEmail,
+
     line_items: [
       {
         quantity,
@@ -123,18 +134,24 @@ async function createCheckoutOrFreeRedirect(opts: {
           product_data: {
             name,
             metadata: {
-              shopify_variant_id: String(variantIdRaw),
+              shopify_product_id: shopifyProductId,
+              shopify_variant_id: shopifyVariantId,
               shopify_product_handle: String(v.product?.handle || ""),
             },
           },
         },
       },
     ],
+
     success_url: success,
     cancel_url: cancel,
+
     metadata: {
-      shopify_variant_id: String(variantIdRaw),
+      shopify_product_id: shopifyProductId,
+      shopify_variant_id: shopifyVariantId,
       shopify_product_handle: String(v.product?.handle || ""),
+      buyer_email: buyerEmail || "",
+      buyer_shopify_customer_id: buyerShopifyCustomerId || "",
     },
   });
 
@@ -151,20 +168,19 @@ export async function GET(req: NextRequest) {
     const url = req.nextUrl;
     const variantId = url.searchParams.get("variantId") || "";
     const quantity = Math.max(1, Number(url.searchParams.get("quantity") || "1"));
-    const returnUrl = url.searchParams.get("returnUrl") || `${url.origin}/`;
 
     if (!variantId) {
       return NextResponse.json({ ok: false, error: "missing_variantId" }, { status: 400 });
     }
 
-    return await createCheckoutOrFreeRedirect({ variantIdRaw: variantId, quantity, returnUrl });
+    return await createCheckout(req, { variantIdRaw: variantId, quantity });
   } catch (err: any) {
     console.error("[MF] /proxy/stripe/checkout GET error", err);
     return NextResponse.json({ ok: false, error: err?.message || "server_error" }, { status: 500 });
   }
 }
 
-// ✅ POST aussi, pour éviter les 405 si un ancien front envoie encore du POST
+// ✅ POST aussi (compat)
 export async function POST(req: NextRequest) {
   try {
     if (!ensureProxy(req)) {
@@ -178,13 +194,12 @@ export async function POST(req: NextRequest) {
 
     const variantId = String(body?.variantId || "");
     const quantity = Math.max(1, Number(body?.quantity || 1));
-    const returnUrl = String(body?.returnUrl || `${req.nextUrl.origin}/`);
 
     if (!variantId) {
       return NextResponse.json({ ok: false, error: "missing_variantId" }, { status: 400 });
     }
 
-    return await createCheckoutOrFreeRedirect({ variantIdRaw: variantId, quantity, returnUrl });
+    return await createCheckout(req, { variantIdRaw: variantId, quantity });
   } catch (err: any) {
     console.error("[MF] /proxy/stripe/checkout POST error", err);
     return NextResponse.json({ ok: false, error: err?.message || "server_error" }, { status: 500 });
