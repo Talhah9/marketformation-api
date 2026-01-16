@@ -129,9 +129,13 @@ model StudentCourse {
   archived     Boolean      @default(false)
 
   // ✅ Progression réelle (UX)
-  // 0..100 (garde simple pour commencer)
-  progressPct  Int  @default(0)
-  // JSON libre (ex: lessonId courant, pages lues, timestamps, etc.)
+  // 0..100
+  progressPct  Int   @default(0)
+  // (vidéo) dernière leçon/chapitre vu(e) — simple et efficace
+  lastLessonId String?
+  // date de complétion (quand progress=100 ou status=COMPLETED)
+  completedAt  DateTime?
+  // JSON libre (pages lues, timestamps, etc.)
   progressData Json?
 
   @@index([studentEmail])
