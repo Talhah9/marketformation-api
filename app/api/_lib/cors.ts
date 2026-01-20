@@ -8,22 +8,34 @@ const DEFAULT_METHODS = 'GET,POST,PUT,PATCH,DELETE,OPTIONS';
 const DEFAULT_HEADERS =
   'Origin, Accept, Content-Type, Authorization, X-Requested-With, x-mf-admin-email';
 
+// ✅ fallback safe (si env pas renseignée)
+const FALLBACK_ORIGINS = [
+  'https://marketformation.fr',
+  'https://www.marketformation.fr',
+];
+
+// normalise une origin (supprime trailing slash)
+const clean = (s: string) => String(s || '').trim().replace(/\/+$/, '');
+
 // Résout l'origine autorisée depuis l'env CORS_ORIGINS
 function pickAllowedOrigin(reqOrigin: string | null): string | undefined {
-  const raw = process.env.CORS_ORIGINS || '';
-  if (!raw) return undefined;
+  const raw = (process.env.CORS_ORIGINS || '').trim();
 
-  const list = raw
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
+  // build list = env + fallback, unique
+  const envList = raw
+    ? raw
+        .split(',')
+        .map((s) => clean(s))
+        .filter(Boolean)
+    : [];
 
-  const clean = (s: string) => s.replace(/\/+$/, '');
+  const list = Array.from(new Set([...envList, ...FALLBACK_ORIGINS.map(clean)]));
 
   // ⚠️ IMPORTANT: pour CORS, il faut renvoyer exactement l'Origin reçue
   // si elle est autorisée. Sinon, le navigateur bloque.
   if (reqOrigin) {
-    const found = list.find((o) => clean(o) === clean(reqOrigin));
+    const reqC = clean(reqOrigin);
+    const found = list.find((o) => o === reqC);
     return found ? reqOrigin : undefined;
   }
 
@@ -40,12 +52,11 @@ export function withCORS(req: Request, res: Response, origin?: string) {
   if (allowed) {
     r.headers.set('Access-Control-Allow-Origin', allowed);
     r.headers.set('Vary', 'Origin');
-  }
 
-  // *** Obligatoire pour credentials: 'include' ***
-  // (ne doit pas être présent si ACAO absent, mais on le laisse car tu utilises
-  // toujours allowed quand c'est un appel navigateur)
-  r.headers.set('Access-Control-Allow-Credentials', 'true');
+    // *** Obligatoire pour credentials: 'include' ***
+    // ✅ On ne met Credentials que si ACAO est présent (sinon certains navigateurs râlent)
+    r.headers.set('Access-Control-Allow-Credentials', 'true');
+  }
 
   r.headers.set('Access-Control-Allow-Methods', DEFAULT_METHODS);
   r.headers.set('Access-Control-Allow-Headers', DEFAULT_HEADERS);
