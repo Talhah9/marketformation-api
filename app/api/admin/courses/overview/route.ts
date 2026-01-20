@@ -21,7 +21,6 @@ async function shopifyGraphql(query: string, variables?: any) {
   if (!domain) throw new Error('Missing env SHOP_DOMAIN');
 
   const endpoint = `https://${domain}/admin/api/2024-07/graphql.json`;
-
   const res = await fetch(endpoint, {
     method: 'POST',
     headers: {
@@ -39,9 +38,13 @@ async function shopifyGraphql(query: string, variables?: any) {
   return { ok: res.ok, status: res.status, json, text };
 }
 
-function isAdmin(req: Request) {
-  const email = String(req.headers.get('x-mf-admin-email') || '').toLowerCase().trim();
-  return email === 'talhahally974@gmail.com';
+function isAdminReq(req: Request) {
+  const email = (req.headers.get('x-mf-admin-email') || '').toLowerCase().trim();
+  const allow = (process.env.MF_ADMIN_EMAILS || 'talhahally974@gmail.com')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  return !!email && allow.includes(email);
 }
 
 function toIntSafe(v: any) {
@@ -56,87 +59,89 @@ export async function OPTIONS(req: Request) {
 export async function GET(req: Request) {
   try {
     if (!process.env.SHOP_DOMAIN || !getAdminToken()) {
-      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or Admin token' }, { status: 500 });
+      return jsonWithCors(req, { ok: false, error: 'Missing SHOP_DOMAIN or admin token' }, { status: 500 });
     }
-    if (!isAdmin(req)) {
-      return jsonWithCors(req, { ok: false, error: 'admin_required' }, { status: 403 });
+    if (!isAdminReq(req)) {
+      return jsonWithCors(req, { ok: false, error: 'admin_forbidden' }, { status: 403 });
     }
 
-    // 1) Courses metrics (approved/pending + sold total)
+    // ✅ MVP overview: calcule "trainers_total" + "courses_sold_total" depuis Shopify
+    // Le reste = 0 / — (tu brancheras Stripe plus tard)
     const q = `
-      query Overview($q: String!) {
-        products(first: 250, query: $q) {
+      query AdminOverview($qCourses: String!, $qTrainers: String!) {
+        courses: products(first: 250, query: $qCourses) {
           edges {
             node {
+              id
               approval: metafield(namespace:"mfapp", key:"approval_status") { value }
               sales: metafield(namespace:"mfapp", key:"sales_count") { value }
             }
           }
         }
+        trainers: customers(first: 250, query: $qTrainers) {
+          edges { node { id } }
+        }
       }
     `;
-    const r = await shopifyGraphql(q, { q: `tag:"mkt-course"` });
+
+    const coursesQuery = `tag:"mkt-course"`;
+    const trainerTags = String(process.env.MF_TRAINER_TAGS || 'mf_trainer,mkt-trainer')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const trainersQuery =
+      trainerTags.length === 1 ? `tag:${trainerTags[0]}` : trainerTags.map((t) => `tag:${t}`).join(' OR ');
+
+    const r = await shopifyGraphql(q, { qCourses: coursesQuery, qTrainers: trainersQuery });
     if (!r.ok) {
       return jsonWithCors(req, { ok: false, error: `Shopify ${r.status}`, detail: r.text }, { status: r.status });
     }
 
-    const edges = r.json?.data?.products?.edges || [];
+    const coursesEdges = r.json?.data?.courses?.edges || [];
+    const trainersEdges = r.json?.data?.trainers?.edges || [];
+
+    let coursesSoldTotal = 0;
     let coursesApproved = 0;
     let coursesPending = 0;
-    let coursesSoldTotal = 0;
 
-    edges.forEach((e: any) => {
-      const n = e?.node || {};
-      const st = String(n?.approval?.value || 'pending').trim().toLowerCase();
+    coursesEdges.forEach((e: any) => {
+      const n = toIntSafe(e?.node?.sales?.value);
+      coursesSoldTotal += n;
+
+      const st = String(e?.node?.approval?.value || 'pending').toLowerCase().trim();
       if (st === 'approved') coursesApproved += 1;
       else coursesPending += 1;
-
-      coursesSoldTotal += toIntSafe(n?.sales?.value);
     });
 
-    // 2) Placeholder subs/mrr/payouts (tu brancheras Stripe après)
-    const subs_active = 0;
-    const subs_starter = 0;
-    const subs_pro = 0;
-    const subs_business = 0;
-
-    const mrr_eur = 0;
-    const sales_30d_eur = 0;
-    const payouts_pending_count = 0;
-    const payouts_pending_eur = 0;
+    const trainersTotal = trainersEdges.length;
 
     return jsonWithCors(req, {
       ok: true,
 
-      // "formateurs" : si tu veux vraiment -> on le branchera à /trainers (customers taggés)
-      trainers_total: 0,
-      trainers_approved: 0,
-      trainers_pending: 0,
+      // trainers
+      trainers_total: trainersTotal,
+      trainers_approved: '—', // pas de champ d'approbation trainers en MVP
+      trainers_pending: '—',
 
-      subscriptions_active: subs_active,
-      subs_active,
-      subs_starter,
-      subs_pro,
-      subs_business,
+      // subs/mrr (placeholder MVP)
+      subs_active: '—',
+      subs_starter: '—',
+      subs_pro: '—',
+      subs_business: '—',
+      mrr: '—',
+      sales_30d: '—',
 
-      mrr_eur,
-      mrr_label: `${mrr_eur} €`,
+      // payouts (placeholder MVP)
+      payouts_pending_count: '—',
+      payouts_pending_eur: null,
+      payouts_pending_label: '—',
 
-      sales_30d: sales_30d_eur,
-      sales_30d_label: `${sales_30d_eur} €`,
-
-      payouts_pending_count,
-      payouts_pending_eur,
-      payouts_pending_label: `${payouts_pending_eur} €`,
-
-      // ✅ NOUVEAU KPI
+      // ✅ nouveau
       courses_sold_total: coursesSoldTotal,
-
-      // bonus si tu veux l’afficher plus tard
       courses_approved: coursesApproved,
       courses_pending: coursesPending,
     });
   } catch (e: any) {
-    return jsonWithCors(req, { ok: false, error: e?.message || 'overview_failed' }, { status: 500 });
+    return jsonWithCors(req, { ok: false, error: e?.message || 'admin_overview_failed' }, { status: 500 });
   }
 }
