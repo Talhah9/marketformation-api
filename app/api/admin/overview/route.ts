@@ -79,14 +79,24 @@ function getStripe(): Stripe {
 
 function planFromPriceId(priceId: string) {
   const starter = process.env.STRIPE_PRICE_STARTER;
+
+  // ✅ compat: ancien / nouveau nom d'env
+  const creator = process.env.STRIPE_PRICE_CREATOR;
   const pro = process.env.STRIPE_PRICE_PRO;
   const business = process.env.STRIPE_PRICE_BUSINESS;
 
   if (starter && priceId === starter) return "starter";
+
+  // ✅ si tu utilises CREATOR, on le traite comme "pro"
+  if (creator && priceId === creator) return "pro";
+
+  // ✅ compat si tu remets PRO/BUSINESS plus tard
   if (pro && priceId === pro) return "pro";
   if (business && priceId === business) return "business";
+
   return "other";
 }
+
 
 async function stripeComputeSubsAndMrr() {
   // ✅ compte les subscriptions actives et estime le MRR
