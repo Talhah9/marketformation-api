@@ -226,6 +226,14 @@ export async function POST(req: Request) {
     // 1) Metafield approval_status = approved
     await upsertProductMetafield(pid, 'mfapp', 'approval_status', 'single_line_text_field', 'approved');
 
+    // ✅ 1bis) Initialise sales_count si absent (ne casse rien)
+    // NOTE: Shopify REST "metafields.json" va créer un nouveau metafield à chaque appel si key/namespace existent déjà ?
+    // En pratique, sur product metafields REST, ça crée/écrase selon ID metafield.
+    // Pour rester safe: on le "set" à 0 uniquement si env MF_INIT_SALES_ON_APPROVE=1
+    if (String(process.env.MF_INIT_SALES_ON_APPROVE || '').trim() === '1') {
+      await upsertProductMetafield(pid, 'mfapp', 'sales_count', 'number_integer', '0');
+    }
+
     // 2) Active + published_at (couvre REST)
     const nowIso = new Date().toISOString();
     const r = await shopifyFetch(`/products/${pid}.json`, {

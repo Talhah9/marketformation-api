@@ -54,6 +54,12 @@ function numIdFromGid(gid: string) {
   return m ? m[1] : '';
 }
 
+// ✅ parse int safe (metafield number stored as string)
+function toIntSafe(v: any) {
+  const n = parseInt(String(v ?? '').trim(), 10);
+  return Number.isFinite(n) ? n : 0;
+}
+
 export async function OPTIONS(req: Request) {
   return handleOptions(req);
 }
@@ -89,6 +95,7 @@ export async function GET(req: Request) {
 
               approval: metafield(namespace:"mfapp", key:"approval_status") { value }
               theme: metafield(namespace:"mfapp", key:"theme") { value }
+              sales: metafield(namespace:"mfapp", key:"sales_count") { value }
             }
           }
         }
@@ -126,11 +133,10 @@ export async function GET(req: Request) {
 
       return {
         // ✅ IMPORTANT: ton front utilise product_id / productId / id
-        // On garde un gid pour la route approve si tu l'utilises comme ça,
-        // ET un id numérique pour display/debug.
+        // ✅ BIGINT safe: id reste string (jamais Number())
         product_id: gid,
         productId: gid,
-        id: idDigits ? Number(idDigits) : gid,
+        id: idDigits || gid,
 
         title: p.title || '',
         trainer_name: p.vendor || '—',
@@ -138,7 +144,8 @@ export async function GET(req: Request) {
         price_label: priceRaw != null && priceRaw !== '' ? `${priceRaw} €` : '—',
         price_eur: Number.isFinite(price_eur as any) ? price_eur : null,
 
-        sales_count: null,
+        // ✅ connecté via metafield mfapp.sales_count (number_integer)
+        sales_count: toIntSafe(p?.sales?.value),
 
         approval_status,
         status_label,
@@ -148,7 +155,7 @@ export async function GET(req: Request) {
         published_at: p.publishedAt || null,
         created_at: p.createdAt || null,
 
-        // optionnels (si un jour tu veux les afficher)
+        // optionnels
         image_url: p?.featuredImage?.url || '',
         mf_theme: String(p?.theme?.value || '').trim(),
         shopify_status: p.status || null,
