@@ -65,8 +65,7 @@ export async function GET(req: Request) {
       return jsonWithCors(req, { ok: false, error: 'admin_forbidden' }, { status: 403 });
     }
 
-    // ✅ MVP overview: calcule "trainers_total" + "courses_sold_total" depuis Shopify
-    // Le reste = 0 / — (tu brancheras Stripe plus tard)
+    // MVP: calcule total vendus + trainers total depuis Shopify
     const q = `
       query AdminOverview($qCourses: String!, $qTrainers: String!) {
         courses: products(first: 250, query: $qCourses) {
@@ -101,45 +100,26 @@ export async function GET(req: Request) {
     const trainersEdges = r.json?.data?.trainers?.edges || [];
 
     let coursesSoldTotal = 0;
-    let coursesApproved = 0;
-    let coursesPending = 0;
-
-    coursesEdges.forEach((e: any) => {
-      const n = toIntSafe(e?.node?.sales?.value);
-      coursesSoldTotal += n;
-
-      const st = String(e?.node?.approval?.value || 'pending').toLowerCase().trim();
-      if (st === 'approved') coursesApproved += 1;
-      else coursesPending += 1;
-    });
-
-    const trainersTotal = trainersEdges.length;
+    coursesEdges.forEach((e: any) => { coursesSoldTotal += toIntSafe(e?.node?.sales?.value); });
 
     return jsonWithCors(req, {
       ok: true,
+      trainers_total: trainersEdges.length,
 
-      // trainers
-      trainers_total: trainersTotal,
-      trainers_approved: '—', // pas de champ d'approbation trainers en MVP
+      // placeholders (tu brancheras Stripe ensuite)
+      trainers_approved: '—',
       trainers_pending: '—',
-
-      // subs/mrr (placeholder MVP)
       subs_active: '—',
       subs_starter: '—',
       subs_pro: '—',
       subs_business: '—',
       mrr: '—',
       sales_30d: '—',
-
-      // payouts (placeholder MVP)
       payouts_pending_count: '—',
-      payouts_pending_eur: null,
       payouts_pending_label: '—',
 
-      // ✅ nouveau
+      // KPI demandé
       courses_sold_total: coursesSoldTotal,
-      courses_approved: coursesApproved,
-      courses_pending: coursesPending,
     });
   } catch (e: any) {
     return jsonWithCors(req, { ok: false, error: e?.message || 'admin_overview_failed' }, { status: 500 });
