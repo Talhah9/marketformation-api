@@ -21,15 +21,24 @@ const resend =
 // =========================
 async function shopifyGraphQL(query: string, variables: any) {
   const shop = process.env.SHOP_DOMAIN!;
-  const token = process.env.ADMIN_TOKEN!;
+  const token =
+    process.env.SHOP_ADMIN_TOKEN ||
+    process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN ||
+    process.env.ADMIN_TOKEN ||
+    "";
+
+  if (!shop) throw new Error("Missing env SHOP_DOMAIN");
+  if (!token) throw new Error("Missing env ADMIN_TOKEN/SHOP_ADMIN_TOKEN");
 
   const res = await fetch(`https://${shop}/admin/api/2025-01/graphql.json`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "X-Shopify-Access-Token": token,
+      Accept: "application/json",
     },
     body: JSON.stringify({ query, variables }),
+    cache: "no-store",
   });
 
   const json = await res.json();
@@ -43,6 +52,68 @@ function gidToNumericId(gid?: string | null) {
   if (!gid) return null;
   const m = String(gid).match(/\/(\d+)$/);
   return m ? m[1] : null;
+}
+
+// =========================
+// ✅ SALES COUNT (mfapp.sales_count)
+// =========================
+function toIntSafe(v: any) {
+  const n = parseInt(String(v ?? "").trim(), 10);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function productGidFromNumericId(productId: string | number) {
+  const s = String(productId || "").trim();
+  if (!s) return "";
+  // accepte déjà un gid
+  if (s.startsWith("gid://")) return s;
+  // numeric
+  if (/^\d+$/.test(s)) return `gid://shopify/Product/${s}`;
+  return "";
+}
+
+async function getProductSalesCount(productGid: string) {
+  const q = `
+    query GetSales($id: ID!) {
+      product(id: $id) {
+        sales: metafield(namespace:"mfapp", key:"sales_count") { value }
+      }
+    }
+  `;
+  const data = await shopifyGraphQL(q, { id: productGid });
+  const val = data?.product?.sales?.value;
+  return toIntSafe(val);
+}
+
+async function setProductSalesCount(productGid: string, nextVal: number) {
+  const m = `
+    mutation SetSales($ownerId: ID!, $value: String!) {
+      metafieldsSet(metafields: [{
+        ownerId: $ownerId,
+        namespace: "mfapp",
+        key: "sales_count",
+        type: "number_integer",
+        value: $value
+      }]) {
+        userErrors { field message }
+      }
+    }
+  `;
+  const data = await shopifyGraphQL(m, { ownerId: productGid, value: String(nextVal) });
+  const errs = data?.metafieldsSet?.userErrors || [];
+  if (errs.length) {
+    throw new Error(errs[0]?.message || "metafieldsSet_failed");
+  }
+}
+
+async function incProductSalesCount(productIdOrGid: string) {
+  const productGid = productGidFromNumericId(productIdOrGid);
+  if (!productGid) return;
+
+  const curr = await getProductSalesCount(productGid);
+  await setProductSalesCount(productGid, curr + 1);
+
+  console.log("[MF][sales_count] incremented", { productGid, from: curr, to: curr + 1 });
 }
 
 // =========================
@@ -215,33 +286,47 @@ export async function POST(req: Request) {
 
       const course = await resolveCourseFromSession(session);
 
+      // ✅ 1) Ton attribution existante (inchangée)
       if (buyerEmail && course) {
         const email = buyerEmail.toLowerCase().trim();
 
-const existing = await prisma.studentCourse.findFirst({
-  where: {
-    studentEmail: email,
-    courseId: course.id,
-    archived: false,
-  },
-  select: { id: true },
-});
+        const existing = await prisma.studentCourse.findFirst({
+          where: {
+            studentEmail: email,
+            courseId: course.id,
+            archived: false,
+          },
+          select: { id: true },
+        });
 
-if (!existing?.id) {
-  await prisma.studentCourse.create({
-    data: {
-      studentEmail: email,
-      courseId: course.id,
-      status: "NOT_STARTED",
-      purchaseDate: new Date(),
-      archived: false,
-      shopifyOrderId: session?.id ? String(session.id) : null, // audit
-    },
-  });
-}
-
+        if (!existing?.id) {
+          await prisma.studentCourse.create({
+            data: {
+              studentEmail: email,
+              courseId: course.id,
+              status: "NOT_STARTED",
+              purchaseDate: new Date(),
+              archived: false,
+              shopifyOrderId: session?.id ? String(session.id) : null, // audit
+            },
+          });
+        }
       }
 
+      // ✅ 2) NOUVEAU — incrémenter mfapp.sales_count (tracking admin)
+      // On le fait seulement si c'est une vente "formation" et qu'on a résolu la formation.
+      // Ton DB a déjà le productId via course.shopifyProductId.
+      try {
+        const mode = String(session?.mode || "");
+        if (mode === "payment" && course?.shopifyProductId) {
+          await incProductSalesCount(String(course.shopifyProductId));
+        }
+      } catch (e: any) {
+        // on ne casse pas le webhook si Shopify rate
+        console.warn("[MF][sales_count] failed (non-blocking)", e?.message || e);
+      }
+
+      // ✅ 3) Ton email existant (inchangé)
       if (buyerEmail) {
         const { amountCents, currency } = moneyFromSession(session);
         const base = process.env.PUBLIC_SITE_URL || "https://marketformation.fr";
@@ -258,6 +343,7 @@ if (!existing?.id) {
       console.log("[MF] checkout.session.completed handled", {
         session_id: session.id,
         buyerEmail,
+        courseResolved: !!course?.id,
       });
     }
 

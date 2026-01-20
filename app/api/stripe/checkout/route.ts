@@ -22,7 +22,7 @@ export async function POST(req: Request) {
       returnUrl,
       shopifyCustomerId,
       planKey,
-      trainerId, // ✅ NEW (optionnel)
+      trainerId, // ✅ optionnel
     } = body as {
       diag?: boolean;
       priceId?: string;
@@ -30,7 +30,7 @@ export async function POST(req: Request) {
       returnUrl?: string;
       shopifyCustomerId?: string | number;
       planKey?: string;
-      trainerId?: string; // ✅ NEW
+      trainerId?: string;
     };
 
     // --- DIAG
@@ -68,11 +68,13 @@ export async function POST(req: Request) {
       return jsonWithCors(req, { ok: false, error: "Missing priceId or email" }, { status: 400 });
     }
 
+    const emailNorm = String(email).toLowerCase().trim();
+
     const stripe = new Stripe(STRIPE_KEY, { apiVersion: "2024-06-20" });
 
     // ✅ Retrouver / créer customer
-    const { data } = await stripe.customers.list({ email, limit: 1 });
-    const customer = data[0] ?? (await stripe.customers.create({ email }));
+    const { data } = await stripe.customers.list({ email: emailNorm, limit: 1 });
+    const customer = data[0] ?? (await stripe.customers.create({ email: emailNorm }));
 
     // ✅ Sauver le shopifyCustomerId en metadata (utile pour subscription + futur)
     if (shopifyCustomerId) {
@@ -89,7 +91,7 @@ export async function POST(req: Request) {
     const resolvedTrainerId =
       (trainerId && String(trainerId).trim()) ||
       (shopifyCustomerId ? `trainer-${String(shopifyCustomerId)}` : "") ||
-      `email:${String(email).toLowerCase().trim()}`;
+      `email:${emailNorm}`;
 
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
@@ -97,19 +99,21 @@ export async function POST(req: Request) {
       line_items: [{ price: priceId, quantity: 1 }],
       allow_promotion_codes: true,
 
-      // ✅ on stocke planKey + shopifyCustomerId + trainer_id (pour stats)
+      // ✅ session metadata (utile côté webhook checkout.session.completed)
       metadata: {
         planKey: planKey ? String(planKey) : "",
         shopify_customer_id: shopifyCustomerId ? String(shopifyCustomerId) : "",
-        trainer_id: resolvedTrainerId, // ✅ NEW
+        trainer_id: resolvedTrainerId,
+        email: emailNorm, // ✅ AJOUT
       },
 
-      // ✅ IMPORTANT: met aussi trainer_id sur la subscription (utile pour invoice.payment_succeeded)
+      // ✅ IMPORTANT: metadata sur la subscription (utile pour customer.subscription.* / invoice.*)
       subscription_data: {
         metadata: {
           planKey: planKey ? String(planKey) : "",
           shopify_customer_id: shopifyCustomerId ? String(shopifyCustomerId) : "",
-          trainer_id: resolvedTrainerId, // ✅ NEW
+          trainer_id: resolvedTrainerId,
+          email: emailNorm, // ✅ AJOUT CRITIQUE
         },
       },
 
