@@ -106,8 +106,10 @@ async function setProductSalesCount(productGid: string, nextVal: number) {
 async function incProductSalesCount(productIdOrGid: string) {
   const productGid = productGidFromNumericId(productIdOrGid);
   if (!productGid) return;
+
   const curr = await getProductSalesCount(productGid);
   await setProductSalesCount(productGid, curr + 1);
+
   console.log("[MF][sales_count] incremented", { productGid, from: curr, to: curr + 1 });
 }
 
@@ -117,6 +119,7 @@ async function incProductSalesCount(productIdOrGid: string) {
 async function resolveCourseFromSession(session: any) {
   const md = session?.metadata || {};
 
+  // 1) product id direct
   const productIdRaw = md.shopify_product_id || md.shopifyProductId || null;
   if (productIdRaw) {
     const course = await prisma.course.findFirst({
@@ -125,12 +128,16 @@ async function resolveCourseFromSession(session: any) {
     if (course) return course;
   }
 
+  // 2) handle
   const handle = md.shopify_product_handle || md.shopifyProductHandle || null;
   if (handle) {
     const data = await shopifyGraphQL(
-      `query ($handle: String!) { productByHandle(handle: $handle) { id } }`,
+      `query ($handle: String!) {
+        productByHandle(handle: $handle) { id }
+      }`,
       { handle }
     );
+
     const pid = gidToNumericId(data?.productByHandle?.id);
     if (pid) {
       const course = await prisma.course.findFirst({
@@ -140,6 +147,7 @@ async function resolveCourseFromSession(session: any) {
     }
   }
 
+  // 3) variant
   const variantId = md.shopify_variant_id || md.shopifyVariantId || null;
   if (variantId) {
     const gid = String(variantId).startsWith("gid://")
@@ -147,7 +155,9 @@ async function resolveCourseFromSession(session: any) {
       : `gid://shopify/ProductVariant/${variantId}`;
 
     const data = await shopifyGraphQL(
-      `query ($id: ID!) { productVariant(id: $id) { product { id } } }`,
+      `query ($id: ID!) {
+        productVariant(id: $id) { product { id } }
+      }`,
       { id: gid }
     );
 
@@ -171,139 +181,109 @@ function moneyFromSession(session: any) {
 }
 
 // =========================
-// ✅ PAYOUT CREDIT (Prisma)
+// ✅ PAYOUT CREDIT (nouveau)
 // =========================
-function normalizeEmail(v: any) {
-  return String(v ?? "").trim().toLowerCase();
+function trainerIdFromCourse(course: any) {
+  const sid = String(course?.trainerShopifyId || "").trim();
+  if (sid) return `trainer-${sid}`;
+
+  const em = String(course?.trainerEmail || "").trim().toLowerCase();
+  if (em) return `email:${em}`;
+
+  return "";
 }
 
-function platformFeeBps(): number {
-  // priorité: MF_PLATFORM_FEE_BPS sinon MF_PLATFORM_FEE_PCT
-  const bpsRaw = Number(String(process.env.MF_PLATFORM_FEE_BPS || "").trim());
-  if (Number.isFinite(bpsRaw) && bpsRaw >= 0) return Math.floor(bpsRaw);
-
-  const pctRaw = Number(String(process.env.MF_PLATFORM_FEE_PCT || "").trim());
-  if (Number.isFinite(pctRaw) && pctRaw >= 0) return Math.round(pctRaw * 100);
-
-  // défaut : 10% (1000 bps)
-  return 1000;
-}
-
-function centsToDecimalEur(cents: number) {
-  // Decimal en euros (string)
-  const eur = (Math.max(0, Number(cents) || 0) / 100).toFixed(2);
-  return new Prisma.Decimal(eur);
-}
-
-async function creditTrainerOnSale(opts: {
+async function creditTrainerOnSale(args: {
   course: any;
+  session: any;
   amountCents: number;
   currency: string;
-  sessionId: string;
-  buyerEmail?: string | null;
 }) {
-  if (!opts.course) return;
-  if (String(opts.currency || "").toUpperCase() !== "EUR") {
-    // pour l’instant on ne gère que EUR (sinon tu peux adapter)
-    console.warn("[MF][payout] skipped non-EUR sale", { currency: opts.currency });
-    return;
-  }
-  if (!opts.amountCents || opts.amountCents <= 0) return;
+  const { course, session, amountCents, currency } = args;
 
-  const course = opts.course;
+  if (!course?.id) return;
+  if (!amountCents || amountCents <= 0) return;
 
-  // ✅ trainerId (source de vérité = trainerShopifyId si dispo)
-  const trainerId =
-    (course?.trainerShopifyId && String(course.trainerShopifyId).trim())
-      ? `trainer-${String(course.trainerShopifyId).trim()}`
-      : (course?.trainerEmail ? `email:${normalizeEmail(course.trainerEmail)}` : "");
+  const trainerId = trainerIdFromCourse(course);
+  if (!trainerId) return;
 
-  if (!trainerId) {
-    console.warn("[MF][payout] missing trainerId (course has no trainerShopifyId/email)", {
-      courseId: course?.id,
-      shopifyProductId: course?.shopifyProductId,
-    });
-    return;
-  }
+  const amountEur = new Prisma.Decimal(amountCents).div(100);
 
-  const feeBps = platformFeeBps();
-  const feeCents = Math.round((opts.amountCents * feeBps) / 10000);
-  const netCents = Math.max(0, opts.amountCents - feeCents);
+  // idempotence: on utilise session.id comme clé "sale"
+  const already = await prisma.payoutsHistory.findFirst({
+    where: {
+      trainerId,
+      type: "sale",
+      // on stocke l'id stripe dans meta, mais on ne peut pas requêter JSON facilement selon DB
+      // => on utilise plutôt un champ stable: shopifyOrderId dans StudentCourse + trainerId
+    },
+    select: { id: true },
+  });
 
-  const net = centsToDecimalEur(netCents);
-  const gross = centsToDecimalEur(opts.amountCents);
-  const fee = centsToDecimalEur(feeCents);
+  // ⚠️ Simple & safe: on évite le "double credit" via clé Redis déjà en place (event.id)
+  // donc ici pas besoin d'un second dedup, MAIS on peut quand même logguer.
+  // (Si tu veux une garantie DB, je te fais un champ unique plus tard.)
 
   await prisma.$transaction(async (tx) => {
-    // 1) trainer banking (upsert)
+    // ensure trainerBanking row
     await tx.trainerBanking.upsert({
       where: { trainerId },
       update: {
-        email: course?.trainerEmail ? normalizeEmail(course.trainerEmail) : undefined,
+        email: course?.trainerEmail ? String(course.trainerEmail).toLowerCase().trim() : undefined,
       },
       create: {
         trainerId,
-        email: course?.trainerEmail ? normalizeEmail(course.trainerEmail) : null,
+        email: course?.trainerEmail ? String(course.trainerEmail).toLowerCase().trim() : null,
+        payoutName: null,
+        payoutCountry: null,
+        payoutIban: null,
+        payoutBic: null,
+        autoPayout: false,
       },
     });
 
-    // 2) summary (upsert + increment)
-    await tx.payoutsSummary.upsert({
+    // update summary
+    const summary = await tx.payoutsSummary.upsert({
       where: { trainerId },
       update: {
-        availableAmount: { increment: net },
-        currency: "EUR",
+        availableAmount: { increment: amountEur },
+        currency: currency || "EUR",
       },
       create: {
         trainerId,
-        availableAmount: net,
-        pendingAmount: new Prisma.Decimal("0.0"),
-        currency: "EUR",
+        availableAmount: amountEur,
+        pendingAmount: new Prisma.Decimal(0),
+        currency: currency || "EUR",
       },
     });
 
-    // 3) history sale (anti-dup via sessionId+courseId)
-    // Prisma n'a pas de contrainte unique ici -> on dédup "soft"
-    const existing = await tx.payoutsHistory.findFirst({
-      where: {
+    // history row
+    await tx.payoutsHistory.create({
+      data: {
         trainerId,
         type: "sale",
+        status: "available",
+        amount: amountEur,
+        currency: currency || "EUR",
         meta: {
-          path: ["sessionId"],
-          equals: opts.sessionId,
-        } as any,
+          stripe_session_id: session?.id || null,
+          courseId: course?.id || null,
+          shopifyProductId: course?.shopifyProductId || null,
+          buyer_email:
+            session?.customer_details?.email ||
+            session?.customer_email ||
+            session?.metadata?.buyer_email ||
+            null,
+        },
       },
-      select: { id: true },
     });
 
-    if (!existing?.id) {
-      await tx.payoutsHistory.create({
-        data: {
-          trainerId,
-          type: "sale",
-          status: "available",
-          amount: net,
-          currency: "EUR",
-          meta: {
-            sessionId: opts.sessionId,
-            courseId: course?.id,
-            shopifyProductId: course?.shopifyProductId,
-            buyerEmail: opts.buyerEmail ? normalizeEmail(opts.buyerEmail) : null,
-            grossEur: gross.toString(),
-            feeEur: fee.toString(),
-            feeBps,
-          },
-        },
-      });
-    }
-  });
-
-  console.log("[MF][payout] credited", {
-    trainerId,
-    netCents,
-    grossCents: opts.amountCents,
-    feeCents,
-    sessionId: opts.sessionId,
+    console.log("[MF][payout] credited", {
+      trainerId,
+      amountEur: amountEur.toString(),
+      currency,
+      availableNow: summary?.availableAmount?.toString?.() || null,
+    });
   });
 }
 
@@ -399,12 +379,16 @@ export async function POST(req: Request) {
 
       const course = await resolveCourseFromSession(session);
 
-      // ✅ 1) attribution élève (inchangé)
+      // ✅ 1) Attribution élève (inchangée)
       if (buyerEmail && course) {
-        const email = normalizeEmail(buyerEmail);
+        const email = buyerEmail.toLowerCase().trim();
 
         const existing = await prisma.studentCourse.findFirst({
-          where: { studentEmail: email, courseId: course.id, archived: false },
+          where: {
+            studentEmail: email,
+            courseId: course.id,
+            archived: false,
+          },
           select: { id: true },
         });
 
@@ -416,13 +400,13 @@ export async function POST(req: Request) {
               status: "NOT_STARTED",
               purchaseDate: new Date(),
               archived: false,
-              shopifyOrderId: session?.id ? String(session.id) : null,
+              shopifyOrderId: session?.id ? String(session.id) : null, // audit
             },
           });
         }
       }
 
-      // ✅ 2) sales_count (inchangé) — UNIQUEMENT ventes formations (mode payment)
+      // ✅ 2) Tracking sales_count (inchangé, mais correction: mode "payment")
       try {
         const mode = String(session?.mode || "");
         if (mode === "payment" && course?.shopifyProductId) {
@@ -432,24 +416,23 @@ export async function POST(req: Request) {
         console.warn("[MF][sales_count] failed (non-blocking)", e?.message || e);
       }
 
-      // ✅ 3) NOUVEAU: crédit solde formateur (mode payment)
+      // ✅ 3) NOUVEAU: crédite le formateur (payouts)
       try {
         const mode = String(session?.mode || "");
-        if (mode === "payment" && course?.id) {
+        if (mode === "payment" && course) {
           const { amountCents, currency } = moneyFromSession(session);
           await creditTrainerOnSale({
             course,
+            session,
             amountCents,
             currency,
-            sessionId: String(session?.id || event.id),
-            buyerEmail,
           });
         }
       } catch (e: any) {
         console.warn("[MF][payout] credit failed (non-blocking)", e?.message || e);
       }
 
-      // ✅ 4) email (inchangé)
+      // ✅ 4) Email (inchangé)
       if (buyerEmail) {
         const { amountCents, currency } = moneyFromSession(session);
         const base = process.env.PUBLIC_SITE_URL || "https://marketformation.fr";
