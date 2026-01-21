@@ -1,5 +1,3 @@
-// prisma/schema.prisma
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -9,46 +7,51 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// -----------------------------------------------------
-// PAIEMENTS FORMATEURS
-// -----------------------------------------------------
+// =====================================================
+// PAIEMENTS / Payouts Formateurs
+// =====================================================
 
 model TrainerBanking {
-  id            String   @id @default(cuid())
-  trainerId     String   @unique
+  id            String  @id @default(cuid())
+  trainerId     String  @unique
   email         String?
   payoutName    String?
   payoutCountry String?
   payoutIban    String?
   payoutBic     String?
-  autoPayout    Boolean  @default(false)
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  autoPayout    Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   summary PayoutsSummary?
   history PayoutsHistory[]
 }
 
 model PayoutsSummary {
-  id              String   @id @default(cuid())
-  trainerId       String   @unique
-  availableAmount Decimal  @default(0.0)
-  pendingAmount   Decimal  @default(0.0)
-  currency        String   @default("EUR")
-  updatedAt       DateTime @updatedAt
+  id        String @id @default(cuid())
+  trainerId String @unique
+
+  availableAmount Decimal @default(0.0)
+  pendingAmount   Decimal @default(0.0)
+  currency        String  @default("EUR")
+
+  updatedAt DateTime @updatedAt
 
   trainer TrainerBanking @relation(fields: [trainerId], references: [trainerId])
 }
 
 model PayoutsHistory {
-  id        String       @id @default(cuid())
+  id        String @id @default(cuid())
   trainerId String
-  type      PayoutType
-  status    PayoutStatus
-  amount    Decimal
-  currency  String       @default("EUR")
-  date      DateTime     @default(now())
-  meta      Json?
+
+  type     PayoutType
+  status   PayoutStatus
+  amount   Decimal
+  currency String       @default("EUR")
+
+  date DateTime @default(now())
+  meta Json?
 
   trainer TrainerBanking @relation(fields: [trainerId], references: [trainerId])
 
@@ -68,24 +71,24 @@ enum PayoutStatus {
   reversed
 }
 
-// -----------------------------------------------------
-// FORMATIONS (plateforme)
-// -----------------------------------------------------
+// =====================================================
+// FORMATIONS
+// =====================================================
 
 model Course {
   id String @id @default(cuid())
 
-  // Lien vers le produit Shopify
+  // Shopify
   shopifyProductId     String  @unique
   shopifyProductHandle String?
   shopifyProductTitle  String?
 
-  // Contenu / affichage
+  // Affichage / contenu
   title     String
   subtitle  String?
   imageUrl  String?
   pdfUrl    String?
-  accessUrl String // ex: "/pages/formation-demo-ia"
+  accessUrl String
 
   // Métadonnées pédagogiques
   categoryLabel  String?
@@ -95,6 +98,9 @@ model Course {
   // Formateur
   trainerEmail     String?
   trainerShopifyId String?
+
+  // Prix (nullable pour migration safe)
+  priceCents Int?
 
   // Relations
   enrollments StudentCourse[]
@@ -107,6 +113,10 @@ model Course {
   @@index([trainerEmail])
 }
 
+// =====================================================
+// INSCRIPTIONS / Étudiants
+// =====================================================
+
 model StudentCourse {
   id String @id @default(cuid())
 
@@ -118,7 +128,7 @@ model StudentCourse {
   courseId String
   course   Course @relation(fields: [courseId], references: [id])
 
-  // Commande Shopify (ou Stripe session id si checkout Stripe)
+  // Commande / paiement
   shopifyOrderId    String?
   shopifyLineItemId String?
 
@@ -128,14 +138,10 @@ model StudentCourse {
   status       CourseStatus @default(IN_PROGRESS)
   archived     Boolean      @default(false)
 
-  // ✅ Progression réelle (UX)
-  // 0..100
-  progressPct  Int   @default(0)
-  // (vidéo) dernière leçon/chapitre vu(e) — simple et efficace
+  // Progression
+  progressPct  Int       @default(0)
   lastLessonId String?
-  // date de complétion (quand progress=100 ou status=COMPLETED)
   completedAt  DateTime?
-  // JSON libre (pages lues, timestamps, etc.)
   progressData Json?
 
   @@index([studentEmail])

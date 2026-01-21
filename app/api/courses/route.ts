@@ -651,9 +651,10 @@ export async function POST(req: Request) {
 
     const pdfUrl = String(pdfUrlRaw || pdf_url || "").trim();
 
-    if (!email || !title || !imageUrl || !pdfUrl) {
-      return jsonWithCors(req, { ok: false, error: "missing fields" }, { status: 400 });
-    }
+    if (!email || !title || !imageUrl || !pdfUrl || price === undefined || price === null || String(price).trim() === "") {
+  return jsonWithCors(req, { ok: false, error: "missing fields (email,title,imageUrl,pdfUrl,price)" }, { status: 400 });
+}
+
 
     if (!/^https?:\/\//i.test(pdfUrl)) {
       return jsonWithCors(req, { ok: false, error: "pdfUrl must be https URL" }, { status: 400 });
@@ -712,6 +713,13 @@ export async function POST(req: Request) {
       if (!Number.isNaN(n) && n >= 0) priceStr = n.toFixed(2);
       else priceStr = String(price).trim();
     }
+
+    const priceNum = Number(String(priceStr || price).replace(",", "."));
+if (!Number.isFinite(priceNum) || priceNum < 0) {
+  return jsonWithCors(req, { ok: false, error: "invalid price" }, { status: 400 });
+}
+const priceCents = Math.round(priceNum * 100);
+
 
     const themeHandleFinal =
       normalizeThemeHandle(mf_theme) ||
@@ -914,33 +922,36 @@ export async function POST(req: Request) {
       const subtitleFinal = String((mf as any).subtitle ?? subtitle ?? "").trim() || (description || null);
 
       await (prisma as any).course.upsert({
-        where: { shopifyProductId },
-        update: {
-          shopifyProductHandle,
-          shopifyProductTitle,
-          title,
-          subtitle: subtitleFinal,
-          imageUrl,
-          pdfUrl,
-          accessUrl,
-          categoryLabel,
-          trainerEmail: email,
-          trainerShopifyId: shopifyCustomerId ? String(shopifyCustomerId) : null,
-        },
-        create: {
-          shopifyProductId,
-          shopifyProductHandle,
-          shopifyProductTitle,
-          title,
-          subtitle: subtitleFinal,
-          imageUrl,
-          pdfUrl,
-          accessUrl,
-          categoryLabel,
-          trainerEmail: email,
-          trainerShopifyId: shopifyCustomerId ? String(shopifyCustomerId) : null,
-        },
-      });
+  where: { shopifyProductId },
+  update: {
+    shopifyProductHandle,
+    shopifyProductTitle,
+    title,
+    subtitle: subtitleFinal,
+    imageUrl,
+    pdfUrl,
+    accessUrl,
+    categoryLabel,
+    trainerEmail: email,
+    trainerShopifyId: shopifyCustomerId ? String(shopifyCustomerId) : null,
+    priceCents, // ✅ NEW
+  },
+  create: {
+    shopifyProductId,
+    shopifyProductHandle,
+    shopifyProductTitle,
+    title,
+    subtitle: subtitleFinal,
+    imageUrl,
+    pdfUrl,
+    accessUrl,
+    categoryLabel,
+    trainerEmail: email,
+    trainerShopifyId: shopifyCustomerId ? String(shopifyCustomerId) : null,
+    priceCents, // ✅ NEW
+  },
+});
+
     } catch (e) {
       console.error("[MF] prisma.course upsert error", e);
     }
