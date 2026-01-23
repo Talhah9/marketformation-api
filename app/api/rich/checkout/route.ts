@@ -6,55 +6,39 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY as string, {
   apiVersion: "2024-06-20",
 });
 
-// ✅ Mets ici tes origines autorisées
-const ALLOWED_ORIGINS = new Set([
-  "https://iamrich.fr",
-  // ajoute aussi ton domaine myshopify si tu testes dessus
-  // "https://xxxxx.myshopify.com",
-]);
-
-function corsHeaders(origin: string | null) {
-  const allowedOrigin = origin && ALLOWED_ORIGINS.has(origin) ? origin : "";
-  return {
-    "Access-Control-Allow-Origin": allowedOrigin,
-    "Access-Control-Allow-Methods": "POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
-    "Access-Control-Max-Age": "86400",
-    "Vary": "Origin",
-  };
-}
-
-export async function OPTIONS(req: Request) {
+function getOrigin(req: Request) {
   const origin = req.headers.get("origin");
-  const headers = corsHeaders(origin);
+  if (origin) return origin;
 
-  // si origin pas autorisée → on renvoie quand même 204 sans Allow-Origin (le navigateur bloquera)
-  return new Response(null, { status: 204, headers });
-}
-
-export async function POST(req: Request) {
-  const origin = req.headers.get("origin");
-  const headers = corsHeaders(origin);
-
-  // ✅ Bloque côté serveur si origin pas autorisée (sécurité)
-  if (!origin || !ALLOWED_ORIGINS.has(origin)) {
-    return Response.json({ error: "Origin not allowed" }, { status: 403, headers });
+  const referer = req.headers.get("referer");
+  if (referer) {
+    try {
+      return new URL(referer).origin;
+    } catch {}
   }
+  return null;
+}
 
+// ✅ GET /api/rich/checkout?name=Gazou
+export async function GET(req: Request) {
   try {
-    const body = await req.json().catch(() => ({}));
-    const nameRaw = body?.name;
+    const url = new URL(req.url);
+    const nameRaw = url.searchParams.get("name") || "";
 
-    if (!nameRaw || typeof nameRaw !== "string" || nameRaw.trim().length < 2) {
-      return Response.json({ error: "Missing or invalid name" }, { status: 400, headers });
+    const name = nameRaw.trim().slice(0, 24);
+    if (!name || name.length < 2) {
+      return new Response("Missing name", { status: 400 });
     }
 
     const priceId = process.env.STRIPE_PRICE_RICH_999;
     if (!priceId) {
-      return Response.json({ error: "Missing STRIPE_PRICE_RICH_999 env" }, { status: 500, headers });
+      return new Response("Missing STRIPE_PRICE_RICH_999 env", { status: 500 });
     }
 
-    const name = nameRaw.trim().slice(0, 24);
+    const origin = getOrigin(req);
+    if (!origin) {
+      return new Response("Missing origin", { status: 400 });
+    }
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
@@ -64,9 +48,10 @@ export async function POST(req: Request) {
       cancel_url: `${origin}/pages/imfuckingrich?cancel=1`,
     });
 
-    return Response.json({ url: session.url }, { status: 200, headers });
+    // ✅ redirect browser to Stripe (NO CORS)
+    return Response.redirect(session.url as string, 303);
   } catch (err) {
     console.error("RICH CHECKOUT ERROR:", err);
-    return Response.json({ error: "Stripe error" }, { status: 500, headers });
+    return new Response("Stripe error", { status: 500 });
   }
 }
