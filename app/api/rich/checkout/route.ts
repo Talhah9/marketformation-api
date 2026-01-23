@@ -42,9 +42,10 @@ export async function GET(req: Request) {
     }
 
     const path = returnUrl.pathname && returnUrl.pathname !== "/" ? returnUrl.pathname : "/";
-const baseReturn = `${returnUrl.origin}${path}`;
+    const baseReturn = returnUrl.origin + "/"; // ✅ toujours HOME
     const successUrl = `${baseReturn}?success=1`;
-    const cancelUrl = `${baseReturn}?cancel=1`;
+    const cancelUrl  = `${baseReturn}?cancel=1`;
+
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
