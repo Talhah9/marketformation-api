@@ -41,7 +41,8 @@ export async function GET(req: Request) {
       return new Response("Missing STRIPE_PRICE_RICH_999 env", { status: 500 });
     }
 
-    const baseReturn = `${returnUrl.origin}${returnUrl.pathname}`;
+    const path = returnUrl.pathname && returnUrl.pathname !== "/" ? returnUrl.pathname : "/";
+const baseReturn = `${returnUrl.origin}${path}`;
     const successUrl = `${baseReturn}?success=1`;
     const cancelUrl = `${baseReturn}?cancel=1`;
 
@@ -49,6 +50,7 @@ export async function GET(req: Request) {
       mode: "payment",
       line_items: [{ price: priceId, quantity: 1 }],
       metadata: { type: "rich_proof", name },
+      allow_promotion_codes: true,
       success_url: successUrl,
       cancel_url: cancelUrl,
     });
