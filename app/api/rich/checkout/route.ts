@@ -1,5 +1,4 @@
 import Stripe from "stripe";
-import { list as blobList, put } from "@vercel/blob";
 
 export const runtime = "nodejs";
 
@@ -7,70 +6,58 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY as string, {
   apiVersion: "2024-06-20",
 });
 
-const KEY = "rich/hall.json";
-const ALLOW_ORIGINS = new Set(["https://iamrich.fr", "https://www.iamrich.fr"]);
-
-type HallItem = {
-  name: string;
-  createdAt: number;
-  sessionId: string;
-};
-
-async function readHall(): Promise<HallItem[]> {
-  const found = await blobList({ prefix: KEY, limit: 1 });
-  const item = found.blobs?.[0];
-  if (!item?.url) return [];
-  const res = await fetch(item.url, { cache: "no-store" });
-  if (!res.ok) return [];
-  const data = await res.json().catch(() => []);
-  return Array.isArray(data) ? (data as HallItem[]) : [];
-}
-
-async function writeHall(items: HallItem[]) {
-  await put(KEY, JSON.stringify(items), {
-    access: "public",
-    contentType: "application/json",
-    addRandomSuffix: false,
+function json(status: number, body: any) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+    },
   });
 }
 
-export async function POST(req: Request) {
-  const sig = req.headers.get("stripe-signature");
-  const whsec = process.env.STRIPE_WEBHOOK_SECRET_RICH;
-
-  if (!sig || !whsec) {
-    return new Response("Missing webhook config", { status: 400 });
-  }
-
-  // IMPORTANT: body raw pour vérifier la signature Stripe
-  const rawBody = await req.text();
-
-  let event: Stripe.Event;
+export async function GET(req: Request) {
   try {
-    event = stripe.webhooks.constructEvent(rawBody, sig, whsec);
-  } catch (err) {
-    console.error("WEBHOOK SIGNATURE ERROR:", err);
-    return new Response("Invalid signature", { status: 400 });
-  }
+    const url = new URL(req.url);
 
-  if (event.type === "checkout.session.completed") {
-    const session = event.data.object as Stripe.Checkout.Session;
+    const name = (url.searchParams.get("name") || "").trim().slice(0, 24);
+    if (!name) return json(400, { ok: false, error: "missing_name" });
 
-    const paid = session.payment_status === "paid";
-    const name = (session.metadata?.name || "").trim().slice(0, 24);
-    const type = session.metadata?.type || "";
-    const sessionId = session.id;
-
-    if (paid && type === "rich_proof" && name) {
-      const hall = await readHall();
-      const exists = hall.some((x) => x.sessionId === sessionId);
-
-      if (!exists) {
-        const next: HallItem[] = [{ name, createdAt: Date.now(), sessionId }, ...hall].slice(0, 500);
-        await writeHall(next);
-      }
+    const returnUrlRaw = url.searchParams.get("return_url") || "https://iamrich.fr/";
+    let returnUrl: URL;
+    try {
+      returnUrl = new URL(returnUrlRaw);
+    } catch {
+      returnUrl = new URL("https://iamrich.fr/");
     }
-  }
 
-  return new Response("ok", { status: 200 });
+    // ✅ Sécurise: on renvoie toujours vers le domaine iamrich
+    const allowedHosts = new Set(["iamrich.fr", "www.iamrich.fr"]);
+    const host = returnUrl.hostname.replace(/^www\./, "");
+    const safeOrigin = allowedHosts.has(host) ? returnUrl.origin : "https://iamrich.fr";
+
+    const success_url = `${safeOrigin}/?success=1`;
+    const cancel_url = `${safeOrigin}/?cancel=1`;
+
+    // ✅ Ton priceId LIVE (mets le bon ici)
+    const priceId = process.env.STRIPE_PRICE_IAMRICH;
+    if (!priceId) return json(500, { ok: false, error: "missing_price_env" });
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      line_items: [{ price: priceId, quantity: 1 }],
+      allow_promotion_codes: true,
+      metadata: { type: "rich_proof", name },
+      success_url,
+      cancel_url,
+    });
+
+    if (!session.url) return json(500, { ok: false, error: "missing_checkout_url" });
+
+    // ✅ Redirection browser -> Stripe (GET flow)
+    return Response.redirect(session.url, 303);
+  } catch (e: any) {
+    console.error("RICH CHECKOUT ERROR:", e);
+    return json(500, { ok: false, error: "stripe_error" });
+  }
 }
