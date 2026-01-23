@@ -3,6 +3,8 @@ import Stripe from "stripe";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
+export const fetchCache = "force-no-store";
+
 
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY as string, {
@@ -21,7 +23,7 @@ function json(status: number, body: any) {
 
 export async function GET(req: Request) {
   try {
-    const url = new URL(req.url);
+    const url = new URL(req.url, "https://mf-api-gold-topaz.vercel.app");
 
     const name = (url.searchParams.get("name") || "").trim().slice(0, 24);
     if (!name) return json(400, { ok: false, error: "missing_name" });
