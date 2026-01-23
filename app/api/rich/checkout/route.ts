@@ -6,36 +6,34 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY as string, {
   apiVersion: "2024-06-20",
 });
 
-function getSiteOrigin(req: Request) {
-  // 1) si Origin est présent (fetch / certains navigations)
-  const origin = req.headers.get("origin");
-  if (origin) return origin;
-
-  // 2) sinon, on reconstruit depuis les headers proxy (Vercel)
-  const proto = req.headers.get("x-forwarded-proto") || "https";
-  const host = req.headers.get("x-forwarded-host") || req.headers.get("host");
-  if (host) return `${proto}://${host}`;
-
-  // 3) fallback referer
-  const referer = req.headers.get("referer");
-  if (referer) {
-    try {
-      return new URL(referer).origin;
-    } catch {}
-  }
-
-  return null;
+function safeName(input: string) {
+  return (input || "").trim().slice(0, 24);
 }
 
-// ✅ GET /api/rich/checkout?name=Gazou
+function isAllowedReturnHost(host: string) {
+  return host === "iamrich.fr" || host === "www.iamrich.fr";
+}
+
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
-    const nameRaw = url.searchParams.get("name") || "";
-    const name = nameRaw.trim().slice(0, 24);
 
+    const name = safeName(url.searchParams.get("name") || "");
     if (!name || name.length < 2) {
       return new Response("Missing name", { status: 400 });
+    }
+
+    const returnUrlRaw = url.searchParams.get("return_url") || "";
+    let returnUrl: URL;
+
+    try {
+      returnUrl = new URL(returnUrlRaw);
+    } catch {
+      return new Response("Invalid return_url", { status: 400 });
+    }
+
+    if (!isAllowedReturnHost(returnUrl.host)) {
+      return new Response("return_url not allowed", { status: 403 });
     }
 
     const priceId = process.env.STRIPE_PRICE_RICH_999;
@@ -43,17 +41,16 @@ export async function GET(req: Request) {
       return new Response("Missing STRIPE_PRICE_RICH_999 env", { status: 500 });
     }
 
-    const siteOrigin = getSiteOrigin(req);
-    if (!siteOrigin) {
-      return new Response("Missing site origin", { status: 400 });
-    }
+    const baseReturn = `${returnUrl.origin}${returnUrl.pathname}`;
+    const successUrl = `${baseReturn}?success=1`;
+    const cancelUrl = `${baseReturn}?cancel=1`;
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       line_items: [{ price: priceId, quantity: 1 }],
       metadata: { type: "rich_proof", name },
-      success_url: `${siteOrigin}/pages/imfuckingrich?success=1`,
-      cancel_url: `${siteOrigin}/pages/imfuckingrich?cancel=1`,
+      success_url: successUrl,
+      cancel_url: cancelUrl,
     });
 
     return Response.redirect(session.url as string, 303);
