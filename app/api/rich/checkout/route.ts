@@ -1,4 +1,5 @@
 import Stripe from "stripe";
+import { list as blobList, put } from "@vercel/blob";
 
 export const runtime = "nodejs";
 
@@ -6,59 +7,70 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY as string, {
   apiVersion: "2024-06-20",
 });
 
-function safeName(input: string) {
-  return (input || "").trim().slice(0, 24);
+const KEY = "rich/hall.json";
+const ALLOW_ORIGINS = new Set(["https://iamrich.fr", "https://www.iamrich.fr"]);
+
+type HallItem = {
+  name: string;
+  createdAt: number;
+  sessionId: string;
+};
+
+async function readHall(): Promise<HallItem[]> {
+  const found = await blobList({ prefix: KEY, limit: 1 });
+  const item = found.blobs?.[0];
+  if (!item?.url) return [];
+  const res = await fetch(item.url, { cache: "no-store" });
+  if (!res.ok) return [];
+  const data = await res.json().catch(() => []);
+  return Array.isArray(data) ? (data as HallItem[]) : [];
 }
 
-function isAllowedReturnHost(host: string) {
-  return host === "iamrich.fr" || host === "www.iamrich.fr";
+async function writeHall(items: HallItem[]) {
+  await put(KEY, JSON.stringify(items), {
+    access: "public",
+    contentType: "application/json",
+    addRandomSuffix: false,
+  });
 }
 
-export async function GET(req: Request) {
-  try {
-    const url = new URL(req.url);
+export async function POST(req: Request) {
+  const sig = req.headers.get("stripe-signature");
+  const whsec = process.env.STRIPE_WEBHOOK_SECRET_RICH;
 
-    const name = safeName(url.searchParams.get("name") || "");
-    if (!name || name.length < 2) {
-      return new Response("Missing name", { status: 400 });
-    }
-
-    const returnUrlRaw = url.searchParams.get("return_url") || "";
-    let returnUrl: URL;
-
-    try {
-      returnUrl = new URL(returnUrlRaw);
-    } catch {
-      return new Response("Invalid return_url", { status: 400 });
-    }
-
-    if (!isAllowedReturnHost(returnUrl.host)) {
-      return new Response("return_url not allowed", { status: 403 });
-    }
-
-    const priceId = process.env.STRIPE_PRICE_RICH_999;
-    if (!priceId) {
-      return new Response("Missing STRIPE_PRICE_RICH_999 env", { status: 500 });
-    }
-
-    const path = returnUrl.pathname && returnUrl.pathname !== "/" ? returnUrl.pathname : "/";
-    const baseReturn = returnUrl.origin + "/"; // ✅ toujours HOME
-    const successUrl = `${baseReturn}?success=1`;
-    const cancelUrl  = `${baseReturn}?cancel=1`;
-
-
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      line_items: [{ price: priceId, quantity: 1 }],
-      metadata: { type: "rich_proof", name },
-      allow_promotion_codes: true,
-      success_url: successUrl,
-      cancel_url: cancelUrl,
-    });
-
-    return Response.redirect(session.url as string, 303);
-  } catch (err) {
-    console.error("RICH CHECKOUT ERROR:", err);
-    return new Response("Stripe error", { status: 500 });
+  if (!sig || !whsec) {
+    return new Response("Missing webhook config", { status: 400 });
   }
+
+  // IMPORTANT: body raw pour vérifier la signature Stripe
+  const rawBody = await req.text();
+
+  let event: Stripe.Event;
+  try {
+    event = stripe.webhooks.constructEvent(rawBody, sig, whsec);
+  } catch (err) {
+    console.error("WEBHOOK SIGNATURE ERROR:", err);
+    return new Response("Invalid signature", { status: 400 });
+  }
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object as Stripe.Checkout.Session;
+
+    const paid = session.payment_status === "paid";
+    const name = (session.metadata?.name || "").trim().slice(0, 24);
+    const type = session.metadata?.type || "";
+    const sessionId = session.id;
+
+    if (paid && type === "rich_proof" && name) {
+      const hall = await readHall();
+      const exists = hall.some((x) => x.sessionId === sessionId);
+
+      if (!exists) {
+        const next: HallItem[] = [{ name, createdAt: Date.now(), sessionId }, ...hall].slice(0, 500);
+        await writeHall(next);
+      }
+    }
+  }
+
+  return new Response("ok", { status: 200 });
 }

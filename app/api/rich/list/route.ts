@@ -1,12 +1,14 @@
+import { list as blobList, put } from "@vercel/blob";
+
 export const runtime = "nodejs";
 
+const KEY = "rich/hall.json";
 const ALLOW_ORIGINS = new Set(["https://iamrich.fr", "https://www.iamrich.fr"]);
 
 type HallItem = {
   name: string;
   createdAt: number;
-  // optionnel si tu le stockes
-  sessionId?: string;
+  sessionId: string;
 };
 
 function corsHeaders(origin: string | null) {
@@ -20,16 +22,34 @@ function corsHeaders(origin: string | null) {
   } as const;
 }
 
+async function readHall(): Promise<HallItem[]> {
+  const found = await blobList({ prefix: KEY, limit: 1 });
+  const item = found.blobs?.[0];
+  if (!item?.url) return [];
+  const res = await fetch(item.url, { cache: "no-store" });
+  if (!res.ok) return [];
+  const data = await res.json().catch(() => []);
+  return Array.isArray(data) ? (data as HallItem[]) : [];
+}
+
+async function ensureFileExists() {
+  const found = await blobList({ prefix: KEY, limit: 1 });
+  if (!found.blobs?.length) {
+    await put(KEY, JSON.stringify([]), {
+      access: "public",
+      contentType: "application/json",
+      addRandomSuffix: false,
+    });
+  }
+}
+
 export async function OPTIONS(req: Request) {
-  return new Response(null, {
-    status: 204,
-    headers: corsHeaders(req.headers.get("origin")),
-  });
+  return new Response(null, { status: 204, headers: corsHeaders(req.headers.get("origin")) });
 }
 
 export async function GET(req: Request) {
-  // ✅ Placeholder (tu remplaceras par Blob/DB)
-  const items: HallItem[] = [];
+  await ensureFileExists();
+  const items = await readHall();
 
   return Response.json(
     { ok: true, items },
