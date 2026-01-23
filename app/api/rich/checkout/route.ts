@@ -24,8 +24,8 @@ export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
     const nameRaw = url.searchParams.get("name") || "";
-
     const name = nameRaw.trim().slice(0, 24);
+
     if (!name || name.length < 2) {
       return new Response("Missing name", { status: 400 });
     }
@@ -48,7 +48,6 @@ export async function GET(req: Request) {
       cancel_url: `${origin}/pages/imfuckingrich?cancel=1`,
     });
 
-    // ✅ redirect browser to Stripe (NO CORS)
     return Response.redirect(session.url as string, 303);
   } catch (err) {
     console.error("RICH CHECKOUT ERROR:", err);
