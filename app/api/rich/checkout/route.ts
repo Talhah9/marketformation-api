@@ -6,16 +6,24 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY as string, {
   apiVersion: "2024-06-20",
 });
 
-function getOrigin(req: Request) {
+function getSiteOrigin(req: Request) {
+  // 1) si Origin est présent (fetch / certains navigations)
   const origin = req.headers.get("origin");
   if (origin) return origin;
 
+  // 2) sinon, on reconstruit depuis les headers proxy (Vercel)
+  const proto = req.headers.get("x-forwarded-proto") || "https";
+  const host = req.headers.get("x-forwarded-host") || req.headers.get("host");
+  if (host) return `${proto}://${host}`;
+
+  // 3) fallback referer
   const referer = req.headers.get("referer");
   if (referer) {
     try {
       return new URL(referer).origin;
     } catch {}
   }
+
   return null;
 }
 
@@ -35,17 +43,17 @@ export async function GET(req: Request) {
       return new Response("Missing STRIPE_PRICE_RICH_999 env", { status: 500 });
     }
 
-    const origin = getOrigin(req);
-    if (!origin) {
-      return new Response("Missing origin", { status: 400 });
+    const siteOrigin = getSiteOrigin(req);
+    if (!siteOrigin) {
+      return new Response("Missing site origin", { status: 400 });
     }
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       line_items: [{ price: priceId, quantity: 1 }],
       metadata: { type: "rich_proof", name },
-      success_url: `${origin}/pages/imfuckingrich?success=1`,
-      cancel_url: `${origin}/pages/imfuckingrich?cancel=1`,
+      success_url: `${siteOrigin}/pages/imfuckingrich?success=1`,
+      cancel_url: `${siteOrigin}/pages/imfuckingrich?cancel=1`,
     });
 
     return Response.redirect(session.url as string, 303);
