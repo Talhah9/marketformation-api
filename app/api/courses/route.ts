@@ -450,6 +450,7 @@ export async function OPTIONS(req: Request) {
 }
 
 /* =====================================================================
+/* =====================================================================
    GET /api/courses
 ===================================================================== */
 export async function GET(req: Request) {
@@ -471,8 +472,20 @@ export async function GET(req: Request) {
     const isPublic = url.searchParams.get("public") === "1";
 
     let email = (url.searchParams.get("email") || "").trim();
-    const shopifyCustomerIdRaw = (url.searchParams.get("shopifyCustomerId") || "").trim();
+    let shopifyCustomerIdRaw = (url.searchParams.get("shopifyCustomerId") || "").trim();
 
+    // ✅ Si on a un handle trainer-<id>, on dérive l'id digits (BIGINT safe)
+    const digitsFromHandle = extractDigitsHandle(handle);
+
+    // ✅ En public, si shopifyCustomerId n'est pas fourni mais handle trainer-<id> oui,
+    // on utilise cet id pour pouvoir lister SANS email.
+    if (!shopifyCustomerIdRaw && digitsFromHandle) {
+      shopifyCustomerIdRaw = digitsFromHandle;
+    }
+
+    // --------------------------
+    // 1) Essaye de résoudre l'email si possible
+    // --------------------------
     if (!email && shopifyCustomerIdRaw) {
       email = await resolveEmailByCustomerIdDigits(shopifyCustomerIdRaw);
     }
@@ -480,16 +493,33 @@ export async function GET(req: Request) {
       email = await resolveEmailByHandle(handle);
     }
 
-    if (!email) {
-      return jsonWithCors(
-        req,
-        { ok: false, error: "email_or_resolvable_handle_required" },
-        { status: 400 }
-      );
-    }
+    // --------------------------
+    // 2) Construire la query Shopify (2 stratégies)
+    //    A) vendor:"email" (meilleur si dispo)
+    //    B) metafield mkt.owner_id:"<idDigits>" (fallback public)
+    // --------------------------
+    let search = "";
 
-    const vendor = email.replace(/"/g, '\\"');
-    const search = `vendor:"${vendor}"`;
+    if (email) {
+      const vendor = email.replace(/"/g, '\\"');
+      search = `vendor:"${vendor}"`;
+    } else {
+      // ✅ En public, on accepte de lister via owner_id si on a un id digits
+      if (isPublic && shopifyCustomerIdRaw && /^\d+$/.test(shopifyCustomerIdRaw)) {
+        // IMPORTANT: on restreint aux courses seulement
+        // Shopify Search supporte généralement le filtre metafield sur products.
+        // Si jamais ce n'est pas supporté dans ton shop, ça renverra juste 0 items (pas 400).
+        const idSafe = shopifyCustomerIdRaw.replace(/"/g, '\\"');
+        search = `tag:"mkt-course" AND metafield:mkt.owner_id:"${idSafe}"`;
+      } else {
+        // private mode => on garde le comportement strict
+        return jsonWithCors(
+          req,
+          { ok: false, error: "email_or_resolvable_handle_required" },
+          { status: 400 }
+        );
+      }
+    }
 
     const q = `
       query($q: String!) {
@@ -505,6 +535,7 @@ export async function GET(req: Request) {
               featuredImage { url }
               theme: metafield(namespace:"mfapp", key:"theme") { value }
               approval: metafield(namespace:"mfapp", key:"approval_status") { value }
+              owner_id: metafield(namespace:"mkt", key:"owner_id") { value }
             }
           }
         }
@@ -553,6 +584,7 @@ export async function GET(req: Request) {
         approval_status,
         approval_label,
         status: p.status || null,
+        owner_id: String(p?.owner_id?.value || "").trim() || null,
       };
     });
 
@@ -577,11 +609,25 @@ export async function GET(req: Request) {
       }
     }
 
-    return jsonWithCors(req, { ok: true, items, plan, quota });
+    return jsonWithCors(req, {
+      ok: true,
+      items,
+      plan,
+      quota,
+      // debug soft (utile si besoin)
+      resolved: {
+        isPublic,
+        handle: handle || null,
+        email: email || null,
+        shopifyCustomerIdRaw: shopifyCustomerIdRaw || null,
+        search,
+      },
+    });
   } catch (e: any) {
     return jsonWithCors(req, { ok: false, error: e?.message || "list_failed" }, { status: 500 });
   }
 }
+
 
 /* =====================================================================
    POST /api/courses
