@@ -10,6 +10,7 @@ function pickHandle(url: URL) {
   return (
     (url.searchParams.get("u") || "").trim() ||
     (url.searchParams.get("handle") || "").trim() ||
+    (url.searchParams.get("trainer") || "").trim() ||
     ""
   );
 }
@@ -48,7 +49,7 @@ export async function GET(req: NextRequest) {
     // ✅ Public mode ONLY if explicitly requested
     const isPublic = url.searchParams.get("public") === "1";
 
-    // ✅ En public, on veut une identité publique stable (u/handle = trainer-<id>)
+    // ✅ En public, on veut une identité publique stable (u/handle)
     if (isPublic && !handle) {
       return NextResponse.json(
         { ok: false, error: "MISSING_HANDLE", reason: "public=1 requires u/handle" },
@@ -56,8 +57,10 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // ✅ Choose stable identity
+    // ✅ If handle is trainer-<id>, derive numeric customer id
     const derivedFromHandle = isTrainerHandle(handle) ? digitsFromTrainerHandle(handle) : "";
+
+    // ✅ Choose stable identity
     const shopifyCustomerId =
       (logged || shopifyCustomerIdParam || (isPublic ? derivedFromHandle : "") || "").trim();
 
@@ -95,14 +98,24 @@ export async function GET(req: NextRequest) {
     if (shopifyCustomerId) internal.searchParams.set("shopifyCustomerId", shopifyCustomerId);
     if (email) internal.searchParams.set("email", email);
 
-    // Forward handle/u if present (tolerance)
-    if (handle) {
+    // Public flag only if explicitly asked
+    if (isPublic) internal.searchParams.set("public", "1");
+
+    /**
+     * ✅ FIX CRITIQUE :
+     * En public, si handle = trainer-<id>, on NE forward PAS u/handle
+     * car /api/courses peut refuser trainer-xxx comme "resolvable handle"
+     * et renvoyer email_or_resolvable_handle_required.
+     *
+     * Dans ce cas, shopifyCustomerId suffit.
+     */
+    const shouldForwardHandle =
+      !isPublic || !derivedFromHandle; // private => oui ; public => seulement si pas trainer-<id>
+
+    if (handle && shouldForwardHandle) {
       internal.searchParams.set("u", handle);
       internal.searchParams.set("handle", handle);
     }
-
-    // Public flag only if explicitly asked
-    if (isPublic) internal.searchParams.set("public", "1");
 
     const r = await fetch(internal.toString(), {
       method: "GET",
@@ -122,7 +135,6 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // ✅ Bonus: si /api/courses renvoie une erreur, on la remonte telle quelle (facile à debug)
     return NextResponse.json(data, { status: r.status });
   } catch (e: any) {
     return NextResponse.json(
