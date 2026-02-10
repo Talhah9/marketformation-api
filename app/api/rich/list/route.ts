@@ -1,6 +1,8 @@
-import { list as blobList, put } from "@vercel/blob";
+import { head, put } from "@vercel/blob";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
 const KEY = "rich/hall.json";
 const ALLOW_ORIGINS = new Set(["https://iamrich.fr", "https://www.iamrich.fr"]);
@@ -22,24 +24,27 @@ function corsHeaders(origin: string | null) {
   } as const;
 }
 
-async function readHall(): Promise<HallItem[]> {
-  const found = await blobList({ prefix: KEY, limit: 1 });
-  const item = found.blobs?.[0];
-  if (!item?.url) return [];
-  const res = await fetch(item.url, { cache: "no-store" });
-  if (!res.ok) return [];
-  const data = await res.json().catch(() => []);
-  return Array.isArray(data) ? (data as HallItem[]) : [];
-}
-
 async function ensureFileExists() {
-  const found = await blobList({ prefix: KEY, limit: 1 });
-  if (!found.blobs?.length) {
+  try {
+    await head(KEY);
+  } catch {
     await put(KEY, JSON.stringify([]), {
       access: "public",
       contentType: "application/json",
       addRandomSuffix: false,
     });
+  }
+}
+
+async function readHall(): Promise<HallItem[]> {
+  try {
+    const meta = await head(KEY);
+    const res = await fetch(meta.url + "?t=" + Date.now(), { cache: "no-store" });
+    if (!res.ok) return [];
+    const data = await res.json().catch(() => []);
+    return Array.isArray(data) ? (data as HallItem[]) : [];
+  } catch {
+    return [];
   }
 }
 
@@ -51,14 +56,12 @@ export async function GET(req: Request) {
   await ensureFileExists();
   const items = await readHall();
 
-  return Response.json(
-    { ok: true, items },
-    {
-      status: 200,
-      headers: {
-        ...corsHeaders(req.headers.get("origin")),
-        "Cache-Control": "no-store",
-      },
-    }
-  );
+  return new Response(JSON.stringify({ ok: true, items }), {
+    status: 200,
+    headers: {
+      ...corsHeaders(req.headers.get("origin")),
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store, max-age=0",
+    },
+  });
 }
