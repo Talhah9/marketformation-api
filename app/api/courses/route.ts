@@ -501,25 +501,28 @@ export async function GET(req: Request) {
     let search = "";
 
     if (email) {
-      const vendor = email.replace(/"/g, '\\"');
-      search = `vendor:"${vendor}"`;
-    } else {
-      // ✅ En public, on accepte de lister via owner_id si on a un id digits
-      if (isPublic && shopifyCustomerIdRaw && /^\d+$/.test(shopifyCustomerIdRaw)) {
-        // IMPORTANT: on restreint aux courses seulement
-        // Shopify Search supporte généralement le filtre metafield sur products.
-        // Si jamais ce n'est pas supporté dans ton shop, ça renverra juste 0 items (pas 400).
-        const idSafe = shopifyCustomerIdRaw.replace(/"/g, '\\"');
-        search = `tag:"mkt-course" AND metafield:mkt.owner_id:"${idSafe}"`;
-      } else {
-        // private mode => on garde le comportement strict
-        return jsonWithCors(
-          req,
-          { ok: false, error: "email_or_resolvable_handle_required" },
-          { status: 400 }
-        );
-      }
-    }
+  const vendor = email.replace(/"/g, '\\"');
+  search = `vendor:"${vendor}"`;
+} else {
+  // ✅ PUBLIC GLOBAL: toutes les formations
+  if (isPublic && !shopifyCustomerIdRaw && !handle) {
+    search = `tag:"mkt-course"`;
+  }
+  // ✅ PUBLIC PAR FORMATEUR (owner_id)
+  else if (isPublic && shopifyCustomerIdRaw && /^\d+$/.test(shopifyCustomerIdRaw)) {
+    const idSafe = shopifyCustomerIdRaw.replace(/"/g, '\\"');
+    search = `tag:"mkt-course" AND metafield:mkt.owner_id:"${idSafe}"`;
+  }
+  // private strict
+  else {
+    return jsonWithCors(
+      req,
+      { ok: false, error: "email_or_resolvable_handle_required" },
+      { status: 400 }
+    );
+  }
+}
+
 
     const q = `
       query($q: String!) {
@@ -697,14 +700,35 @@ export async function POST(req: Request) {
 
     const pdfUrl = String(pdfUrlRaw || pdf_url || "").trim();
 
-    if (!email || !title || !imageUrl || !pdfUrl || price === undefined || price === null || String(price).trim() === "") {
-  return jsonWithCors(req, { ok: false, error: "missing fields (email,title,imageUrl,pdfUrl,price)" }, { status: 400 });
+    const typeRaw =
+  String(mfapp?.type || body?.type || "").trim().toUpperCase();
+
+const isVideo = typeRaw === "VIDEO";
+
+if (!email || !title || !imageUrl || price === undefined || price === null || String(price).trim() === "") {
+  return jsonWithCors(
+    req,
+    { ok: false, error: "missing fields (email,title,imageUrl,price)" },
+    { status: 400 }
+  );
+}
+
+// ✅ PDF requis uniquement si ce n’est pas une VIDEO
+if (!isVideo && !pdfUrl) {
+  return jsonWithCors(
+    req,
+    { ok: false, error: "missing fields (pdfUrl)" },
+    { status: 400 }
+  );
 }
 
 
-    if (!/^https?:\/\//i.test(pdfUrl)) {
-      return jsonWithCors(req, { ok: false, error: "pdfUrl must be https URL" }, { status: 400 });
-    }
+    if (!isVideo) {
+  if (!/^https?:\/\//i.test(pdfUrl)) {
+    return jsonWithCors(req, { ok: false, error: "pdfUrl must be https URL" }, { status: 400 });
+  }
+}
+
 
     const admin = isAdminRequest(req, email);
     const bypass = bypassParam || admin;
@@ -820,7 +844,9 @@ const priceCents = Math.round(priceNum * 100);
     if (shopifyCustomerId) {
       await upsertProductMetafield(created.id, "mkt", "owner_id", "single_line_text_field", String(shopifyCustomerId));
     }
-    await upsertProductMetafield(created.id, "mkt", "pdf_url", "url", pdfUrl);
+    if (!isVideo) {
+  await upsertProductMetafield(created.id, "mkt", "pdf_url", "url", pdfUrl);
+}
 
     // approval + theme
     await upsertProductMetafield(created.id, "mfapp", "approval_status", "single_line_text_field", "pending");
@@ -830,9 +856,16 @@ const priceCents = Math.round(priceNum * 100);
 
     // image/pdf
     await upsertProductMetafield(created.id, "mfapp", "image_url", "url", String(imageUrl).trim());
-    await upsertProductMetafield(created.id, "mfapp", "pdf_url", "url", String(pdfUrl).trim());
-    await upsertProductMetafield(created.id, "mfapp", "imageUrl", "url", String(imageUrl).trim());
-    await upsertProductMetafield(created.id, "mfapp", "pdfUrl", "url", String(pdfUrl).trim());
+    if (!isVideo) {
+  await upsertProductMetafield(created.id, "mkt", "pdf_url", "url", pdfUrl);
+
+  await upsertProductMetafield(created.id, "mfapp", "pdf_url", "url", String(pdfUrl).trim());
+  await upsertProductMetafield(created.id, "mfapp", "pdfUrl", "url", String(pdfUrl).trim());
+} else {
+  // optionnel: tu peux explicitement vider un champ texte si tu veux,
+  // mais SURTOUT pas type "url" avec valeur vide.
+}
+
 
     // ✅ Sync fiche produit (Udemy-like)
     try {
@@ -954,53 +987,52 @@ const priceCents = Math.round(priceNum * 100);
     }
 
     // Prisma (sans casser)
-    try {
-      const shopifyProductId = String(created.id);
-      const shopifyProductHandle = created.handle || null;
-      const shopifyProductTitle = created.title || title;
+try {
+  const shopifyProductId = String(created.id);
+  const shopifyProductHandle = created.handle || null;
+  const shopifyProductTitle = created.title || title;
 
-      const mfThemeKey = themeHandleFinal || "";
-      const categoryLabel = mfThemeKey && THEME_LABELS[mfThemeKey] ? THEME_LABELS[mfThemeKey] : null;
+  const mfThemeKey = themeHandleFinal || "";
+  const categoryLabel = mfThemeKey && THEME_LABELS[mfThemeKey] ? THEME_LABELS[mfThemeKey] : null;
 
-      const accessUrl = shopifyProductHandle ? `/products/${shopifyProductHandle}` : "";
+  const accessUrl = shopifyProductHandle ? `/products/${shopifyProductHandle}` : "";
 
-      const mf = mfapp && typeof mfapp === "object" ? mfapp : {};
-      const subtitleFinal = String((mf as any).subtitle ?? subtitle ?? "").trim() || (description || null);
+  const mf = mfapp && typeof mfapp === "object" ? mfapp : {};
+  const subtitleFinal = String((mf as any).subtitle ?? subtitle ?? "").trim() || (description || null);
 
-      await (prisma as any).course.upsert({
-  where: { shopifyProductId },
-  update: {
-    shopifyProductHandle,
-    shopifyProductTitle,
-    title,
-    subtitle: subtitleFinal,
-    imageUrl,
-    pdfUrl,
-    accessUrl,
-    categoryLabel,
-    trainerEmail: email,
-    trainerShopifyId: shopifyCustomerId ? String(shopifyCustomerId) : null,
-    priceCents, // ✅ NEW
-  },
-  create: {
-    shopifyProductId,
-    shopifyProductHandle,
-    shopifyProductTitle,
-    title,
-    subtitle: subtitleFinal,
-    imageUrl,
-    pdfUrl,
-    accessUrl,
-    categoryLabel,
-    trainerEmail: email,
-    trainerShopifyId: shopifyCustomerId ? String(shopifyCustomerId) : null,
-    priceCents, // ✅ NEW
-  },
-});
-
-    } catch (e) {
-      console.error("[MF] prisma.course upsert error", e);
-    }
+  await (prisma as any).course.upsert({
+    where: { shopifyProductId },
+    update: {
+      shopifyProductHandle,
+      shopifyProductTitle,
+      title,
+      subtitle: subtitleFinal,
+      imageUrl,
+      pdfUrl: isVideo ? "" : pdfUrl,
+      accessUrl,
+      categoryLabel,
+      trainerEmail: email,
+      trainerShopifyId: shopifyCustomerId ? String(shopifyCustomerId) : null,
+      priceCents, // ✅ NEW
+    },
+    create: {
+      shopifyProductId,
+      shopifyProductHandle,
+      shopifyProductTitle,
+      title,
+      subtitle: subtitleFinal,
+      imageUrl,
+      pdfUrl: isVideo ? "" : pdfUrl,
+      accessUrl,
+      categoryLabel,
+      trainerEmail: email,
+      trainerShopifyId: shopifyCustomerId ? String(shopifyCustomerId) : null,
+      priceCents, // ✅ NEW
+    },
+  });
+} catch (e) {
+  console.error("[MF] prisma.course upsert error", e);
+}
 
     // quota incr
     try {
